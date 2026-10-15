@@ -6,7 +6,7 @@ import numpy as np
 
 from utils import matrix_svd
 
-from .table import _save_numpy, _write_atomic
+from experiments.common import save_json, save_numpy, write_atomic
 
 
 INPUT_NAME = "matrix.npy"
@@ -59,12 +59,9 @@ def compute_svd(
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     for name, factor in zip(OUTPUT_NAMES[:3], (result.U, result.S, result.Vt)):
-        _write_atomic(output_dir / name, lambda tmp: _save_numpy(tmp, factor))
-    _write_atomic(
-        output_dir / OUTPUT_NAMES[3],
-        lambda tmp: tmp.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-        ),
+        write_atomic(output_dir / name, lambda tmp: save_numpy(tmp, factor))
+    write_atomic(
+        output_dir / OUTPUT_NAMES[3], lambda tmp: save_json(tmp, metadata)
     )
     return {
         "output_dir": str(output_dir),

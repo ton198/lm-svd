@@ -2,51 +2,16 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
 from pathlib import Path
-
+import torch
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-import torch
+from experiments.common import Sample, load_samples, save_json, save_numpy, write_atomic
 
 from utils import CausalLMInference
 
-
-@dataclass(frozen=True)
-class Sample:
-    sample_id: int
-    token_ids: list[int]
-
-
-def load_samples(
-    samples_path: Path, history_count: int | None, future_count: int | None
-) -> tuple[list[Sample], list[Sample]]:
-    if not samples_path.is_file():
-        raise ValueError(f"samples file does not exist: {samples_path}")
-    table = pq.read_table(samples_path, columns=["sample_id", "group", "token_ids"])
-    histories: list[Sample] = []
-    futures: list[Sample] = []
-    for group, requested, target in (
-        ("history", history_count, histories),
-        ("future", future_count, futures),
-    ):
-        mask = pc.equal(table["group"], group)
-        rows = table.filter(mask)
-        available = len(rows)
-        if available == 0:
-            raise ValueError(f"no {group} samples in {samples_path}")
-        if requested is not None and available < requested:
-            raise ValueError(
-                f"requested {requested} {group} samples but only {available} exist"
-            )
-        selected = rows.slice(0, requested) if requested is not None else rows
-        target.extend(
-            Sample(int(row["sample_id"]), list(row["token_ids"]))
-            for row in selected.to_pylist()
-        )
-    return histories, futures
 
 
 def centered_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -93,14 +58,6 @@ def build_matrix(
     return matrix
 
 
-def _write_atomic(path: Path, writer) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    try:
-        writer(temporary)
-        temporary.replace(path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
 
 
 def build_exp1_table(
@@ -168,15 +125,11 @@ def build_exp1_table(
         "source_metadata": json.loads(raw_source_metadata) if raw_source_metadata else None,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_atomic(outputs[0], lambda tmp: _save_numpy(tmp, matrix))
-    _write_atomic(outputs[1], lambda tmp: pq.write_table(row_table, tmp))
-    _write_atomic(outputs[2], lambda tmp: pq.write_table(column_table, tmp))
-    _write_atomic(
-        outputs[3],
-        lambda tmp: tmp.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-        ),
-    )
+    write_atomic(outputs[0], lambda tmp: save_numpy(tmp, matrix))
+    write_atomic(outputs[1], lambda tmp: pq.write_table(row_table, tmp))
+    write_atomic(outputs[2], lambda tmp: pq.write_table(column_table, tmp))
+    write_atomic(outputs[3], lambda tmp: save_json(tmp, metadata))
+ 
     return {
         "output_dir": str(output_dir),
         "rows": len(histories),
@@ -186,6 +139,4 @@ def build_exp1_table(
     }
 
 
-def _save_numpy(path: Path, matrix: np.ndarray) -> None:
-    with path.open("wb") as stream:
-        np.save(stream, matrix)
+ 

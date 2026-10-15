@@ -7,11 +7,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
-from experiments.exp1_L_M_table.table import (
-    _save_numpy,
-    _write_atomic,
-    load_samples,
-)
+from experiments.common import load_samples, save_json, save_numpy, write_atomic
 from utils import CausalLMInference
 
 
@@ -67,13 +63,8 @@ def build_exp2_pfh(
         "source_metadata": json.loads(raw_source_metadata) if raw_source_metadata else None,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_atomic(outputs[0], lambda tmp: _save_numpy(tmp, matrix))
-    _write_atomic(
-        outputs[1],
-        lambda tmp: tmp.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-        ),
-    )
+    write_atomic(outputs[0], lambda tmp: save_numpy(tmp, matrix))
+    write_atomic(outputs[1], lambda tmp: save_json(tmp, metadata))
     return {
         "output_dir": str(output_dir),
         "rows": len(histories),
