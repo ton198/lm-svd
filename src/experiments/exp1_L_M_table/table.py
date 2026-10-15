@@ -3,15 +3,14 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-import torch
+
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import torch
+
 from experiments.common import Sample, load_samples, save_json, save_numpy, write_atomic
-
 from utils import CausalLMInference
-
 
 
 def centered_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -56,8 +55,6 @@ def build_matrix(
             flush=True,
         )
     return matrix
-
-
 
 
 def build_exp1_table(
@@ -129,7 +126,7 @@ def build_exp1_table(
     write_atomic(outputs[1], lambda tmp: pq.write_table(row_table, tmp))
     write_atomic(outputs[2], lambda tmp: pq.write_table(column_table, tmp))
     write_atomic(outputs[3], lambda tmp: save_json(tmp, metadata))
- 
+
     return {
         "output_dir": str(output_dir),
         "rows": len(histories),
@@ -137,6 +134,3 @@ def build_exp1_table(
         "top_k": top_k,
         "model_path": str(model_path),
     }
-
-
- 

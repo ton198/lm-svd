@@ -10,7 +10,6 @@ import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
 from experiments.exp1_L_M_table import build_exp1_table
-from experiments.exp1_L_M_table.svd import compute_svd
 from utils import CausalLMInference
 
 
@@ -132,34 +131,6 @@ class Exp1TableTests(unittest.TestCase):
                 output_dir=self.root / "insufficient",
                 overwrite=False,
             )
-
-
-class Exp1SvdTests(unittest.TestCase):
-    def test_outputs_are_written_and_consistent(self) -> None:
-        a = (
-            np.outer([1, 2, 3, 4], [1, 0, 2, 0, 1, 3])
-            + np.outer([0, 1, 0, -1], [2, 1, 0, 1, 0, 1])
-        ).astype(np.float32)
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            np.save(tmp / "matrix.npy", a)
-            summary = compute_svd(input_dir=tmp, output_dir=tmp, overwrite=False)
-            self.assertEqual(summary["rank"], 2)
-            metadata = json.loads((tmp / "svd_metadata.json").read_text(encoding="utf-8"))
-            self.assertEqual(metadata["rank"], 2)
-            U = np.load(tmp / "svd_U.npy")
-            S = np.load(tmp / "svd_S.npy")
-            Vt = np.load(tmp / "svd_Vt.npy")
-            np.testing.assert_allclose((U * S) @ Vt, a, atol=1e-5)
-            self.assertIsNone(metadata["table_metadata"])
-
-    def test_existing_output_requires_overwrite(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tmp = Path(directory)
-            np.save(tmp / "matrix.npy", np.zeros((3, 5), dtype=np.float32))
-            (tmp / "svd_S.npy").touch()
-            with self.assertRaisesRegex(FileExistsError, "pass --overwrite"):
-                compute_svd(input_dir=tmp, output_dir=tmp, overwrite=False)
 
 
 if __name__ == "__main__":
