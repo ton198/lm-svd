@@ -1,0 +1,26 @@
+[project]
+name = "lm-svd"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Tony Li", email = "ton20060624@outlook.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.4",
+    "pyarrow>=26.0.0",
+    "torch>=2.14.1",
+    "transformers>=5.19.0",
+]
+
+[project.scripts]
+lm-svd = "lm_svd:main"
+data-pipline = "data_pipline.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["lm_svd", "data_pipline", "utils", "experiments"]
