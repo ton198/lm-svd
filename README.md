@@ -38,20 +38,31 @@ The script downloads **complete inference files**, not every file in the upstrea
 | `models/gpt2-small` | [openai-community/gpt2](https://huggingface.co/openai-community/gpt2) | `607a30d783dfa663caf39e06633721c8d4cfcd7e` |
 | `models/gpt2-medium` | [openai-community/gpt2-medium](https://huggingface.co/openai-community/gpt2-medium) | `6dcaa7a952f72f9298047fd5137cd6e4f05f41da` |
 
-Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of `gpt2-small` and `gpt2-medium`; by default it is the repository's `models/` directory. Internet access is required to fetch missing files; do not enable offline mode until this step finishes.
+Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of `gpt2-small` and `gpt2-medium`; by default it is the repository's `models/` directory. Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
 
-After downloading, all tokenization and model inference can run offline:
-
-```bash
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-```
+After downloading both models and source data, all tokenization and model inference can run offline.
 
 Both models have been verified with local-only tokenizer loading and CPU inference, including next-token logits and conditional continuation log probabilities.
 
 ## 3. Prepare shared history/future samples
 
-The data pipeline reads **local Parquet shards**; it does not download the dataset. For the default configuration, provide files matching:
+Download the source dataset before generating history/future windows:
+
+```bash
+# Default: WikiText-103 raw, including train, validation, and test.
+uv run python scripts/download_samples.py
+
+# The training split alone is sufficient for the default experiments.
+uv run python scripts/download_samples.py --splits train
+
+# Optional: download all four WikiText configurations.
+uv run python scripts/download_samples.py \
+  --configs wikitext-103-raw-v1 wikitext-103-v1 wikitext-2-raw-v1 wikitext-2-v1
+```
+
+The script downloads Parquet shards and the dataset card from [Salesforce/wikitext](https://huggingface.co/datasets/Salesforce/wikitext) at revision `b08601e04326c79dfdd32d625aee71d232d685c3`. It reuses files already downloaded at that revision. The default destination is `data/original/wikitext/`; `--output-dir PATH` changes it. Pass that same path to `build-windows --dataset-dir PATH` if you change it. `--configs` selects configurations and `--splits` selects `train`, `validation`, or `test`.
+
+This script downloads **source text data**, not the generated experiment sample file. The separate `build-windows` step below creates history/future token sequences. Its default input files match:
 
 ```text
 data/original/wikitext/wikitext-103-raw-v1/train-*.parquet
@@ -59,9 +70,12 @@ data/original/wikitext/wikitext-103-raw-v1/train-*.parquet
 
 Each shard must have a non-null `text` column. `--dataset-dir` selects the dataset root; `--config` selects its subdirectory; `--split` selects the filename prefix.
 
-Build the shared sample file once:
+Once both downloads are complete, enable offline mode and build the shared sample file:
 
 ```bash
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
 uv run data-pipline build-windows \
   --dataset-dir data/original/wikitext \
   --config wikitext-103-raw-v1 \
@@ -71,6 +85,8 @@ uv run data-pipline build-windows \
   --future-count 512 --future-tokens 32 \
   --seed 0
 ```
+
+These exports remain active in the current shell. Before running either download script again, use `unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE` to allow network access.
 
 The output is `data/history_future_samples/wikitext-103-raw-v1-train-gpt2-history-future.parquet`. If it already exists, reuse it or explicitly pass `--overwrite` to rebuild it. Both experiments use this path by default. GPT-2 Small and Medium use the same GPT-2 token vocabulary, so the same sample file can be reused for comparisons between them.
 
