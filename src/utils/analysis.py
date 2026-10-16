@@ -4,8 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
-from experiments.common import save_json, save_numpy, write_atomic
-from utils import matrix_svd, numerical_rank
+from .common import save_json, save_numpy, write_atomic
+from .linalg import matrix_svd, numerical_rank
 
 
 SVD_NAMES = ("svd_U.npy", "svd_S.npy", "svd_Vt.npy", "svd_metadata.json")

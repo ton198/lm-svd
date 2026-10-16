@@ -2,12 +2,13 @@
 
 Build matrices from local GPT-2 inference, compute their singular value decompositions (SVDs), measure numerical rank, and plot singular-value decay and cumulative energy.
 
-Both experiments use the same sampled history/future token sequences but construct different matrices:
+All matrix experiments use the same sampled history/future token sequences but construct different matrices:
 
 | Experiment | Matrix entry | Matrix shape | Matrix file |
 | --- | --- | --- | --- |
 | `exp1` | Centered next-token logit for a future-specific header token | histories × (futures × top-k) | `matrix.npy` |
 | `exp2` | Conditional log probability of an entire future given a history | histories × futures | `feature_log_prob.npy` |
+| `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
 
 Each experiment has four independent subcommands, run in order: `get_matrix`, `svd`, `rank`, `visualize`. Once a matrix exists, the analysis stages do not load a language model or need a GPU.
 
@@ -88,7 +89,7 @@ uv run data-pipline build-windows \
 
 These exports remain active in the current shell. Before running either download script again, use `unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE` to allow network access.
 
-The output is `data/history_future_samples/wikitext-103-raw-v1-train-gpt2-history-future.parquet`. If it already exists, reuse it or explicitly pass `--overwrite` to rebuild it. Both experiments use this path by default. GPT-2 Small and Medium use the same GPT-2 token vocabulary, so the same sample file can be reused for comparisons between them.
+The output is `data/history_future_samples/wikitext-103-raw-v1-train-gpt2-history-future.parquet`. If it already exists, reuse it or explicitly pass `--overwrite` to rebuild it. All three experiments use this path by default. GPT-2 Small and Medium use the same GPT-2 token vocabulary, so the same sample file can be reused for comparisons between them.
 
 The pipeline processes sorted shards and rows, encodes each text row independently, concatenates token IDs without inserting separators or EOS tokens, and samples distinct non-overlapping windows. Windows may cross source-row boundaries. Output columns are `sample_id`, `group`, `token_count`, `start_token`, `token_ids`, and `text`. Experiments use **`token_ids`**, not re-encoded text. Sampling settings and source information are stored in the Parquet schema's `lm_svd` metadata.
 
@@ -139,6 +140,7 @@ uv run exp1 visualize --svd-dir "$RESULT_DIR"
 echo "Results: $RESULT_DIR"
 ```
 
+
 ## 5. Experiment 2: conditional future log-probability matrix
 
 For each history/future pair, sum the conditional log probabilities of the future's tokens:
@@ -185,9 +187,34 @@ uv run exp2 visualize --svd-dir "$RESULT_DIR"
 echo "Results: $RESULT_DIR"
 ```
 
-## 6. Understand the analysis outputs
+## 6. Experiment 3: difference between centered-logit matrices
 
-Both experiments share the same analysis implementation:
+`exp3` computes the exp1 matrix for two models on the same sampled histories and futures, then stores `D = L_A - L_B`. Model A selects the top-k header tokens from each future-only context; model B is evaluated on those exact token IDs, so each difference column refers to the same future/token pair in both matrices. The models must use the same token-ID-to-token mapping. Equal vocabulary size is checked, but cannot establish tokenizer identity.
+
+```text
+D[history, (future, token)] = L_A[history, (future, token)]
+                            - L_B[history, (future, token)]
+L[history, (future, token)] = centered logit(token | history + future)
+```
+
+### Full workflow
+
+By default, model A is GPT-2 Small, model B is GPT-2 Medium, and all samples are used. The matrix is `512 × 25600` at top-k 50.
+
+```bash
+RESULT_DIR=data/experiment_results/exp3_L_M_diff/gpt2-small__minus__gpt2-medium
+
+uv run exp3 get_matrix --device cuda --top-k 50 --output-dir "$RESULT_DIR"
+uv run exp3 svd --input-dir "$RESULT_DIR"
+uv run exp3 rank --svd-dir "$RESULT_DIR"
+uv run exp3 visualize --svd-dir "$RESULT_DIR"
+```
+
+Override the models with `--model-a-path` and `--model-b-path`. `get_matrix` writes `matrix.npy` (the difference), `matrix_a.npy`, `matrix_b.npy`, `rows.parquet`, `columns.parquet`, and `metadata.json`. Column tokens and future-only logits in `columns.parquet` come from model A.
+
+## 7. Understand the analysis outputs
+
+All experiments share the same analysis implementation:
 
 | Stage | Reads | Writes |
 | --- | --- | --- |
@@ -215,7 +242,7 @@ Other useful options:
 - `exp2 get_matrix --batch-size N`: score N futures per inference batch; default 64.
 - `get_matrix --device cpu`: use CPU instead of the default CUDA device.
 
-Use `uv run exp1 <subcommand> --help` or `uv run exp2 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>` and `uv run python -m experiments.exp2_PFH <subcommand>`.
+Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv run exp3 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>`, `uv run python -m experiments.exp2_PFH <subcommand>`, and `uv run python -m experiments.exp3_L_M_diff <subcommand>`.
 
 ## Python inference API
 

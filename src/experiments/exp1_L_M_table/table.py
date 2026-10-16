@@ -1,16 +1,23 @@
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
-from experiments.common import Sample, load_samples, save_json, save_numpy, write_atomic
-from utils import CausalLMInference
+from utils import (
+    CausalLMInference,
+    Sample,
+    build_column_table,
+    build_row_table,
+    load_samples,
+    read_source_metadata,
+    save_json,
+    save_numpy,
+    write_atomic,
+)
 
 
 def centered_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -85,29 +92,12 @@ def build_exp1_table(
     header_token_ids, future_only_values = select_header_tokens(inference, futures, top_k)
     matrix = build_matrix(inference, histories, futures, header_token_ids)
 
-    row_table = pa.table(
-        {
-            "row_index": pa.array(range(len(histories)), type=pa.int32()),
-            "history_sample_id": pa.array(
-                [sample.sample_id for sample in histories], type=pa.int32()
-            ),
-        }
+    row_table = build_row_table([sample.sample_id for sample in histories])
+    column_table = build_column_table(
+        [sample.sample_id for sample in futures], header_token_ids, future_only_values
     )
     column_count = len(futures) * top_k
-    columns = {
-        "column_index": pa.array(range(column_count), type=pa.int32()),
-        "future_sample_id": pa.array(
-            [sample.sample_id for sample in futures for _ in range(top_k)], type=pa.int32()
-        ),
-        "rank": pa.array([rank for _ in futures for rank in range(top_k)], type=pa.int32()),
-        "token_id": pa.array(header_token_ids.reshape(-1), type=pa.int32()),
-        "future_only_centered_logit": pa.array(
-            future_only_values.reshape(-1), type=pa.float32()
-        ),
-    }
-    column_table = pa.table(columns)
-    source_metadata = pq.read_schema(samples_path).metadata or {}
-    raw_source_metadata = source_metadata.get(b"lm_svd")
+    source_metadata = read_source_metadata(samples_path)
     metadata = {
         "samples_path": str(samples_path),
         "model_path": str(model_path),
@@ -119,7 +109,7 @@ def build_exp1_table(
         "value": "logit(token | history + future) - mean(logits over full vocabulary)",
         "matrix_shape": list(matrix.shape),
         "matrix_dtype": "float32",
-        "source_metadata": json.loads(raw_source_metadata) if raw_source_metadata else None,
+        "source_metadata": source_metadata,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     write_atomic(outputs[0], lambda tmp: save_numpy(tmp, matrix))

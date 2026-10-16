@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from experiments.analysis import compute_rank, compute_svd, visualize_svd
+from utils import compute_rank, compute_svd, visualize_svd
 from experiments.exp2_PFH.cli import main as exp2_main
 
 

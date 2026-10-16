@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 
 from data_pipline.cli import positive_int
-from experiments.analysis import add_analysis_commands, run_analysis_command
+from utils import add_analysis_commands, run_analysis_command
 
 from .feature_logprob import build_exp2_pfh
 
