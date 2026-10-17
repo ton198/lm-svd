@@ -145,7 +145,12 @@ class Exp3LMDiffTests(unittest.TestCase):
         self.build(output, model_b=self.model_a_path)
         matrix = np.load(output / "matrix.npy")
         self.assertFalse(matrix.any())
-        compute_svd(matrix_path=output / "matrix.npy", output_dir=output, overwrite=False)
+        compute_svd(
+            matrix_path=output / "matrix.npy",
+            output_dir=output,
+            centering="none",
+            overwrite=False,
+        )
         summary = compute_rank(svd_dir=output, overwrite=False)
         self.assertEqual(summary["rank"], 0)
 
@@ -160,10 +165,10 @@ class Exp3LMDiffTests(unittest.TestCase):
         with self.assertRaisesRegex(FileExistsError, "pass --overwrite"):
             self.build(output)
 
-    def test_cli_runs_get_matrix_and_analysis(self) -> None:
+    def test_cli_runs_inference_and_analysis(self) -> None:
         output = self.root / "cli"
         arguments = [
-            "get_matrix",
+            "inference",
             "--samples-path",
             str(self.samples_path),
             "--model-a-path",
@@ -174,18 +179,18 @@ class Exp3LMDiffTests(unittest.TestCase):
             "cpu",
             "--top-k",
             "2",
-            "--output-dir",
+            "--result-dir",
             str(output),
         ]
         with redirect_stdout(StringIO()):
             exp3_main(arguments)
-            exp3_main(["svd", "--input-dir", str(output)])
-            exp3_main(["rank", "--svd-dir", str(output)])
-            exp3_main(["visualize", "--svd-dir", str(output)])
-        rank = json.loads((output / "rank.json").read_text(encoding="utf-8"))
+            exp3_main(["analysis", "--result-dir", str(output)])
+        self.assertTrue((output / "inference" / "matrix.npy").is_file())
+        analysis = output / "analysis" / "none"
+        rank = json.loads((analysis / "rank.json").read_text(encoding="utf-8"))
         self.assertEqual(rank["matrix_shape"], [2, 4])
         self.assertTrue(
-            (output / "svd_spectrum.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+            (analysis / "svd_spectrum.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
         )
 
 

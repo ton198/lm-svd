@@ -10,7 +10,7 @@ All matrix experiments use the same sampled history/future token sequences but c
 | `exp2` | Conditional log probability of an entire future given a history | histories × futures | `feature_log_prob.npy` |
 | `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
 
-Each experiment has four independent subcommands, run in order: `get_matrix`, `svd`, `rank`, `visualize`. Once a matrix exists, the analysis stages do not load a language model or need a GPU.
+Each experiment has two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, analysis does not load a language model or need a GPU.
 
 ## 1. Install dependencies
 
@@ -112,18 +112,16 @@ Set `MODEL` to `gpt2-small` or `gpt2-medium`; the remaining commands work unchan
 MODEL=gpt2-small
 RESULT_DIR="data/experiment_results/exp1_L_M_table/$MODEL"
 
-uv run exp1 get_matrix \
+uv run exp1 inference \
   --model-path "models/$MODEL" \
   --device cuda \
   --top-k 50 \
-  --output-dir "$RESULT_DIR"
+  --result-dir "$RESULT_DIR"
 
-uv run exp1 svd --input-dir "$RESULT_DIR"
-uv run exp1 rank --svd-dir "$RESULT_DIR"
-uv run exp1 visualize --svd-dir "$RESULT_DIR"
+uv run exp1 analysis --result-dir "$RESULT_DIR" --centering none
 ```
 
-`get_matrix` writes `matrix.npy`, `rows.parquet`, `columns.parquet`, and `metadata.json`. The Parquet files map rows and columns to sample IDs, header ranks, token IDs, and future-only centered logits.
+`inference` writes `matrix.npy`, `rows.parquet`, `columns.parquet`, and `metadata.json` under `$RESULT_DIR/inference/`. The Parquet files map rows and columns to sample IDs, header ranks, token IDs, and future-only centered logits.
 
 ### Small CPU smoke run
 
@@ -131,12 +129,10 @@ This uses GPT-2 Small and the leading samples from the same input file. `mktemp`
 
 ```bash
 RESULT_DIR=$(mktemp -d /tmp/lm-svd-exp1.XXXXXX)
-uv run exp1 get_matrix --device cpu \
+uv run exp1 inference --device cpu \
   --history-count 1 --future-count 1 --top-k 2 \
-  --output-dir "$RESULT_DIR"
-uv run exp1 svd --input-dir "$RESULT_DIR"
-uv run exp1 rank --svd-dir "$RESULT_DIR"
-uv run exp1 visualize --svd-dir "$RESULT_DIR"
+  --result-dir "$RESULT_DIR"
+uv run exp1 analysis --result-dir "$RESULT_DIR" --centering global
 echo "Results: $RESULT_DIR"
 ```
 
@@ -159,18 +155,16 @@ Set `MODEL` to `gpt2-small` or `gpt2-medium`. All histories and futures in the s
 MODEL=gpt2-small
 RESULT_DIR="data/experiment_results/exp2_PFH/$MODEL"
 
-uv run exp2 get_matrix \
+uv run exp2 inference \
   --model-path "models/$MODEL" \
   --device cuda \
   --batch-size 64 \
-  --output-dir "$RESULT_DIR"
+  --result-dir "$RESULT_DIR"
 
-uv run exp2 svd --input-dir "$RESULT_DIR"
-uv run exp2 rank --svd-dir "$RESULT_DIR"
-uv run exp2 visualize --svd-dir "$RESULT_DIR"
+uv run exp2 analysis --result-dir "$RESULT_DIR" --centering none
 ```
 
-`get_matrix` writes `feature_log_prob.npy` and `metadata.json`. Keep the matrix filename unchanged when passing this directory to `exp2 svd`.
+`inference` writes `feature_log_prob.npy` and `metadata.json` under `$RESULT_DIR/inference/`. Keep the matrix filename unchanged: `exp2 analysis` reads `inference/feature_log_prob.npy`.
 
 ### Small CPU smoke run
 
@@ -178,12 +172,10 @@ The expected shape is `2 × 2`.
 
 ```bash
 RESULT_DIR=$(mktemp -d /tmp/lm-svd-exp2.XXXXXX)
-uv run exp2 get_matrix --device cpu \
+uv run exp2 inference --device cpu \
   --history-count 2 --future-count 2 --batch-size 2 \
-  --output-dir "$RESULT_DIR"
-uv run exp2 svd --input-dir "$RESULT_DIR"
-uv run exp2 rank --svd-dir "$RESULT_DIR"
-uv run exp2 visualize --svd-dir "$RESULT_DIR"
+  --result-dir "$RESULT_DIR"
+uv run exp2 analysis --result-dir "$RESULT_DIR" --centering none
 echo "Results: $RESULT_DIR"
 ```
 
@@ -204,43 +196,77 @@ By default, model A is GPT-2 Small, model B is GPT-2 Medium, and all samples are
 ```bash
 RESULT_DIR=data/experiment_results/exp3_L_M_diff/gpt2-small__minus__gpt2-medium
 
-uv run exp3 get_matrix --device cuda --top-k 50 --output-dir "$RESULT_DIR"
-uv run exp3 svd --input-dir "$RESULT_DIR"
-uv run exp3 rank --svd-dir "$RESULT_DIR"
-uv run exp3 visualize --svd-dir "$RESULT_DIR"
+uv run exp3 inference --device cuda --top-k 50 --result-dir "$RESULT_DIR"
+uv run exp3 analysis --result-dir "$RESULT_DIR" --centering none
 ```
 
-Override the models with `--model-a-path` and `--model-b-path`. `get_matrix` writes `matrix.npy` (the difference), `matrix_a.npy`, `matrix_b.npy`, `rows.parquet`, `columns.parquet`, and `metadata.json`. Column tokens and future-only logits in `columns.parquet` come from model A.
+Override the models with `--model-a-path` and `--model-b-path`. `inference` writes `matrix.npy` (the difference), `matrix_a.npy`, `matrix_b.npy`, `rows.parquet`, `columns.parquet`, and `metadata.json` under `$RESULT_DIR/inference/`. Column tokens and future-only logits in `columns.parquet` come from model A. Analysis processes only the difference `matrix.npy`, not the two component matrices. Each secondary centering strategy is linear, so `center(L_A - L_B) = center(L_A) - center(L_B)`.
 
 ## 7. Understand the analysis outputs
 
-All experiments share the same analysis implementation:
+All experiments share the same `analysis` command. It reads the matrix and optional sibling `metadata.json` from `<result-dir>/inference/`, then writes all six outputs to `<result-dir>/analysis/<centering>/`:
 
-| Stage | Reads | Writes |
-| --- | --- | --- |
-| `svd` | The experiment's matrix; optional sibling `metadata.json` | `svd_U.npy`, `svd_S.npy`, `svd_Vt.npy`, `svd_metadata.json` |
-| `rank` | `svd_S.npy`, `svd_metadata.json` | `rank.json` |
-| `visualize` | `svd_S.npy`, `rank.json` | `svd_spectrum.png` |
+```text
+data/experiment_results/<experiment>/<run>/
+├── inference/
+│   ├── <matrix file and other inference outputs>
+│   └── metadata.json
+└── analysis/
+    ├── none/
+    │   ├── svd_U.npy
+    │   ├── svd_S.npy
+    │   ├── svd_Vt.npy
+    │   ├── svd_metadata.json
+    │   ├── rank.json
+    │   └── svd_spectrum.png
+    ├── global/  # same six files
+    └── row/     # same six files
+```
 
-- **SVD:** Float64 thin SVD, with no additional centering. Reconstruct the stored matrix as `(U * S) @ Vt`. Metadata records input path, shape and dtype, computation dtype, singular-value extrema, Frobenius norm, relative reconstruction error, and the source matrix metadata under `matrix_metadata`. New SVD metadata does not contain rank fields.
-- **Numerical rank:** Counts singular values strictly greater than `S.max() * max(matrix.shape) * finfo(input_dtype).eps`. The original matrix dtype determines epsilon, even though the SVD is computed in float64; non-floating input uses float64 epsilon. `rank.json` records the rank, tolerance, rule, matrix shape, input dtype, and singular-value count. Existing SVD metadata with legacy rank fields is accepted; rank is recomputed from the singular values.
-- **Visualization:** `svd_spectrum.png` contains logarithmic singular-value decay with rank and tolerance markers, plus cumulative squared Frobenius energy with a rank marker. It uses Matplotlib's headless Agg backend. An all-zero spectrum is rejected because normalized energy is undefined. Existing manual `singular_value_decay.png` plots are untouched.
+`<run>` is the model directory name for exp1/exp2 (for example, `gpt2-small`), or `<model_a>__minus__<model_b>` for exp3 (for example, `gpt2-small__minus__gpt2-medium`). Only the requested strategy directory is created.
+
+### Secondary centering
+
+`analysis --centering {none,global,row}` selects how the stored matrix `M` is transformed before SVD; the default is `none`:
+
+| Strategy | Matrix decomposed |
+| --- | --- |
+| `none` | `M` |
+| `global` | `M - mean(M)` |
+| `row` | `M - mean(M, axis=1, keepdims=True)` |
+
+Row centering subtracts each history's mean across all columns: futures × header tokens for exp1/exp3, or futures for exp2. This is **secondary** centering: it does not change the base vocabulary-mean logit subtraction in exp1/exp3, and exp2 inference still stores uncentered log-probability sums. Selecting only top-k header tokens can leave the stored exp1/exp3 matrix biased toward large values despite its base vocabulary centering.
+
+For example, compare all strategies without rerunning inference:
+
+```bash
+RESULT_DIR=data/experiment_results/exp2_PFH/gpt2-small
+for CENTERING in none global row; do
+  uv run exp2 analysis --result-dir "$RESULT_DIR" --centering "$CENTERING"
+done
+```
+
+If `none` was already analyzed, add `--overwrite` to regenerate it.
+
+- **SVD:** Float64 thin SVD of the selected centered matrix. `(U * S) @ Vt` reconstructs that matrix, not the original stored matrix unless centering is `none`. The centered matrix is not saved separately. `svd_metadata.json` records `centering`, `centering_formula`, input path, shape and original dtype, computation dtype, singular-value extrema, the centered Frobenius norm and relative reconstruction error, and source matrix metadata under `matrix_metadata`. New SVD metadata does not contain rank fields.
+- **Numerical rank:** Counts singular values strictly greater than `S.max() * max(matrix.shape) * finfo(input_dtype).eps`. The original stored matrix dtype determines epsilon for all three strategies, even though centering and SVD use float64; non-floating input uses float64 epsilon. `rank.json` records the rank, tolerance, rule, matrix shape, input dtype, and singular-value count. Existing SVD metadata with legacy rank fields is accepted; rank is recomputed from the singular values.
+- **Visualization:** `svd_spectrum.png` contains singular-value decay with logarithmic index and singular-value axes, plus cumulative squared Frobenius energy with linear index and energy axes. Indices start at 1. Rank markers appear in both panels, and the singular-value panel also shows the tolerance. It uses Matplotlib's headless Agg backend. An all-zero spectrum is rejected because normalized energy is undefined, including when centering produces an all-zero matrix; SVD and rank outputs have already been written in that case. Existing manual `singular_value_decay.png` plots are untouched.
 
 ### Directory selection and existing results
 
-**Analysis commands do not infer the model from your last `get_matrix` call.** If no directory options are supplied, they always use the GPT-2 Small result directory for that experiment. Always pass explicit directories for Medium, custom outputs, or smoke runs, as shown above.
+**Analysis does not infer the model from your last `inference` call.** Without `--result-dir`, it always uses the default GPT-2 Small run for that experiment (Small minus Medium for exp3). Always pass `--result-dir` for Medium, custom outputs, or smoke runs, as shown above.
 
-`get_matrix` defaults to `models/gpt2-small` and writes under `data/experiment_results/<experiment>/<model-directory-name>/`. A different `--model-path` changes that default result directory. `svd --output-dir PATH` can write factors elsewhere; subsequent `rank` and `visualize` calls must use that output directory as `--svd-dir`.
+`inference` defaults to `models/gpt2-small` for exp1/exp2 and writes to `data/experiment_results/<experiment>/<model-directory-name>/inference/`. A different `--model-path` changes that default run directory. Exp3 derives its default run directory from both model directory names. `--result-dir PATH` selects the run root, not its `inference/` or `analysis/` child.
 
-Every stage refuses to replace its own existing outputs unless `--overwrite` is supplied. If a stage has already completed, reuse its files and start at the next stage. When regenerating a matrix, rerun **all downstream stages** to avoid mixing results from different inputs; overwriting one stage does not refresh the others.
+Inference refuses to replace its existing outputs without `--overwrite`. Analysis prechecks all six outputs for the selected strategy and refuses to start if any exists unless `--overwrite` is supplied; this prevents an existing rank or plot file from causing a late overwrite conflict after SVD. `analysis --overwrite` replaces only that strategy's analysis outputs, not inference files or other strategies. When regenerating inference, rerun analysis with `--overwrite` for every previously computed strategy you intend to use; overwriting inference does not refresh analysis.
 
 Other useful options:
 
-- `get_matrix --samples-path PATH`: use another history/future sample file.
-- `get_matrix --history-count N --future-count N`: use only the leading N samples of each group; omit both to use all available samples.
-- `exp1 get_matrix --top-k K`: select K header tokens per future; default 50.
-- `exp2 get_matrix --batch-size N`: score N futures per inference batch; default 64.
-- `get_matrix --device cpu`: use CPU instead of the default CUDA device.
+- `inference --samples-path PATH`: use another history/future sample file.
+- `inference --history-count N --future-count N`: use only the leading N samples of each group; omit both to use all available samples.
+- `exp1 inference --top-k K`: select K header tokens per future; default 50.
+- `exp2 inference --batch-size N`: score N futures per inference batch; default 64.
+- `inference --device cpu`: use CPU instead of the default CUDA device.
 
 Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv run exp3 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>`, `uv run python -m experiments.exp2_PFH <subcommand>`, and `uv run python -m experiments.exp3_L_M_diff <subcommand>`.
 

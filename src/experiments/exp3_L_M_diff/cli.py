@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 
 from data_pipline.cli import positive_int
-from utils import add_analysis_commands, run_analysis_command
+from utils import INFERENCE_DIR, add_analysis_command, run_analysis
 
 from .table import build_exp3_diff
 
@@ -13,6 +13,7 @@ DEFAULT_SAMPLES = Path(
 DEFAULT_RESULT_DIR = Path(
     "data/experiment_results/exp3_L_M_diff/gpt2-small__minus__gpt2-medium"
 )
+MATRIX_NAME = "matrix.npy"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -21,29 +22,41 @@ def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    matrix_parser = subparsers.add_parser(
-        "get_matrix",
+    inference_parser = subparsers.add_parser(
+        "inference",
         help="Build the difference between two L/M matrices",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    matrix_parser.add_argument("--samples-path", type=Path, default=DEFAULT_SAMPLES)
-    matrix_parser.add_argument("--model-a-path", type=Path, default=Path("models/gpt2-small"))
-    matrix_parser.add_argument("--model-b-path", type=Path, default=Path("models/gpt2-medium"))
-    matrix_parser.add_argument("--device", default="cuda")
-    matrix_parser.add_argument("--history-count", type=positive_int, default=None)
-    matrix_parser.add_argument("--future-count", type=positive_int, default=None)
-    matrix_parser.add_argument("--top-k", type=positive_int, default=50)
-    matrix_parser.add_argument("--output-dir", type=Path, default=None)
-    matrix_parser.add_argument("--overwrite", action="store_true")
-    add_analysis_commands(subparsers, result_dir=DEFAULT_RESULT_DIR, matrix_name="matrix.npy")
+    inference_parser.add_argument("--samples-path", type=Path, default=DEFAULT_SAMPLES)
+    inference_parser.add_argument("--model-a-path", type=Path, default=Path("models/gpt2-small"))
+    inference_parser.add_argument("--model-b-path", type=Path, default=Path("models/gpt2-medium"))
+    inference_parser.add_argument("--device", default="cuda")
+    inference_parser.add_argument("--history-count", type=positive_int, default=None)
+    inference_parser.add_argument("--future-count", type=positive_int, default=None)
+    inference_parser.add_argument("--top-k", type=positive_int, default=50)
+    inference_parser.add_argument(
+        "--result-dir",
+        type=Path,
+        default=None,
+        help="Experiment result directory; outputs go to <result-dir>/inference",
+    )
+    inference_parser.add_argument("--overwrite", action="store_true")
+    add_analysis_command(subparsers, result_dir=DEFAULT_RESULT_DIR)
     args = parser.parse_args(argv)
-    if args.command != "get_matrix":
+    if args.command == "analysis":
         try:
-            print(run_analysis_command(args))
+            print(
+                run_analysis(
+                    result_dir=args.result_dir,
+                    matrix_name=MATRIX_NAME,
+                    centering=args.centering,
+                    overwrite=args.overwrite,
+                )
+            )
         except (ValueError, FileExistsError) as error:
             parser.error(str(error))
         return
-    output_dir = args.output_dir or (
+    result_dir = args.result_dir or (
         Path("data/experiment_results/exp3_L_M_diff")
         / f"{args.model_a_path.name}__minus__{args.model_b_path.name}"
     )
@@ -56,7 +69,7 @@ def main(argv: list[str] | None = None) -> None:
             history_count=args.history_count,
             future_count=args.future_count,
             top_k=args.top_k,
-            output_dir=output_dir,
+            output_dir=result_dir / INFERENCE_DIR,
             overwrite=args.overwrite,
         )
     except (ValueError, FileExistsError) as error:

@@ -11,13 +11,38 @@ from .linalg import matrix_svd, numerical_rank
 SVD_NAMES = ("svd_U.npy", "svd_S.npy", "svd_Vt.npy", "svd_metadata.json")
 RANK_NAME = "rank.json"
 PLOT_NAME = "svd_spectrum.png"
+INFERENCE_DIR = "inference"
+ANALYSIS_DIR = "analysis"
+CENTERING_CHOICES = ("none", "global", "row")
+CENTERING_FORMULAS = {
+    "none": "M",
+    "global": "M - mean(M)",
+    "row": "M - mean(M, axis=1, keepdims=True)",
+}
+
+
+def center_matrix(matrix: np.ndarray, centering: str) -> np.ndarray:
+    if centering not in CENTERING_CHOICES:
+        raise ValueError(
+            f"unknown centering: {centering}; expected one of {', '.join(CENTERING_CHOICES)}"
+        )
+    data = matrix.astype(np.float64)
+    if centering == "global":
+        return data - data.mean()
+    if centering == "row":
+        return data - data.mean(axis=1, keepdims=True)
+    return data
 
 
 def compute_svd(
-    *, matrix_path: Path, output_dir: Path, overwrite: bool
+    *, matrix_path: Path, output_dir: Path, centering: str, overwrite: bool
 ) -> dict[str, int | float | str]:
     if not matrix_path.is_file():
         raise ValueError(f"matrix file does not exist: {matrix_path}")
+    if centering not in CENTERING_CHOICES:
+        raise ValueError(
+            f"unknown centering: {centering}; expected one of {', '.join(CENTERING_CHOICES)}"
+        )
     for name in SVD_NAMES:
         path = output_dir / name
         if path.exists() and not overwrite:
@@ -26,8 +51,8 @@ def compute_svd(
             )
 
     matrix = np.load(matrix_path)
-    result = matrix_svd(matrix)
-    data = matrix.astype(np.float64)
+    data = center_matrix(matrix, centering)
+    result = matrix_svd(data)
     frobenius_norm = float(np.linalg.norm(data))
     reconstruction_relative_error = (
         float(np.linalg.norm(data - (result.U * result.S) @ result.Vt) / frobenius_norm)
@@ -41,7 +66,8 @@ def compute_svd(
         "matrix_shape": [m, n],
         "input_dtype": str(matrix.dtype),
         "compute_dtype": "float64",
-        "centering": "none (SVD of the stored matrix)",
+        "centering": centering,
+        "centering_formula": CENTERING_FORMULAS[centering],
         "svd": "thin: matrix = U @ diag(S) @ Vt",
         "singular_value_max": float(result.S[0]),
         "singular_value_min": float(result.S[-1]),
@@ -59,6 +85,7 @@ def compute_svd(
     write_atomic(output_dir / SVD_NAMES[3], lambda tmp: save_json(tmp, metadata))
     return {
         "output_dir": str(output_dir),
+        "centering": centering,
         "rows": m,
         "columns": n,
         "singular_value_max": float(result.S[0]),
@@ -133,6 +160,7 @@ def visualize_svd(*, svd_dir: Path, overwrite: bool) -> Path:
     indices = np.arange(1, singular_values.size + 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     try:
+        axes[0].set_xscale("log")
         axes[0].semilogy(indices, np.where(singular_values > 0, singular_values, np.nan))
         axes[0].axvline(rank, color="red", linestyle="--", label=f"rank = {rank}")
         axes[0].axhline(tolerance, color="gray", linestyle=":", label="tolerance")
@@ -156,60 +184,54 @@ def visualize_svd(*, svd_dir: Path, overwrite: bool) -> Path:
     return output_path
 
 
-def add_analysis_commands(subparsers, *, result_dir: Path, matrix_name: str) -> None:
-    svd_parser = subparsers.add_parser(
-        "svd",
-        help="Compute the matrix SVD",
+def add_analysis_command(subparsers, *, result_dir: Path) -> None:
+    parser = subparsers.add_parser(
+        "analysis",
+        help="Run SVD, rank, and visualization on the inference matrix",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    svd_parser.add_argument(
-        "--input-dir", type=Path, default=result_dir,
-        help=f"Directory containing {matrix_name}",
+    parser.add_argument(
+        "--result-dir", type=Path, default=result_dir,
+        help="Experiment result directory; reads <result-dir>/inference, writes <result-dir>/analysis/<centering>",
     )
-    svd_parser.add_argument(
-        "--output-dir", type=Path, default=None,
-        help="Output directory; use the input directory when unset",
+    parser.add_argument(
+        "--centering", choices=CENTERING_CHOICES, default="none",
+        help="Secondary centering applied before SVD",
     )
-    svd_parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
-    svd_parser.set_defaults(matrix_name=matrix_name)
-    for command, help_text in (
-        ("rank", "Compute numerical rank from the SVD"),
-        ("visualize", "Plot singular values and cumulative energy"),
-    ):
-        parser = subparsers.add_parser(
-            command, help=help_text,
-            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        )
-        parser.add_argument(
-            "--svd-dir", type=Path, default=result_dir,
-            help="Directory containing SVD results",
-        )
-        parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
-        parser.set_defaults(matrix_name=matrix_name)
+    parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
 
 
-def run_analysis_command(args) -> str:
-    if args.command == "svd":
-        summary = compute_svd(
-            matrix_path=args.input_dir / args.matrix_name,
-            output_dir=args.output_dir or args.input_dir,
-            overwrite=args.overwrite,
+def run_analysis(
+    *, result_dir: Path, matrix_name: str, centering: str, overwrite: bool
+) -> str:
+    if centering not in CENTERING_CHOICES:
+        raise ValueError(
+            f"unknown centering: {centering}; expected one of {', '.join(CENTERING_CHOICES)}"
         )
-        return (
-            f"output_dir: {summary['output_dir']}\n"
-            f"matrix: {summary['rows']} x {summary['columns']}\n"
-            f"singular values: max {summary['singular_value_max']:.6g}, "
-            f"min {summary['singular_value_min']:.6g}; "
-            f"reconstruction relative error {summary['reconstruction_relative_error']:.3e}"
-        )
-    if args.command == "rank":
-        summary = compute_rank(svd_dir=args.svd_dir, overwrite=args.overwrite)
-        return (
-            f"output: {summary['output_path']}\n"
-            f"rank: {summary['rank']}\n"
-            f"tolerance: {summary['rank_tolerance']:.6g}"
-        )
-    if args.command == "visualize":
-        path = visualize_svd(svd_dir=args.svd_dir, overwrite=args.overwrite)
-        return f"output: {path}"
-    raise ValueError(f"unknown analysis command: {args.command}")
+    matrix_path = result_dir / INFERENCE_DIR / matrix_name
+    output_dir = result_dir / ANALYSIS_DIR / centering
+    if not overwrite:
+        for name in (*SVD_NAMES, RANK_NAME, PLOT_NAME):
+            path = output_dir / name
+            if path.exists():
+                raise FileExistsError(
+                    f"output already exists: {path}; pass --overwrite to replace it"
+                )
+    svd = compute_svd(
+        matrix_path=matrix_path,
+        output_dir=output_dir,
+        centering=centering,
+        overwrite=overwrite,
+    )
+    rank = compute_rank(svd_dir=output_dir, overwrite=overwrite)
+    plot_path = visualize_svd(svd_dir=output_dir, overwrite=overwrite)
+    return (
+        f"output_dir: {output_dir}\n"
+        f"centering: {centering}\n"
+        f"matrix: {svd['rows']} x {svd['columns']}\n"
+        f"singular values: max {svd['singular_value_max']:.6g}, "
+        f"min {svd['singular_value_min']:.6g}; "
+        f"reconstruction relative error {svd['reconstruction_relative_error']:.3e}\n"
+        f"rank: {rank['rank']} (tolerance {rank['rank_tolerance']:.6g})\n"
+        f"plot: {plot_path}"
+    )
