@@ -184,21 +184,18 @@ def visualize_svd(*, svd_dir: Path, overwrite: bool) -> Path:
     return output_path
 
 
-def add_analysis_command(subparsers, *, result_dir: Path) -> None:
+def add_analysis_command(subparsers) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "analysis",
         help="Run SVD, rank, and visualization on the inference matrix",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--result-dir", type=Path, default=result_dir,
-        help="Experiment result directory; reads <result-dir>/inference, writes <result-dir>/analysis/<centering>",
-    )
-    parser.add_argument(
         "--centering", choices=CENTERING_CHOICES, default="none",
         help="Secondary centering applied before SVD",
     )
     parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
+    return parser
 
 
 def run_analysis(

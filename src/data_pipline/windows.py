@@ -10,6 +10,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
+from .io import write_parquet_atomic
+
 
 @dataclass(frozen=True)
 class Window:
@@ -165,14 +167,7 @@ def build_windows_table(
         for index, field in enumerate(schema)
     ]
     table = pa.Table.from_arrays(arrays, schema=schema)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".tmp")
-    try:
-        pq.write_table(table, temporary)
-        temporary.replace(output)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    write_parquet_atomic(table, output)
     return {
         "output": str(output),
         "stream_tokens": len(stream),

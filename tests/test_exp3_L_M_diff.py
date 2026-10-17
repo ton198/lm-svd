@@ -4,6 +4,7 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pyarrow as pa
@@ -166,11 +167,15 @@ class Exp3LMDiffTests(unittest.TestCase):
             self.build(output)
 
     def test_cli_runs_inference_and_analysis(self) -> None:
-        output = self.root / "cli"
+        results_root = self.root / "cli"
+        output = (
+            results_root / "exp3_L_M_diff"
+            / f"samples__{self.model_a_path.name}__minus__{self.model_b_path.name}"
+        )
         arguments = [
             "inference",
-            "--samples-path",
-            str(self.samples_path),
+            "--dataset",
+            "samples",
             "--model-a-path",
             str(self.model_a_path),
             "--model-b-path",
@@ -179,12 +184,20 @@ class Exp3LMDiffTests(unittest.TestCase):
             "cpu",
             "--top-k",
             "2",
-            "--result-dir",
-            str(output),
+            "--results-root",
+            str(results_root),
         ]
-        with redirect_stdout(StringIO()):
+        with (
+            mock.patch("utils.experiment_paths.SAMPLES_DIR", self.root),
+            redirect_stdout(StringIO()),
+        ):
             exp3_main(arguments)
-            exp3_main(["analysis", "--result-dir", str(output)])
+            exp3_main([
+                "analysis", "--dataset", "samples",
+                "--results-root", str(results_root),
+                "--model-a-path", str(self.model_a_path),
+                "--model-b-path", str(self.model_b_path),
+            ])
         self.assertTrue((output / "inference" / "matrix.npy").is_file())
         analysis = output / "analysis" / "none"
         rank = json.loads((analysis / "rank.json").read_text(encoding="utf-8"))

@@ -97,8 +97,9 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse((self.root / "svd_spectrum.png").exists())
 
     def test_exp2_analysis_writes_each_centering_to_its_own_directory(self) -> None:
-        inference = self.root / "inference"
-        inference.mkdir()
+        run = self.root / "exp2_PFH" / "wikitext__gpt2-small"
+        inference = run / "inference"
+        inference.mkdir(parents=True)
         matrix_path = inference / "feature_log_prob.npy"
         np.save(matrix_path, self.matrix)
         (inference / "metadata.json").write_text(
@@ -119,10 +120,10 @@ class AnalysisTests(unittest.TestCase):
             with self.subTest(centering=centering):
                 with redirect_stdout(StringIO()):
                     exp2_main([
-                        "analysis", "--result-dir", str(self.root),
+                        "analysis", "--results-root", str(self.root),
                         "--centering", centering,
                     ])
-                output = self.root / "analysis" / centering
+                output = run / "analysis" / centering
                 U = np.load(output / "svd_U.npy")
                 S = np.load(output / "svd_S.npy")
                 Vt = np.load(output / "svd_Vt.npy")
@@ -148,7 +149,7 @@ class AnalysisTests(unittest.TestCase):
 
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             exp2_main([
-                "analysis", "--result-dir", str(self.root), "--centering", "row"
+                "analysis", "--results-root", str(self.root), "--centering", "row"
             ])
         with self.assertRaisesRegex(ValueError, "unknown centering"):
             compute_svd(

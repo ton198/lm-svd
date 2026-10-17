@@ -64,7 +64,7 @@ class CausalLMInferenceTests(unittest.TestCase):
 
     def test_continuation_log_probs_match_tokenwise_scores_and_batch_sizes(self) -> None:
         context = [1, 2, 3]
-        continuations = [[7, 8], [9, 10], [2, 4]]
+        continuations = [[7, 8], [9], [2, 4]]
         expected = []
         for continuation in continuations:
             prefix = list(context)
@@ -96,10 +96,6 @@ class CausalLMInferenceTests(unittest.TestCase):
             self.inference.continuation_log_probs([], [[2]])
         with self.assertRaisesRegex(ValueError, "continuations must not be empty"):
             self.inference.continuation_log_probs([1], [])
-        with self.assertRaisesRegex(
-            ValueError, "continuations must all have the same length"
-        ):
-            self.inference.continuation_log_probs([1], [[2], [3, 4]])
         with self.assertRaisesRegex(
             ValueError,
             "context plus continuation length 7 exceeds model maximum 6",
