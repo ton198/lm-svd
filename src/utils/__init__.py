@@ -12,6 +12,7 @@ from .analysis import (
 from .common import Sample, load_samples, save_json, save_numpy, write_atomic
 from .inference import CausalLMInference
 from .linalg import MatrixSVD, matrix_svd, numerical_rank
+from .neural_svd import NestedLoRASVDLoss, NeuralSVDSpectrum, nesting_masks, neural_svd_spectrum
 from .lm_table import build_column_table, build_row_table, read_source_metadata
 
 __all__ = [
@@ -20,6 +21,8 @@ __all__ = [
     "INFERENCE_DIR",
     "CausalLMInference",
     "MatrixSVD",
+    "NestedLoRASVDLoss",
+    "NeuralSVDSpectrum",
     "Sample",
     "add_analysis_command",
     "build_column_table",
@@ -29,6 +32,8 @@ __all__ = [
     "compute_svd",
     "load_samples",
     "matrix_svd",
+    "nesting_masks",
+    "neural_svd_spectrum",
     "numerical_rank",
     "read_source_metadata",
     "run_analysis",

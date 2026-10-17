@@ -286,6 +286,40 @@ scores = inference.continuation_log_probs(
 
 `next_token_logits` returns unnormalized logits as a CPU float32 tensor of shape `(vocab_size,)`. `continuation_log_probs` returns one summed conditional log probability per continuation as a CPU float64 tensor. Inputs must be non-empty integer token-ID sequences within the model vocabulary and context limit; continuations in one call must have equal lengths. Load models sequentially when memory is limited.
 
+## NeuralSVD utility API
+
+`utils.NestedLoRASVDLoss` ports the SVD loss and nesting masks from Ryu et al.'s
+NestedLoRA (ICML 2024). It accepts row features `f` of shape `(B_rows, rank)`,
+column features `g` of shape `(B_cols, rank)`, and the corresponding matrix block
+`a_block` of shape `(B_rows, B_cols)`. Sample rows and columns independently.
+Features may come from trainable lookup tables or encoders; the utility does not
+load or save matrices.
+
+```python
+from utils import NestedLoRASVDLoss, neural_svd_spectrum
+
+loss_fn = NestedLoRASVDLoss(rank=3)  # joint nesting; optionally step=2
+# f, g are model outputs; a_block contains A(row_i, column_j).
+loss = loss_fn(f, g, a_block)
+loss.backward()
+# After training, evaluate features on the desired rows and columns:
+spectrum = neural_svd_spectrum(f.detach(), g.detach())
+```
+
+Move `loss_fn` to the features' device with `.to(device)`. It computes both
+normalized operator products internally, converts `a_block` to `f`'s dtype and
+device, and does not differentiate through the block. `sequential=True` selects
+the original asymmetric prefix gradients and requires `step=1`.
+`nesting_masks(rank, step=1, sequential=False)` exposes the masks separately.
+
+`neural_svd_spectrum` returns a `NeuralSVDSpectrum` with `singular_values`, `left`,
+and `right`; columns of the latter two have unit mean square. For a finite
+`m × n` matrix evaluated on all rows and columns uniformly, multiply the returned
+singular values by `sqrt(m * n)` to recover matrix singular values, and divide
+`left` and `right` by `sqrt(m)` and `sqrt(n)` for unit-norm vectors. Results retain
+the learned column order: they are not sorted, so unconverged ordering remains
+visible. This API does not change the existing experiment analysis commands.
+
 ## Tests
 
 ```bash
