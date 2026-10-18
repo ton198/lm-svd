@@ -140,6 +140,14 @@ mkdir -p bluehive_run/logs
 sbatch bluehive_run/task-single-text.sbatch
 ```
 
+To submit only one experiment, use the single-experiment launcher with an explicit experiment name:
+
+```bash
+bash submit-single.sh exp3  # Required: select exp1, exp2, or exp3.
+```
+
+The launcher requires exactly one experiment name; missing or invalid arguments produce an error without submitting a job. It switches to its own repository directory, creates the log directory, and overrides the existing batch script's array range with a single task ID (`--array=3` for `exp3`). Resource requests, dataset, inference → analysis ordering, and log paths remain the same; no other experiment is submitted. Do not run it alongside another job writing the same experiment's result directory.
+
 Create the log directory before submission, as shown above, so Slurm can open `bluehive_run/logs/slurm-<job-name>-<array-job-id>_<array-task-id>.out` and `.err` before the script starts. The script uses `SLURM_SUBMIT_DIR` as its working directory, so submit from the repository root. Per-experiment inference and analysis logs are created under `bluehive_run/logs/slurm-<job-name>-<array-job-id>_<array-task-id>/`.
 
 The submission creates three independently scheduled array tasks (`--array=1-3`), mapping task IDs 1, 2 and 3 to `exp1`, `exp2` and `exp3`, respectively. Each task requests one H100, 4 CPUs, 16 GiB host memory and a maximum of two hours (`02:00:00`). Each runs only its assigned experiment's inference, then its matching analysis; any failed command stops that task, so failed inference skips analysis. The script uses all dataset rows and the default result directories, without `--overwrite`: existing outputs cause failure rather than being silently replaced. Do not submit overlapping arrays or other jobs against those same result directories.
