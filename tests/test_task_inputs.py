@@ -12,9 +12,11 @@ from data_pipline.task_inputs import (
     TaskCandidate,
     finalize_tasks,
     load_sni_tasks,
+    load_task_catalog,
     load_tasksource_tasks,
     order_by_bucket,
     select_passages,
+    select_single_text_tasks,
 )
 
 
@@ -142,6 +144,69 @@ class TasksourceTaskTests(unittest.TestCase):
         self.assertTrue(tasks[0].instruction.endswith('with either "no" or "yes".'))
 
 
+class TaskCatalogTests(unittest.TestCase):
+    def load_rows(self, rows: list[dict]) -> list[TaskCandidate]:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic.jsonl"
+            path.write_text(
+                "\n" + "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            return load_task_catalog(path)
+
+    def test_valid_row_preserves_catalog_source_id_and_category(self) -> None:
+        tasks = self.load_rows([
+            {
+                "id": "task-summary",
+                "source": "sni",
+                "category": "Summarization",
+                "instruction": "Summarize the document in one sentence.",
+            },
+        ])
+
+        self.assertEqual(tasks, [
+            TaskCandidate(
+                source="sni",
+                source_id="task-summary",
+                category="Summarization",
+                instruction="Summarize the document in one sentence.",
+                format_class="single_text",
+                format_reason=None,
+            ),
+        ])
+
+    def test_duplicate_id_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "^duplicate task id: syn-0001$"):
+            self.load_rows([
+                {"id": "syn-0001", "source": "synthetic", "category": "synthetic",
+                 "instruction": "Summarize the document."},
+                {"id": "syn-0001", "source": "sni", "category": "Summarization",
+                 "instruction": "List the main points of the text."},
+            ])
+
+    def test_missing_fields_report_path_and_physical_line_number(self) -> None:
+        for field in ("id", "source", "category", "instruction"):
+            with self.subTest(field=field):
+                row = {
+                    "id": "syn-0001", "source": "synthetic", "category": "synthetic",
+                    "instruction": "Summarize the document.",
+                }
+                del row[field]
+                with self.assertRaisesRegex(
+                    ValueError, rf"synthetic\.jsonl:2: missing field {field}$",
+                ):
+                    self.load_rows([row])
+
+    def test_unknown_source_reports_path_and_physical_line_number(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, r"synthetic\.jsonl:2: unknown task source other$",
+        ):
+            self.load_rows([
+                {"id": "syn-0001", "source": "other", "category": "synthetic",
+                 "instruction": "Summarize the document."},
+            ])
+
+
 class TaskSelectionTests(unittest.TestCase):
     def test_normalized_dedup_prefers_sni_over_tasksource(self) -> None:
         sni = TaskCandidate(
@@ -164,6 +229,40 @@ class TaskSelectionTests(unittest.TestCase):
         self.assertIsNone(tasksource.history_tokens)
         tokenizer.encode.assert_called_once_with(
             "Instruction: Classify this review!", add_special_tokens=False,
+        )
+
+    def test_synthetic_tasks_follow_original_sources_during_deduplication(self) -> None:
+        original = TaskCandidate(
+            "flan", "original", "flan", "Summarize the text.", "single_text", None,
+        )
+        synthetic = TaskCandidate(
+            "synthetic", "syn-0001", "synthetic", "Summarize the text!",
+            "single_text", None,
+        )
+        tokenizer = Mock()
+        tokenizer.encode.side_effect = lambda text, **kwargs: text.split()
+
+        tasks = finalize_tasks([synthetic, original], tokenizer)
+
+        self.assertEqual(tasks, [original, synthetic])
+        self.assertIsNone(original.reject_reason)
+        self.assertEqual(synthetic.reject_reason, "duplicate_instruction")
+
+    def test_selection_keeps_only_surviving_single_text_tasks(self) -> None:
+        selected = TaskCandidate(
+            "sni", "selected", "summary", "Summarize the text.", "single_text", None,
+        )
+        rejected = TaskCandidate(
+            "sni", "rejected", "summary", "Summarize the text.", "single_text", None,
+            reject_reason="duplicate_instruction",
+        )
+        structured = TaskCandidate(
+            "sni", "structured", "comparison", "Compare the two texts.", "structured",
+            "definition_requires_structure",
+        )
+
+        self.assertEqual(
+            select_single_text_tasks([rejected, structured, selected]), [selected],
         )
 
     def test_bucket_order_is_deterministic_and_prefixes_are_balanced(self) -> None:

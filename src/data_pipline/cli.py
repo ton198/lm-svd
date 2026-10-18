@@ -44,19 +44,9 @@ def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     task_inputs.add_argument(
-        "--sni-headers", type=Path,
-        default=Path("data/original/natural_instructions/task_headers.jsonl"),
-        help="Natural Instructions task headers",
-    )
-    task_inputs.add_argument(
-        "--flan-templates", type=Path,
-        default=Path("data/original/flan/templates.py"),
-        help="Local FLAN templates source",
-    )
-    task_inputs.add_argument(
-        "--tasksource-parquet", type=Path,
-        default=Path("data/original/tasksource-instruct/data/test-00000-of-00001.parquet"),
-        help="Local tasksource instruction examples",
+        "--task-catalog", type=Path,
+        default=Path("data/original/task_sources/single_text.jsonl"),
+        help="Frozen single-document task catalog",
     )
     task_inputs.add_argument(
         "--c4-paths", type=Path, nargs="+",
@@ -68,11 +58,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Local tokenizer directory; no Hub downloads",
     )
     task_inputs.add_argument(
-        "--input-count", type=positive_int, default=1000, help="Number of shared documents",
-    )
-    task_inputs.add_argument(
-        "--all-formats-task-count", type=positive_int, default=1000,
-        help="Number of tasks in the all-formats dataset",
+        "--input-count", type=positive_int, default=1309, help="Number of shared documents",
     )
     task_inputs.add_argument(
         "--history-max-tokens", type=positive_int, default=256,
@@ -92,29 +78,21 @@ def main(argv: list[str] | None = None) -> None:
         help="Output Parquet directory",
     )
     task_inputs.add_argument(
-        "--pool-dir", type=Path, default=Path("data/task_input_pool"),
-        help="Task and input audit JSONL directory",
-    )
-    task_inputs.add_argument(
         "--overwrite", action="store_true", help="Replace existing outputs",
     )
     args = parser.parse_args(argv)
     try:
         if args.command == "build-task-inputs":
             build_task_input_tables(
-                sni_headers=args.sni_headers,
-                flan_templates=args.flan_templates,
-                tasksource_parquet=args.tasksource_parquet,
+                task_catalog=args.task_catalog,
                 c4_paths=args.c4_paths,
                 tokenizer_path=args.tokenizer_path,
                 input_count=args.input_count,
-                all_formats_task_count=args.all_formats_task_count,
                 history_max_tokens=args.history_max_tokens,
                 passage_min_tokens=args.passage_min_tokens,
                 passage_max_tokens=args.passage_max_tokens,
                 seed=args.seed,
                 output_dir=args.output_dir,
-                pool_dir=args.pool_dir,
                 overwrite=args.overwrite,
             )
             return

@@ -95,34 +95,30 @@ The output is `data/history_future_samples/wikitext.parquet`. If it already exis
 
 The pipeline processes sorted shards and rows, encodes each text row independently, concatenates token IDs without inserting separators or EOS tokens, and samples distinct non-overlapping windows. Windows may cross source-row boundaries. Output columns are `sample_id`, `group`, `token_count`, `start_token`, `token_ids`, and `text`. Experiments use **`token_ids`**, not re-encoded text. Sampling settings and source information are stored in the Parquet schema's `lm_svd` metadata.
 
-Experiments load named sample sets only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). The available prepared names are `wikitext`, `task-single-text`, and `task-all-formats`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment.
+Experiments load named sample sets only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). The available prepared names are `wikitext` and `task-single-text`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment.
 
-### Rules-only task × document samples
+### Task × document samples
 
-For task-conditioned prompts instead of unrelated windows, download the pinned Natural Instructions, FLAN, tasksource-instruct, and C4 sources, then build both datasets locally:
+For task-conditioned prompts instead of unrelated windows, build from the frozen task catalog at `data/original/task_sources/single_text.jsonl`, C4 documents and a local tokenizer. The builder needs no other task-source files. Download the pinned sources as needed:
 
 ```bash
 unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
 uv run python scripts/download_task_sources.py
+# The frozen catalog must already exist at data/original/task_sources/single_text.jsonl.
 uv run data-pipline build-task-inputs --tokenizer-path models/gpt2-small
 ```
 
-The downloader reuses existing files under `data/original/`; `--output-dir` changes that source root. Source revisions are pinned in the downloader and recorded in each output's `lm_svd` Parquet metadata, together with selection settings and rejection counts. Task selection, classification, deduplication, and passage filtering use **rules, not model generation**.
+The downloader reuses existing files under `data/original/`; `--output-dir` changes that source root. Its Natural Instructions (SNI), FLAN and tasksource-instruct files are used only as references by the `synthesize-single-text-tasks` project skill, not by the builder. The skill generates instructions one at a time with smol subagents, rejects near-duplicates using embedding recall and review, and appends accepted instructions to the frozen catalog. The builder itself does not generate instructions.
 
-The observed default build produces:
+Each nonblank catalog line contains `id`, `source`, `category` and `instruction`; IDs must be unique. The frozen catalog contains 1309 histories: 213 SNI, 88 tasksource, 8 FLAN and 1000 synthetic instructions. The builder writes only `data/history_future_samples/task-single-text.parquet`, pairing these histories with 1309 C4 document futures by default for a 1309 × 1309 matrix. Every catalog task must pass deterministic deduplication and token-length checks; rejected catalog tasks cause an error rather than being silently dropped. The C4 revision and catalog's SHA-256 digest are recorded in the output's `lm_svd` Parquet metadata, together with selection settings and passage rejection counts.
 
-| File under `data/history_future_samples/` | Histories | Futures |
-|---|---:|---:|
-| `task-single-text.parquet` | 309 | 1000 |
-| `task-all-formats.parquet` | 1000 | 1000 |
-
-The single-text histories are included in all-formats, which also contains structured/multi-field tasks. Both files share the same selected C4 futures. Single-text classification is heuristic: it can miss multi-field requirements. These are rules-selected prompts, **not a semantic compatibility guarantee** between every instruction and every document.
+Original-source classification is heuristic: it can miss multi-field requirements. Synthetic instructions are reviewed for use with one arbitrary English prose document, but this is **not a semantic compatibility guarantee** between every instruction and every document. Task deduplication, token-length checks, and passage filtering still use deterministic rules.
 
 Histories render as `Instruction: {instruction}` without trailing whitespace; futures render as `\n\nDocument: {passage}\n\nResponse:`. Their concatenation places the instruction before the document and response cue. The builder checks tokenization boundaries and model context length. Histories are ordered by seeded category round-robin, so leading prefixes selected with inference's `--history-count N` are category-balanced.
 
-Audit files are `data/task_input_pool/tasks.jsonl` (all candidates, rejection reasons, and dataset membership) and `data/task_input_pool/inputs.jsonl` (selected passages and source URLs). Builder controls include `--input-count` (1000 shared futures), `--all-formats-task-count` (1000 histories), `--history-max-tokens` (256), `--passage-min-tokens` / `--passage-max-tokens` (96 / 160 passage tokens), and `--seed` (0). `--tokenizer-path` selects the tokenizer, recorded as `tokenizer_path` in `lm_svd` metadata rather than a filename suffix; rebuilding with another tokenizer targets the same filenames and requires `--overwrite` to replace existing files. `--output-dir` and `--pool-dir` relocate generated files. Use `--sni-headers`, `--flan-templates`, `--tasksource-parquet`, and `--c4-paths` to select local source files, including after changing the downloader's destination. Existing outputs are refused unless `--overwrite` is explicit.
+Builder controls include `--task-catalog` (default `data/original/task_sources/single_text.jsonl`), `--input-count` (1309 futures), `--history-max-tokens` (256), `--passage-min-tokens` / `--passage-max-tokens` (96 / 160 passage tokens), and `--seed` (0). `--tokenizer-path` selects the tokenizer, recorded as `tokenizer_path` in `lm_svd` metadata rather than a filename suffix; rebuilding with another tokenizer targets the same filename and requires `--overwrite` to replace existing files. `--output-dir` relocates the generated Parquet file. Use `--c4-paths` to select local C4 files, including after changing the downloader's destination. Existing outputs are refused unless `--overwrite` is explicit.
 
-Select either task dataset by name for any experiment; dataset-prefixed run directories keep their results separate:
+Select the task dataset by name for any experiment; dataset-prefixed run directories keep its results separate:
 
 ```bash
 DATASET=task-single-text
@@ -132,7 +128,7 @@ uv run exp2 inference --device cuda --dataset "$DATASET" --results-root "$RESULT
 uv run exp3 inference --device cuda --dataset "$DATASET" --results-root "$RESULTS_ROOT"
 ```
 
-Replace `task-single-text` with `task-all-formats` for the second dataset. Omit sample limits to use all rows, or set `--history-count N --future-count N` for leading subsets. exp2 supports these variable-length document futures, including in the same batch. Its summed log probabilities are length-sensitive, not normalized by future length.
+Omit sample limits to use all rows, or set `--history-count N --future-count N` for leading subsets. exp2 supports these variable-length document futures, including in the same batch. Its summed log probabilities are length-sensitive, not normalized by future length.
 
 ## 4. Experiment 1: centered-logit matrix
 

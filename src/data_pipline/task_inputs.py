@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import ast
 import gzip
+import hashlib
 import json
 import re
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, MutableMapping
 from urllib.parse import urlparse
@@ -16,6 +17,9 @@ import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
 from .io import write_parquet_atomic
+
+
+SOURCE_RANK = {"sni": 0, "tasksource": 1, "flan": 2, "synthetic": 3}
 
 
 @dataclass
@@ -194,12 +198,40 @@ def load_flan_tasks(templates_path: Path | str) -> list[TaskCandidate]:
     return tasks
 
 
+def load_task_catalog(path: Path | str) -> list[TaskCandidate]:
+    tasks: list[TaskCandidate] = []
+    seen: set[str] = set()
+    with Path(path).open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            for name in ("id", "source", "category", "instruction"):
+                if name not in row:
+                    raise ValueError(f"{path}:{line_number}: missing field {name}")
+            source = row["source"]
+            if source not in SOURCE_RANK:
+                raise ValueError(f"{path}:{line_number}: unknown task source {source}")
+            source_id = row["id"]
+            if source_id in seen:
+                raise ValueError(f"duplicate task id: {source_id}")
+            seen.add(source_id)
+            tasks.append(TaskCandidate(
+                source=row["source"],
+                source_id=source_id,
+                category=row["category"],
+                instruction=row["instruction"],
+                format_class="single_text",
+                format_reason=None,
+            ))
+    return tasks
+
+
 def finalize_tasks(
     candidates: Iterable[TaskCandidate], tokenizer, history_max_tokens: int = 256,
 ) -> list[TaskCandidate]:
     """Deduplicate and count histories in place; return all candidates in source order."""
-    source_rank = {"sni": 0, "tasksource": 1, "flan": 2}
-    tasks = sorted(candidates, key=lambda task: (source_rank[task.source], task.source_id))
+    tasks = sorted(candidates, key=lambda task: (SOURCE_RANK[task.source], task.source_id))
     seen: set[str] = set()
     for task in tasks:
         if task.reject_reason is not None:
@@ -241,27 +273,15 @@ def order_by_bucket(tasks: Iterable[TaskCandidate], seed: int) -> list[TaskCandi
     return ordered
 
 
-def select_task_datasets(
-    tasks: Iterable[TaskCandidate], all_formats_task_count: int = 1000, seed: int = 0,
-) -> tuple[list[TaskCandidate], list[TaskCandidate]]:
-    """Return (single_text, all_formats), preserving the entire single-text set."""
-    kept = [task for task in tasks if task.reject_reason is None]
-    single_text = order_by_bucket(
-        [task for task in kept if task.format_class == "single_text"], seed,
+def select_single_text_tasks(
+    tasks: Iterable[TaskCandidate], seed: int = 0,
+) -> list[TaskCandidate]:
+    """Return all surviving single-text tasks in balanced category order."""
+    return order_by_bucket(
+        [task for task in tasks
+         if task.reject_reason is None and task.format_class == "single_text"],
+        seed,
     )
-    if len(single_text) > all_formats_task_count:
-        raise ValueError(
-            f"{len(single_text)} single-text tasks exceed all-formats task count "
-            f"{all_formats_task_count}"
-        )
-    structured = order_by_bucket(
-        [task for task in kept if task.format_class == "structured"], seed,
-    )
-    extra_count = all_formats_task_count - len(single_text)
-    all_formats = order_by_bucket(single_text + structured[:extra_count], seed)
-    if len(all_formats) < all_formats_task_count:
-        print(f"all-formats: only {len(all_formats)} tasks available")
-    return single_text, all_formats
 
 
 _PASSAGE_LINE_END = re.compile(r"""[.!?]["')]?$""")
@@ -359,65 +379,34 @@ def select_passages(
 
 _HISTORY_TEMPLATE = "Instruction: {instruction}"
 _FUTURE_TEMPLATE = "\n\nDocument: {passage}\n\nResponse:"
-_SOURCE_REVISIONS = {
-    "allenai/natural-instructions": "55a365637381ce7f3748fa2eac7aef1a113bbb82",
-    "google-research/FLAN": "e9e4ec6e2701182c7a91af176f705310da541277",
-    "tasksource/tasksource-instruct": "4cdba593d93bf1e32c0fd1731d84c6780136fe51",
-    "allenai/c4": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
-}
-
-
-def _write_jsonl_atomic(records: Iterable[dict], output: Path) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as stream:
-            for record in records:
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-        temporary.replace(output)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+_C4_REVISION = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
 
 
 def build_task_input_tables(
     *,
-    sni_headers: Path = Path("data/original/natural_instructions/task_headers.jsonl"),
-    flan_templates: Path = Path("data/original/flan/templates.py"),
-    tasksource_parquet: Path = Path(
-        "data/original/tasksource-instruct/data/test-00000-of-00001.parquet"
-    ),
+    task_catalog: Path = Path("data/original/task_sources/single_text.jsonl"),
     c4_paths: Iterable[Path] = (
         Path("data/original/c4/en/c4-validation.00000-of-00008.json.gz"),
     ),
     tokenizer_path: Path = Path("models/gpt2-small"),
-    input_count: int = 1000,
-    all_formats_task_count: int = 1000,
+    input_count: int = 1309,
     history_max_tokens: int = 256,
     passage_min_tokens: int = 96,
     passage_max_tokens: int = 160,
     seed: int = 0,
     output_dir: Path = Path("data/history_future_samples"),
-    pool_dir: Path = Path("data/task_input_pool"),
     overwrite: bool = False,
 ) -> dict:
-    """Build two task-history datasets with identical C4 document futures."""
+    """Build single-text task histories with C4 document futures."""
     tokenizer_path = Path(tokenizer_path)
-    output_dir, pool_dir = Path(output_dir), Path(pool_dir)
-    outputs = {
-        dataset: output_dir / f"task-{dataset.replace('_', '-')}.parquet"
-        for dataset in ("single_text", "all_formats")
-    }
-    tasks_output = pool_dir / "tasks.jsonl"
-    inputs_output = pool_dir / "inputs.jsonl"
-    for output in (*outputs.values(), tasks_output, inputs_output):
-        if output.exists() and not overwrite:
-            raise FileExistsError(
-                f"output already exists: {output}; pass --overwrite to replace it"
-            )
+    output_dir = Path(output_dir)
+    output = output_dir / "task-single-text.parquet"
+    if output.exists() and not overwrite:
+        raise FileExistsError(
+            f"output already exists: {output}; pass --overwrite to replace it"
+        )
     for name, value in (
         ("input_count", input_count),
-        ("all_formats_task_count", all_formats_task_count),
         ("history_max_tokens", history_max_tokens),
         ("passage_min_tokens", passage_min_tokens),
         ("passage_max_tokens", passage_max_tokens),
@@ -426,12 +415,13 @@ def build_task_input_tables(
             raise ValueError(f"{name} must be positive")
     if passage_min_tokens > passage_max_tokens:
         raise ValueError("passage_min_tokens must not exceed passage_max_tokens")
-    sni_headers, flan_templates = Path(sni_headers), Path(flan_templates)
-    tasksource_parquet = Path(tasksource_parquet)
+    task_catalog = Path(task_catalog)
+    if not task_catalog.is_file():
+        raise ValueError(f"task catalog does not exist: {task_catalog}")
     c4_paths = [Path(path) for path in c4_paths]
     if not c4_paths:
         raise ValueError("at least one C4 path is required")
-    for path in (sni_headers, flan_templates, tasksource_parquet, *c4_paths):
+    for path in c4_paths:
         if not path.is_file():
             raise ValueError(
                 f"input file does not exist: {path}; run scripts/download_task_sources.py"
@@ -450,15 +440,15 @@ def build_task_input_tables(
     def encode(text: str) -> list[int]:
         return tokenizer(text, add_special_tokens=False)["input_ids"]
 
-    candidates = finalize_tasks(
-        load_sni_tasks(sni_headers)
-        + load_tasksource_tasks(tasksource_parquet)
-        + load_flan_tasks(flan_templates),
-        tokenizer, history_max_tokens,
+    candidates = finalize_tasks(load_task_catalog(task_catalog), tokenizer, history_max_tokens)
+    counts = Counter(
+        task.reject_reason for task in candidates if task.reject_reason is not None
     )
-    single_text, all_formats = select_task_datasets(
-        candidates, all_formats_task_count, seed,
-    )
+    if counts:
+        raise ValueError(
+            f"task catalog contains rejected tasks: {json.dumps(dict(sorted(counts.items())))}"
+        )
+    single_text = select_single_text_tasks(candidates, seed)
     if not single_text:
         raise ValueError("no single-text tasks survived the harvesting rules")
     passage_reject_counts: Counter = Counter()
@@ -467,7 +457,7 @@ def build_task_input_tables(
         passage_min_tokens, passage_max_tokens, seed,
         rejection_counts=passage_reject_counts,
     )
-    # Render futures once so both files share exactly the same text and token IDs.
+    # Render futures independently of the selected task histories.
     futures = [
         {
             "group": "future",
@@ -483,117 +473,90 @@ def build_task_input_tables(
     for row in futures:
         row["token_ids"] = encode(row["text"])
         row["token_count"] = len(row["token_ids"])
-    kept_counts = Counter(
-        f"{task.source}/{task.format_class}"
-        for task in candidates if task.reject_reason is None
-    )
-    task_reject_counts = Counter(
-        task.reject_reason for task in candidates if task.reject_reason is not None
-    )
-    tables = {}
-    for dataset, tasks in (("single_text", single_text), ("all_formats", all_formats)):
-        histories = [
-            {
-                "group": "history",
-                "start_token": -1,
-                "text": _HISTORY_TEMPLATE.format(instruction=task.instruction),
-                "source": task.source,
-                "source_id": task.source_id,
-                "category": task.category,
-                "format_class": task.format_class,
-            }
-            for task in tasks
-        ]
-        for row in histories:
-            row["token_ids"] = encode(row["text"])
-            row["token_count"] = len(row["token_ids"])
-        max_history = max(row["token_count"] for row in histories)
-        max_future = max(row["token_count"] for row in futures)
-        if max_history + max_future > tokenizer.model_max_length:
-            raise ValueError(
-                f"{dataset}: maximum history + future length "
-                f"{max_history} + {max_future} exceeds tokenizer model_max_length "
-                f"{tokenizer.model_max_length}"
-            )
-        rng = np.random.default_rng(seed)
-        pairs = rng.integers([0, 0], [len(histories), len(futures)], size=(2000, 2))
-        for history_index, future_index in pairs:
-            history, future = histories[int(history_index)], futures[int(future_index)]
-            if history["token_ids"] + future["token_ids"] != encode(
-                history["text"] + future["text"]
-            ):
-                raise ValueError(
-                    "history/future tokenization is not concatenation-safe for "
-                    f"{history['source_id']} + {future['source_id']}"
-                )
-        metadata = {
-            "kind": "task_input",
-            "dataset": dataset,
-            "tokenizer_path": str(tokenizer_path),
-            "seed": seed,
-            "history_template": _HISTORY_TEMPLATE,
-            "future_template": _FUTURE_TEMPLATE,
-            "sources": _SOURCE_REVISIONS,
-            "history_count": len(histories),
-            "future_count": len(futures),
-            "history_counts_by_source_format": dict(sorted(Counter(
-                f"{task.source}/{task.format_class}" for task in tasks
-            ).items())),
-            "task_reject_counts": dict(sorted(task_reject_counts.items())),
-            "passage_reject_counts": dict(sorted(passage_reject_counts.items())),
-            "passage_token_bounds": [passage_min_tokens, passage_max_tokens],
-            "history_max_tokens": history_max_tokens,
+    histories = [
+        {
+            "group": "history",
+            "start_token": -1,
+            "text": _HISTORY_TEMPLATE.format(instruction=task.instruction),
+            "source": task.source,
+            "source_id": task.source_id,
+            "category": task.category,
+            "format_class": task.format_class,
         }
-        schema = pa.schema(
-            [
-                ("sample_id", pa.int32()),
-                ("group", pa.string()),
-                ("token_count", pa.int32()),
-                ("start_token", pa.int64()),
-                ("token_ids", pa.list_(pa.int32())),
-                ("text", pa.string()),
-                ("source", pa.string()),
-                ("source_id", pa.string()),
-                ("category", pa.string()),
-                ("format_class", pa.string()),
-            ],
-            metadata={b"lm_svd": json.dumps(metadata, ensure_ascii=False).encode("utf-8")},
+        for task in single_text
+    ]
+    for row in histories:
+        row["token_ids"] = encode(row["text"])
+        row["token_count"] = len(row["token_ids"])
+    max_history = max(row["token_count"] for row in histories)
+    max_future = max(row["token_count"] for row in futures)
+    if max_history + max_future > tokenizer.model_max_length:
+        raise ValueError(
+            "single_text: maximum history + future length "
+            f"{max_history} + {max_future} exceeds tokenizer model_max_length "
+            f"{tokenizer.model_max_length}"
         )
-        rows = [
-            {"sample_id": index, **row}
-            for index, row in enumerate(histories + futures)
-        ]
-        tables[dataset] = pa.Table.from_pylist(rows, schema=schema)
-
-    single_keys = {(task.source, task.source_id) for task in single_text}
-    all_keys = {(task.source, task.source_id) for task in all_formats}
-    for dataset, table in tables.items():
-        write_parquet_atomic(table, outputs[dataset])
-    _write_jsonl_atomic(
-        (
-            {
-                **asdict(task),
-                "in_single_text": (task.source, task.source_id) in single_keys,
-                "in_all_formats": (task.source, task.source_id) in all_keys,
-            }
-            for task in candidates
-        ),
-        tasks_output,
+    rng = np.random.default_rng(seed)
+    pairs = rng.integers([0, 0], [len(histories), len(futures)], size=(2000, 2))
+    for history_index, future_index in pairs:
+        history, future = histories[int(history_index)], futures[int(future_index)]
+        if history["token_ids"] + future["token_ids"] != encode(
+            history["text"] + future["text"]
+        ):
+            raise ValueError(
+                "history/future tokenization is not concatenation-safe for "
+                f"{history['source_id']} + {future['source_id']}"
+            )
+    metadata = {
+        "kind": "task_input",
+        "dataset": "single_text",
+        "tokenizer_path": str(tokenizer_path),
+        "seed": seed,
+        "history_template": _HISTORY_TEMPLATE,
+        "future_template": _FUTURE_TEMPLATE,
+        "sources": {
+            "allenai/c4": _C4_REVISION,
+            str(task_catalog): hashlib.sha256(task_catalog.read_bytes()).hexdigest(),
+        },
+        "history_count": len(histories),
+        "future_count": len(futures),
+        "history_counts_by_source_format": dict(sorted(Counter(
+            f"{task.source}/{task.format_class}" for task in single_text
+        ).items())),
+        "passage_reject_counts": dict(sorted(passage_reject_counts.items())),
+        "passage_token_bounds": [passage_min_tokens, passage_max_tokens],
+        "history_max_tokens": history_max_tokens,
+    }
+    schema = pa.schema(
+        [
+            ("sample_id", pa.int32()),
+            ("group", pa.string()),
+            ("token_count", pa.int32()),
+            ("start_token", pa.int64()),
+            ("token_ids", pa.list_(pa.int32())),
+            ("text", pa.string()),
+            ("source", pa.string()),
+            ("source_id", pa.string()),
+            ("category", pa.string()),
+            ("format_class", pa.string()),
+        ],
+        metadata={b"lm_svd": json.dumps(metadata, ensure_ascii=False).encode("utf-8")},
     )
-    _write_jsonl_atomic((asdict(passage) for passage in passages), inputs_output)
-    print(f"kept tasks by source/format: {json.dumps(dict(sorted(kept_counts.items())))}")
-    print(f"task reject counts: {json.dumps(dict(sorted(task_reject_counts.items())))}")
+    rows = [
+        {"sample_id": index, **row}
+        for index, row in enumerate(histories + futures)
+    ]
+    table = pa.Table.from_pylist(rows, schema=schema)
+    write_parquet_atomic(table, output)
+    print(
+        "tasks by source/format: "
+        + json.dumps(metadata["history_counts_by_source_format"])
+    )
     print(f"passage reject counts: {json.dumps(dict(sorted(passage_reject_counts.items())))}")
     print(f"single_text: {len(single_text)} x {len(passages)}")
-    print(f"all_formats: {len(all_formats)} x {len(passages)}")
-    for output in (*outputs.values(), tasks_output, inputs_output):
-        print(f"output: {output}")
+    print(f"output: {output}")
     return {
-        "single_text_output": str(outputs["single_text"]),
-        "all_formats_output": str(outputs["all_formats"]),
-        "tasks_output": str(tasks_output),
-        "inputs_output": str(inputs_output),
+        "single_text_output": str(output),
         "single_text_history_count": len(single_text),
-        "all_formats_history_count": len(all_formats),
         "future_count": len(passages),
     }
