@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:H100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --time=1:00:00
+#SBATCH --time=3:00:00
 #SBATCH --array=1-3
 #SBATCH --output=bluehive_run/logs/slurm-%x-%A_%a.out
 #SBATCH --error=bluehive_run/logs/slurm-%x-%A_%a.err

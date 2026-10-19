@@ -10,4 +10,4 @@ fi
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 mkdir -p bluehive_run/logs
 # Override the batch script's array range with exactly one experiment.
-exec sbatch --array="${experiment#exp}" bluehive_run/task-single-text.sbatch
+exec sbatch --array="${experiment#exp}" --time=6:00:00 bluehive_run/task-single-text.sbatch
