@@ -72,6 +72,24 @@ class CausalLMInference:
             logits = self.model(input_ids=input_ids, use_cache=False).logits[0, -1]
         return logits.to(device="cpu", dtype=torch.float32)
 
+    def next_token_logits_batch(
+        self, sequences: Sequence[Sequence[int]]
+    ) -> torch.Tensor:
+        if not sequences:
+            raise ValueError("sequences must not be empty")
+        ids = [self._validate_ids(sequence) for sequence in sequences]
+        lengths = sorted({len(sequence) for sequence in ids})
+        if len(lengths) != 1:
+            raise ValueError(
+                f"sequences must have equal length, got lengths {lengths}"
+            )
+        with torch.no_grad():
+            input_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
+            logits = self.model(
+                input_ids=input_ids, use_cache=False, logits_to_keep=1
+            ).logits[:, -1]
+        return logits.to(dtype=torch.float32)
+
     def continuation_log_probs(
         self,
         context: Sequence[int],

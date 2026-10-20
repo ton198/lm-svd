@@ -15,6 +15,26 @@ def positive_int(value: str) -> int:
     return number
 
 
+def add_window_arguments(
+    parser: argparse.ArgumentParser, *, history_count: int, future_count: int, output: Path
+) -> None:
+    parser.add_argument("--dataset-dir", type=Path, default=Path("data/original/wikitext"), help="Local dataset root")
+    parser.add_argument("--config", default="wikitext-103-raw-v1", help="Dataset configuration directory")
+    parser.add_argument("--split", default="train", help="Parquet split prefix")
+    parser.add_argument("--tokenizer-path", type=Path, default=Path("models/gpt2-small"), help="Local tokenizer directory; no Hub downloads")
+    parser.add_argument("--history-count", type=positive_int, default=history_count, help="Number of history windows")
+    parser.add_argument("--history-tokens", type=positive_int, default=64, help="Tokens per history window")
+    parser.add_argument("--future-count", type=positive_int, default=future_count, help="Number of future windows")
+    parser.add_argument("--future-tokens", type=positive_int, default=32, help="Tokens per future window")
+    parser.add_argument("--seed", type=int, default=0, help="Random selection seed")
+    parser.add_argument(
+        "--output", type=Path,
+        default=output,
+        help="Output Parquet file",
+    )
+    parser.add_argument("--overwrite", action="store_true", help="Replace an existing output")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="data-pipline")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -23,21 +43,19 @@ def main(argv: list[str] | None = None) -> None:
         help="Build independent, non-overlapping history/future windows",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    build.add_argument("--dataset-dir", type=Path, default=Path("data/original/wikitext"), help="Local dataset root")
-    build.add_argument("--config", default="wikitext-103-raw-v1", help="Dataset configuration directory")
-    build.add_argument("--split", default="train", help="Parquet split prefix")
-    build.add_argument("--tokenizer-path", type=Path, default=Path("models/gpt2-small"), help="Local tokenizer directory; no Hub downloads")
-    build.add_argument("--history-count", type=positive_int, default=512, help="Number of history windows")
-    build.add_argument("--history-tokens", type=positive_int, default=64, help="Tokens per history window")
-    build.add_argument("--future-count", type=positive_int, default=512, help="Number of future windows")
-    build.add_argument("--future-tokens", type=positive_int, default=32, help="Tokens per future window")
-    build.add_argument("--seed", type=int, default=0, help="Random selection seed")
-    build.add_argument(
-        "--output", type=Path,
-        default=Path("data/history_future_samples/wikitext.parquet"),
-        help="Output Parquet file",
+    add_window_arguments(
+        build, history_count=512, future_count=512,
+        output=Path("data/history_future_samples/wikitext.parquet"),
     )
-    build.add_argument("--overwrite", action="store_true", help="Replace an existing output")
+    large = subparsers.add_parser(
+        "build-wikitext-large",
+        help="Build the large WikiText window set used by exp4",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_window_arguments(
+        large, history_count=10000, future_count=10000,
+        output=Path("data/history_future_samples/wikitext-large.parquet"),
+    )
     task_inputs = subparsers.add_parser(
         "build-task-inputs",
         help="Build task histories and shared C4 document futures",

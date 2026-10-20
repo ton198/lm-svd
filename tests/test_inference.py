@@ -42,6 +42,21 @@ class CausalLMInferenceTests(unittest.TestCase):
         self.assertEqual(logits.dtype, torch.float32)
         self.assertEqual(logits.device.type, "cpu")
 
+    def test_next_token_logits_batch_matches_individual_sequences(self) -> None:
+        sequences = [[1, 2], [3, 4], [5, 6]]
+        expected = torch.stack(
+            [self.inference.next_token_logits(sequence) for sequence in sequences]
+        )
+        logits = self.inference.next_token_logits_batch(sequences)
+        self.assertEqual(logits.shape, (3, 11))
+        self.assertEqual(logits.dtype, torch.float32)
+        self.assertEqual(logits.device, self.inference.device)
+        torch.testing.assert_close(logits, expected, rtol=0, atol=1e-6)
+
+    def test_next_token_logits_batch_rejects_unequal_lengths(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must have equal length"):
+            self.inference.next_token_logits_batch([[1, 2], [3]])
+
     def test_input_longer_than_maximum_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "exceeds model maximum 6"):
             self.inference.next_token_logits([0] * 7)

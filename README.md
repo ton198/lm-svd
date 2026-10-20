@@ -1,16 +1,17 @@
 # LM-SVD: GPT-2 Matrix Experiments
 
-Build matrices from local GPT-2 inference, compute their singular value decompositions (SVDs), measure numerical rank, and plot singular-value decay and cumulative energy.
+Build matrices from local GPT-2 inference, compute their singular value decompositions (SVDs), measure numerical rank, and plot singular-value decay and cumulative energy. For matrices too large to store, learn leading singular components online with NeuralSVD.
 
-All matrix experiments use the same sampled history/future token sequences but construct different matrices:
+Experiments use sampled history/future token sequences but construct different matrices:
 
 | Experiment | Matrix entry | Matrix shape | Matrix file |
 | --- | --- | --- | --- |
 | `exp1` | Centered next-token logit for a future-specific header token | histories × (futures × top-k) | `matrix.npy` |
 | `exp2` | Conditional log probability of an entire future given a history | histories × futures | `feature_log_prob.npy` |
 | `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
+| `exp4` | Centered next-token logit for every vocabulary token | histories × (futures × vocabulary) | Not stored; online NeuralSVD |
 
-Each experiment has two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, analysis does not load a language model. Analysis defaults to CUDA; use `--device cpu` to run without a GPU.
+Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead uses `train` → `analysis`, defaults to the larger `wikitext-large` dataset, and analyzes learned features on CPU without loading a model or materializing the matrix.
 
 ## 1. Install dependencies
 
@@ -91,11 +92,19 @@ uv run data-pipline build-windows \
 
 These exports remain active in the current shell. Before running either download script again, use `unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE` to allow network access.
 
-The output is `data/history_future_samples/wikitext.parquet`. If it already exists, reuse it or explicitly pass `--overwrite` to rebuild it. All three experiments select this file by default with `--dataset wikitext`. GPT-2 Small and Medium use the same GPT-2 token vocabulary, so the same sample file can be reused for comparisons between them.
+The output is `data/history_future_samples/wikitext.parquet`. If it already exists, reuse it or explicitly pass `--overwrite` to rebuild it. Experiments exp1–exp3 select this file by default with `--dataset wikitext`. GPT-2 Small and Medium use the same GPT-2 token vocabulary, so the same sample file can be reused for comparisons between them.
+
+For exp4, build the larger window set from the same downloaded source:
+
+```bash
+uv run data-pipline build-wikitext-large
+```
+
+This writes `data/history_future_samples/wikitext-large.parquet` with **10000 histories × 64 tokens and 10000 futures × 32 tokens** by default. It accepts the same window flags as `build-windows`, including `--history-count`, `--future-count`, `--dataset-dir`, `--tokenizer-path`, `--seed` (default 0), `--output`, and `--overwrite`. Only the default counts and output path differ.
 
 The pipeline processes sorted shards and rows, encodes each text row independently, concatenates token IDs without inserting separators or EOS tokens, and samples distinct non-overlapping windows. Windows may cross source-row boundaries. Output columns are `sample_id`, `group`, `token_count`, `start_token`, `token_ids`, and `text`. Experiments use **`token_ids`**, not re-encoded text. Sampling settings and source information are stored in the Parquet schema's `lm_svd` metadata.
 
-Experiments load named sample sets only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). The available prepared names are `wikitext` and `task-single-text`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment.
+Experiments load named sample sets only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). Prepared names include `wikitext`, `wikitext-large`, and `task-single-text`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment.
 
 ### Task × document samples
 
@@ -118,7 +127,7 @@ Histories render as `Instruction: {instruction}` without trailing whitespace; fu
 
 Builder controls include `--task-catalog` (default `data/original/task_sources/single_text.jsonl`), `--input-count` (1309 futures), `--history-max-tokens` (256), `--passage-min-tokens` / `--passage-max-tokens` (96 / 160 passage tokens), and `--seed` (0). `--tokenizer-path` selects the tokenizer, recorded as `tokenizer_path` in `lm_svd` metadata rather than a filename suffix; rebuilding with another tokenizer targets the same filename and requires `--overwrite` to replace existing files. `--output-dir` relocates the generated Parquet file. Use `--c4-paths` to select local C4 files, including after changing the downloader's destination. Existing outputs are refused unless `--overwrite` is explicit.
 
-Select the task dataset by name for any experiment; dataset-prefixed run directories keep its results separate:
+Select the task dataset by name for exp1–exp3; dataset-prefixed run directories keep its results separate. exp4 requires equal-length concatenated inputs within each block and is not suitable for these variable-length task/document samples:
 
 ```bash
 DATASET=task-single-text
@@ -281,9 +290,46 @@ uv run exp3 analysis \
 
 Override the models with `--model-a-path` and `--model-b-path`. `inference` writes `matrix.npy` (the difference), `matrix_a.npy`, `matrix_b.npy`, `rows.parquet`, `columns.parquet`, and `metadata.json` under `$RESULT_DIR/inference/`. Column tokens and future-only logits in `columns.parquet` come from model A. Analysis processes only the difference `matrix.npy`, not the two component matrices. `global` and `row` centering are linear, so `center(L_A - L_B) = center(L_A) - center(L_B)`; `deflate1` is not linear because it removes the leading singular component of the difference matrix itself.
 
-## 7. Understand the analysis outputs
+## 7. Experiment 4: online full-vocabulary NeuralSVD
 
-All experiments share the same `analysis` command. It reads the matrix and optional sibling `metadata.json` from `<result-dir>/inference/`, then writes all six outputs to `<result-dir>/analysis/<centering>/`:
+exp4 learns leading singular components of the exp1 centered-logit matrix **without top-k selection**:
+
+```text
+A[h, (f, z)] = logit(z | h + f) - mean_vocabulary(logits | h + f)
+```
+
+Columns are future-major, then token ID over the full vocabulary. With the default `wikitext-large` samples and GPT-2 Small's vocabulary of 50257, the matrix is `10000 × 502570000` (about 20 TB in float32). It is never stored: training samples history and future subsets independently, generates their full-vocabulary logit block online, and feeds it to `NestedLoRASVDLoss`.
+
+For a bias-free output layer with token embeddings `e_z`, centered logits equal `s(h, f) · (e_z - mean_e)`, where `s` is the final hidden state. exp4 uses a sparse history lookup for left features and the right parameterization `g_l(f, z) = W_f[l] · (e_z - mean_e)`, with `W_f` of shape `(rank, hidden_size)`. Thus right features need no lookup table over all future/token pairs. Training uses SparseAdam and rejects output layers with bias.
+
+### Workflow and defaults
+
+```bash
+uv run data-pipline build-wikitext-large
+uv run exp4 train
+uv run exp4 analysis
+```
+
+Both stages default to `--dataset wikitext-large`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; use `--device cpu` for either stage without CUDA. Training uses all available histories and futures, rank 32, sequential nesting, history/future batches of 16 each, 100000 steps, learning rate `1e-2`, seed 0, and logging every 100 steps. Use `--history-count` / `--future-count` for leading subsets, `--history-batch` / `--future-batch` for block sizes, `--rank`, `--steps`, `--lr`, `--log-every`, or `--nesting joint` to adjust training.
+
+Runs are stored under `<results-root>/exp4_neural_svd/<dataset>__<model-directory-name>/`. Pass matching dataset, results-root, and model-path flags to both stages for nondefault runs. The provided Slurm workflows cover exp1–exp3 only, not exp4.
+
+### Outputs and interpretation
+
+- `train/`: `features.pt` (history and future lookup weights), `token_gram.npy` (the centered token embedding Gram matrix), `loss_history.npy`, `histories.parquet`, `futures.parquet`, and `metadata.json` (matrix definition, training settings/results, and source provenance).
+- `analysis/`: `singular_values.npy`, `left_singular_vectors.npy` (unit-norm columns), `spectrum.json`, and `neural_svd_spectrum.png`. The plot shows singular values on a log scale, cumulative captured energy, and training loss.
+
+Analysis computes feature statistics in torch float64 on the selected device and reads only `train/{features.pt,token_gram.npy,loss_history.npy,metadata.json}`. Future weights remain on CPU and move to the device in chunks of at most 1024 futures, using a flat 2-D matrix product with the token Gram matrix. Downstream diagnostics and output processing remain in NumPy. `--model-path` supplies only the directory name for locating the run; no language model or sample file is loaded. The token Gram matrix gives right-feature norms and inner products without constructing the enormous right-feature array. Analysis does **not** compute an exact matrix SVD, save right singular vectors, or estimate numerical rank. It does not accept `--centering`: no secondary centering is available because the matrix is not stored.
+
+For a two-step feasibility smoke, run `uv run exp4 train --steps 2 --log-every 1 --results-root /tmp/exp4-smoke`, then `uv run exp4 analysis --results-root /tmp/exp4-smoke`. Add `--device cpu` to the analysis command to run without CUDA. Two steps verify execution and outputs, not convergence.
+
+Singular values retain **learned order**, not sorted order. `spectrum.json` reports maximum absolute off-diagonal inner products for normalized left/right features (`left_orthogonality_error`, `right_orthogonality_error`), a sampled squared Frobenius norm estimate, cumulative captured energy, and training metadata. Captured energy divides cumulative squared learned singular values by that sampled norm estimate; it can exceed 1 before convergence and is reported without clipping. These are learned estimates, not a guarantee of convergence or exact leading singular values; inspect orthogonality, ordering, energy, and loss together.
+
+Both stages precheck their output files and require `--overwrite` to replace existing outputs. Replacing training outputs does not refresh analysis; rerun `exp4 analysis --overwrite` when needed. Use `uv run exp4 <subcommand> --help` or `uv run python -m experiments.exp4_neural_svd <subcommand>`.
+
+## 8. Understand exp1–exp3 analysis outputs
+
+Experiments exp1–exp3 share the same `analysis` workflow. It reads the matrix and optional sibling `metadata.json` from `<result-dir>/inference/`, then writes all six outputs to `<result-dir>/analysis/<centering>/`:
 
 ```text
 <results-root>/<experiment>/<run>/
@@ -381,12 +427,15 @@ from utils import CausalLMInference
 
 inference = CausalLMInference("models/gpt2-medium", device="cpu")
 logits = inference.next_token_logits([15496, 11])
+batch_logits = inference.next_token_logits_batch([[15496, 11], [995, 0]])
 scores = inference.continuation_log_probs(
     [15496, 11], [[995, 0]], batch_size=1
 )
 ```
 
 `next_token_logits` returns unnormalized logits as a CPU float32 tensor of shape `(vocab_size,)`. `continuation_log_probs` returns one summed conditional log probability per continuation as a CPU float64 tensor, preserving input order. Inputs must be non-empty integer token-ID sequences within the model vocabulary and context limit; continuations in one call may have different lengths. Scores are sums, not length-normalized averages. Load models sequentially when memory is limited.
+
+`next_token_logits_batch` takes a non-empty batch of non-empty token-ID sequences with **equal lengths** (no padding); each sequence is validated against the vocabulary and context limit. It returns float32 logits of shape `(batch_size, vocab_size)` **on the inference device**, unlike the CPU return from `next_token_logits`. Unequal lengths raise `ValueError`; this is why exp4 uses fixed-length windows rather than variable-length task/document inputs.
 
 ## NeuralSVD utility API
 
@@ -420,7 +469,7 @@ and `right`; columns of the latter two have unit mean square. For a finite
 singular values by `sqrt(m * n)` to recover matrix singular values, and divide
 `left` and `right` by `sqrt(m)` and `sqrt(n)` for unit-norm vectors. Results retain
 the learned column order: they are not sorted, so unconverged ordering remains
-visible. This API does not change the existing experiment analysis commands.
+visible. exp4 uses the same learned-order convention with closed-form right-feature moments; exp1–exp3 retain their exact matrix-analysis workflows.
 
 ## Tests
 
