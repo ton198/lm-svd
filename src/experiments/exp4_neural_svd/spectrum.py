@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from utils import ANALYSIS_DIR
+from utils.analysis import ANALYSIS_DIR
 from utils.common import save_json, save_numpy, write_atomic
 
 

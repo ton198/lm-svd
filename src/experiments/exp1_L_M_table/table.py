@@ -7,17 +7,9 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-from utils import (
-    CausalLMInference,
-    Sample,
-    build_column_table,
-    build_row_table,
-    load_samples,
-    read_source_metadata,
-    save_json,
-    save_numpy,
-    write_atomic,
-)
+from utils.common import Sample, load_samples, save_json, save_numpy, write_atomic
+from utils.inference import CausalLMInference
+from utils.lm_table import build_column_table, build_row_table, read_source_metadata
 
 
 def centered_logits(logits: torch.Tensor) -> torch.Tensor:

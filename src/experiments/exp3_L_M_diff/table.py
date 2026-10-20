@@ -6,16 +6,9 @@ import pyarrow.parquet as pq
 import torch
 
 from experiments.exp1_L_M_table.table import build_matrix, select_header_tokens
-from utils import (
-    CausalLMInference,
-    build_column_table,
-    build_row_table,
-    load_samples,
-    read_source_metadata,
-    save_json,
-    save_numpy,
-    write_atomic,
-)
+from utils.common import load_samples, save_json, save_numpy, write_atomic
+from utils.inference import CausalLMInference
+from utils.lm_table import build_column_table, build_row_table, read_source_metadata
 
 
 def build_exp3_diff(

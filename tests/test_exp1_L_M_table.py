@@ -9,8 +9,8 @@ import pyarrow.parquet as pq
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from experiments.exp1_L_M_table import build_exp1_table
-from utils import CausalLMInference
+from experiments.exp1_L_M_table.table import build_exp1_table
+from utils.inference import CausalLMInference
 
 
 class Exp1TableTests(unittest.TestCase):

@@ -7,7 +7,8 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
-from utils import CausalLMInference, load_samples, save_json, save_numpy, write_atomic
+from utils.common import load_samples, save_json, save_numpy, write_atomic
+from utils.inference import CausalLMInference
 
 
 def build_exp2_pfh(

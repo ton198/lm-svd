@@ -390,7 +390,7 @@ Older float32 analyses used float32 epsilon for rank, so refresh their `rank.jso
 
 ```python
 from pathlib import Path
-from utils import compute_rank, visualize_svd
+from utils.analysis import compute_rank, visualize_svd
 
 svd_dir = Path("data/experiment_results/exp2_PFH/wikitext__gpt2-small/analysis/none")
 compute_rank(svd_dir=svd_dir, overwrite=True)
@@ -423,7 +423,7 @@ Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv
 `CausalLMInference` loads a local model once in float32 and reuses it for token-ID inputs. It does not download files or tokenize text. CUDA is the default device; CPU is shown here for portability:
 
 ```python
-from utils import CausalLMInference
+from utils.inference import CausalLMInference
 
 inference = CausalLMInference("models/gpt2-medium", device="cpu")
 logits = inference.next_token_logits([15496, 11])
@@ -447,7 +447,7 @@ Features may come from trainable lookup tables or encoders; the utility does not
 load or save matrices.
 
 ```python
-from utils import NestedLoRASVDLoss, neural_svd_spectrum
+from utils.neural_svd import NestedLoRASVDLoss, neural_svd_spectrum
 
 loss_fn = NestedLoRASVDLoss(rank=3)  # joint nesting; optionally step=2
 # f, g are model outputs; a_block contains A(row_i, column_j).

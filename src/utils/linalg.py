@@ -1,7 +1,10 @@
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,8 @@ def numerical_rank(
 
 
 def matrix_svd(matrix: np.ndarray, *, device: str | torch.device) -> MatrixSVD:
+    import torch
+
     matrix = np.asarray(matrix)
     if matrix.ndim != 2 or 0 in matrix.shape:
         raise ValueError(

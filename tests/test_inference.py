@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from utils import CausalLMInference
+from utils.inference import CausalLMInference
 
 
 class CausalLMInferenceTests(unittest.TestCase):

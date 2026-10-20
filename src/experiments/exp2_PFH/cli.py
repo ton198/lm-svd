@@ -2,16 +2,8 @@ import argparse
 from pathlib import Path
 
 from data_pipline.cli import positive_int
-from utils import (
-    INFERENCE_DIR,
-    add_analysis_command,
-    add_run_arguments,
-    dataset_samples_path,
-    run_analysis,
-    run_dir,
-)
-
-from .feature_logprob import build_exp2_pfh
+from utils.analysis import INFERENCE_DIR, add_analysis_command, run_analysis
+from utils.experiment_paths import add_run_arguments, dataset_samples_path, run_dir
 
 
 EXPERIMENT = "exp2_PFH"
@@ -60,6 +52,8 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
             return
+        from .feature_logprob import build_exp2_pfh
+
         summary = build_exp2_pfh(
             samples_path=dataset_samples_path(args.dataset),
             model_path=args.model_path,
