@@ -76,7 +76,18 @@ class Exp4NeuralSVDTests(unittest.TestCase):
         cls.histories, cls.futures = load_samples(cls.samples_path, None, None)
         cls.inference = CausalLMInference(cls.model_path, "cpu")
 
-    def _train(self, output_dir: Path, *, history_batch: int = 4) -> dict:
+    def _train(
+        self,
+        output_dir: Path,
+        *,
+        history_batch: int = 4,
+        max_steps: int | None = 100000,
+        eval_every: int = 1000,
+        tol: float = 1e-4,
+        patience: int = 3,
+        checkpoint_every: int = 1000,
+        overwrite: bool = False,
+    ) -> dict:
         return train_exp4(
             samples_path=self.samples_path,
             model_path=self.model_path,
@@ -87,13 +98,16 @@ class Exp4NeuralSVDTests(unittest.TestCase):
             nesting="sequential",
             history_batch=history_batch,
             future_batch=3,
-            # The second mode is ~85x smaller; full-batch probes need >10000 steps.
-            steps=20000,
+            max_steps=max_steps,
+            eval_every=eval_every,
+            tol=tol,
+            patience=patience,
+            checkpoint_every=checkpoint_every,
             lr=1e-2,
             seed=0,
-            log_every=20000,
+            log_every=100000,
             output_dir=output_dir,
-            overwrite=False,
+            overwrite=overwrite,
         )
 
     def test_centered_logit_block_matches_every_full_vocabulary_entry(self) -> None:
@@ -117,8 +131,9 @@ class Exp4NeuralSVDTests(unittest.TestCase):
         result_dir = self.root / "convergence"
         result = self._train(result_dir / "train")
         self.assertEqual((result["rows"], result["columns"]), (4, 33))
-        self.assertEqual(result["steps"], 20000)
-        self.assertEqual(result["pairs_evaluated"], 20000 * 4 * 3)
+        self.assertEqual(result["stop_reason"], "converged")
+        self.assertEqual(result["pairs_evaluated"], result["steps"] * 4 * 3)
+        self.assertFalse((result_dir / "train" / "checkpoint.pt").exists())
         analyze_exp4(result_dir=result_dir, device="cpu", overwrite=False)
         matrix = centered_logit_block(
             self.inference, self.histories, self.futures
@@ -128,6 +143,71 @@ class Exp4NeuralSVDTests(unittest.TestCase):
         self.assertEqual(learned.shape, (2,))
         np.testing.assert_allclose(learned, expected, rtol=1e-2, atol=0)
         self.assertTrue((result_dir / "analysis" / "neural_svd_spectrum.png").is_file())
+
+    def test_interrupted_training_resumes_identically(self) -> None:
+        uninterrupted_dir = self.root / "uninterrupted" / "train"
+        resumed_dir = self.root / "resumed" / "train"
+        uninterrupted_result = self._train(
+            uninterrupted_dir, max_steps=10, eval_every=5, checkpoint_every=3
+        )
+        self._train(resumed_dir, max_steps=4, eval_every=5, checkpoint_every=3)
+        resumed_result = self._train(
+            resumed_dir, max_steps=10, eval_every=5, checkpoint_every=3
+        )
+        for output_dir, result in (
+            (uninterrupted_dir, uninterrupted_result),
+            (resumed_dir, resumed_result),
+        ):
+            with self.subTest(output_dir=output_dir):
+                self.assertEqual(result["stop_reason"], "max_steps")
+                self.assertEqual(result["steps"], 10)
+                self.assertFalse((output_dir / "metadata.json").exists())
+        uninterrupted = torch.load(
+            uninterrupted_dir / "checkpoint.pt", map_location="cpu", weights_only=True
+        )
+        resumed = torch.load(
+            resumed_dir / "checkpoint.pt", map_location="cpu", weights_only=True
+        )
+        self.assertEqual(uninterrupted["features"].keys(), resumed["features"].keys())
+        for name, tensor in uninterrupted["features"].items():
+            with self.subTest(feature=name):
+                self.assertTrue(torch.equal(tensor, resumed["features"][name]))
+        for name in ("loss_history", "generator"):
+            with self.subTest(state=name):
+                self.assertTrue(torch.equal(uninterrupted[name], resumed[name]))
+        for name in ("previous_singular_values", "stable_evaluations"):
+            with self.subTest(state=name):
+                self.assertEqual(uninterrupted[name], resumed[name])
+        uninterrupted_optimizer = uninterrupted["optimizer"]["state"]
+        resumed_optimizer = resumed["optimizer"]["state"]
+        self.assertEqual(len(uninterrupted_optimizer), 2)
+        self.assertEqual(uninterrupted_optimizer.keys(), resumed_optimizer.keys())
+        for parameter, state in uninterrupted_optimizer.items():
+            for name in ("exp_avg", "exp_avg_sq"):
+                with self.subTest(parameter=parameter, optimizer_state=name):
+                    self.assertTrue(
+                        torch.equal(state[name], resumed_optimizer[parameter][name])
+                    )
+
+    def test_resume_rejects_changed_config(self) -> None:
+        output_dir = self.root / "changed_config" / "train"
+        self._train(output_dir, max_steps=2)
+        with self.assertRaisesRegex(
+            ValueError, "checkpoint config mismatch.*history_batch"
+        ):
+            self._train(output_dir, max_steps=4, history_batch=3)
+
+    def test_overwrite_restarts_from_scratch(self) -> None:
+        output_dir = self.root / "overwrite" / "train"
+        self._train(output_dir, max_steps=3, checkpoint_every=1)
+        result = self._train(
+            output_dir, max_steps=2, checkpoint_every=1, overwrite=True
+        )
+        self.assertEqual(result["steps"], 2)
+        checkpoint = torch.load(
+            output_dir / "checkpoint.pt", map_location="cpu", weights_only=True
+        )
+        self.assertEqual(checkpoint["step"], 2)
 
     def test_existing_training_metadata_requires_overwrite(self) -> None:
         output_dir = self.root / "existing" / "train"

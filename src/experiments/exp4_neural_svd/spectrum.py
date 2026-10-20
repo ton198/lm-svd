@@ -9,6 +9,38 @@ from utils import ANALYSIS_DIR
 from utils.common import save_json, save_numpy, write_atomic
 
 
+def learned_feature_moments(
+    history_weight: torch.Tensor,
+    future_weight: torch.Tensor,
+    token_gram: torch.Tensor,
+    *,
+    rank: int,
+    hidden_size: int,
+    columns: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return float64 f_rms, g_rms, and right_gram on token_gram.device."""
+    with torch.no_grad():
+        device = token_gram.device
+        history_features_t = history_weight.to(device=device, dtype=torch.float64)
+        future_count = future_weight.shape[0]
+        future_weights = future_weight.view(future_count, rank, hidden_size)
+        f_rms_t = history_features_t.pow(2).mean(dim=0).sqrt()
+        g_sq = torch.zeros(rank, dtype=torch.float64, device=device)
+        right_gram_t = torch.zeros((rank, rank), dtype=torch.float64, device=device)
+        for start in range(0, future_count, 1024):
+            weights = future_weights[start : start + 1024].to(
+                device=device, dtype=torch.float64
+            )
+            weighted_gram = (
+                weights.reshape(-1, hidden_size) @ token_gram
+            ).view_as(weights)
+            g_sq += (weighted_gram * weights).sum(dim=(0, 2))
+            right_gram_t += torch.einsum("cld,cmd->lm", weighted_gram, weights)
+        g_rms = (g_sq / columns).sqrt()
+        right_gram = right_gram_t / columns
+        return f_rms_t, g_rms, right_gram
+
+
 def analyze_exp4(
     *, result_dir: Path, device: str | torch.device, overwrite: bool
 ) -> str:
@@ -53,30 +85,21 @@ def analyze_exp4(
     rank = metadata["rank"]
     columns = future_count * vocab_size
     state = torch.load(input_paths[0], map_location="cpu", weights_only=True)
-    with torch.no_grad():
-        history_features_t = state["history.weight"].to(
-            device=device, dtype=torch.float64
-        )
-        future_weights = state["future.weight"].view(future_count, rank, hidden_size)
-        token_gram = torch.from_numpy(np.load(input_paths[1])).to(
-            device=device, dtype=torch.float64
-        )
-        f_rms_t = history_features_t.pow(2).mean(dim=0).sqrt()
-        g_sq = torch.zeros(rank, dtype=torch.float64, device=device)
-        right_gram_t = torch.zeros((rank, rank), dtype=torch.float64, device=device)
-        for start in range(0, future_count, 1024):
-            weights = future_weights[start : start + 1024].to(
-                device=device, dtype=torch.float64
-            )
-            weighted_gram = (
-                weights.reshape(-1, hidden_size) @ token_gram
-            ).view_as(weights)
-            g_sq += (weighted_gram * weights).sum(dim=(0, 2))
-            right_gram_t += torch.einsum("cld,cmd->lm", weighted_gram, weights)
-        history_features = history_features_t.cpu().numpy()
-        f_rms = f_rms_t.cpu().numpy()
-        g_rms = (g_sq / columns).sqrt().cpu().numpy()
-        right_gram = (right_gram_t / columns).cpu().numpy()
+    token_gram = torch.from_numpy(np.load(input_paths[1])).to(
+        device=device, dtype=torch.float64
+    )
+    f_rms_t, g_rms_t, right_gram_t = learned_feature_moments(
+        state["history.weight"],
+        state["future.weight"],
+        token_gram,
+        rank=rank,
+        hidden_size=hidden_size,
+        columns=columns,
+    )
+    history_features = state["history.weight"].to(dtype=torch.float64).cpu().numpy()
+    f_rms = f_rms_t.cpu().numpy()
+    g_rms = g_rms_t.cpu().numpy()
+    right_gram = right_gram_t.cpu().numpy()
     loss_history = np.asarray(np.load(input_paths[2]), dtype=np.float64)
     if np.any(f_rms == 0) or np.any(g_rms == 0):
         raise ValueError("every feature column must have nonzero norm")

@@ -46,11 +46,22 @@ def main(argv: list[str] | None = None) -> None:
     )
     train_parser.add_argument("--history-batch", type=positive_int, default=64)
     train_parser.add_argument("--future-batch", type=positive_int, default=64)
-    train_parser.add_argument("--steps", type=positive_int, default=100000)
+    train_parser.add_argument(
+        "--max-steps", type=positive_int, default=None,
+        help="Stop after this many total steps even if not converged; default: unlimited",
+    )
+    train_parser.add_argument("--eval-every", type=positive_int, default=1000)
+    train_parser.add_argument("--tol", type=positive_float, default=1e-3)
+    train_parser.add_argument("--patience", type=positive_int, default=3)
+    train_parser.add_argument("--checkpoint-every", type=positive_int, default=100)
     train_parser.add_argument("--lr", type=positive_float, default=1e-2)
     train_parser.add_argument("--seed", type=int, default=0)
     train_parser.add_argument("--log-every", type=positive_int, default=100)
-    train_parser.add_argument("--overwrite", action="store_true")
+    train_parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Discard any checkpoint and final outputs and restart training from step 0; "
+        "by default training resumes from train/checkpoint.pt",
+    )
     analysis_parser = subparsers.add_parser(
         "analysis",
         help=f"Analyze the learned spectrum and write {ANALYSIS_DIR} outputs",
@@ -87,7 +98,11 @@ def main(argv: list[str] | None = None) -> None:
             nesting=args.nesting,
             history_batch=args.history_batch,
             future_batch=args.future_batch,
-            steps=args.steps,
+            max_steps=args.max_steps,
+            eval_every=args.eval_every,
+            tol=args.tol,
+            patience=args.patience,
+            checkpoint_every=args.checkpoint_every,
             lr=args.lr,
             seed=args.seed,
             log_every=args.log_every,
@@ -98,6 +113,7 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(str(error))
     print(
         f"output_dir: {summary['output_dir']}\n"
+        f"stop_reason: {summary['stop_reason']}\n"
         f"matrix: {summary['rows']} x {summary['columns']}\n"
         f"steps: {summary['steps']}\n"
         f"pairs_evaluated: {summary['pairs_evaluated']}\n"
