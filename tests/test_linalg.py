@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import torch
 
-from utils import matrix_svd
+from utils.linalg import matrix_svd
 
 
 class MatrixSVDTests(unittest.TestCase):

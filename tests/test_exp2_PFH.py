@@ -9,8 +9,8 @@ import pyarrow.parquet as pq
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from experiments.exp2_PFH import build_exp2_pfh
-from utils import CausalLMInference
+from experiments.exp2_PFH.feature_logprob import build_exp2_pfh
+from utils.inference import CausalLMInference
 
 
 class Exp2PFHTests(unittest.TestCase):

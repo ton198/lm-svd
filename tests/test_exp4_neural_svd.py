@@ -9,12 +9,10 @@ import pyarrow.parquet as pq
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from experiments.exp4_neural_svd import (
-    analyze_exp4,
-    centered_logit_block,
-    train_exp4,
-)
-from utils import CausalLMInference, load_samples
+from experiments.exp4_neural_svd.spectrum import analyze_exp4
+from experiments.exp4_neural_svd.train import centered_logit_block, train_exp4
+from utils.common import load_samples
+from utils.inference import CausalLMInference
 
 
 class Exp4NeuralSVDTests(unittest.TestCase):

@@ -10,17 +10,10 @@ import pyarrow.parquet as pq
 import torch
 from torch import nn
 
-from utils import (
-    CausalLMInference,
-    NestedLoRASVDLoss,
-    Sample,
-    build_row_table,
-    load_samples,
-    read_source_metadata,
-    save_json,
-    save_numpy,
-    write_atomic,
-)
+from utils.common import Sample, load_samples, save_json, save_numpy, write_atomic
+from utils.inference import CausalLMInference
+from utils.lm_table import build_row_table, read_source_metadata
+from utils.neural_svd import NestedLoRASVDLoss
 
 
 def centered_unembedding(inference: CausalLMInference) -> torch.Tensor:

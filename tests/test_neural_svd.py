@@ -4,7 +4,7 @@ import unittest
 import torch
 from torch import nn
 
-from utils import NestedLoRASVDLoss, nesting_masks, neural_svd_spectrum
+from utils.neural_svd import NestedLoRASVDLoss, nesting_masks, neural_svd_spectrum
 
 
 class NeuralSVDTests(unittest.TestCase):

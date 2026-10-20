@@ -1,9 +1,6 @@
 import argparse
 from pathlib import Path
 
-from .task_inputs import build_task_input_tables
-from .windows import build_windows_table
-
 
 def positive_int(value: str) -> int:
     try:
@@ -101,6 +98,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         if args.command == "build-task-inputs":
+            from .task_inputs import build_task_input_tables
+
             build_task_input_tables(
                 task_catalog=args.task_catalog,
                 c4_paths=args.c4_paths,
@@ -114,6 +113,8 @@ def main(argv: list[str] | None = None) -> None:
                 overwrite=args.overwrite,
             )
             return
+        from .windows import build_windows_table
+
         summary = build_windows_table(
             dataset_dir=args.dataset_dir,
             config=args.config,

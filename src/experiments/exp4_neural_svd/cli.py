@@ -3,10 +3,8 @@ import math
 from pathlib import Path
 
 from data_pipline.cli import positive_int
-from utils import ANALYSIS_DIR, add_run_arguments, dataset_samples_path, run_dir
-
-from .spectrum import analyze_exp4
-from .train import train_exp4
+from utils.analysis import ANALYSIS_DIR
+from utils.experiment_paths import add_run_arguments, dataset_samples_path, run_dir
 
 
 EXPERIMENT = "exp4_neural_svd"
@@ -73,10 +71,14 @@ def main(argv: list[str] | None = None) -> None:
             args.results_root, EXPERIMENT, args.dataset, args.model_path.name
         )
         if args.command == "analysis":
+            from .spectrum import analyze_exp4
+
             print(analyze_exp4(
                 result_dir=result_dir, device=args.device, overwrite=args.overwrite
             ))
             return
+        from .train import train_exp4
+
         summary = train_exp4(
             samples_path=dataset_samples_path(args.dataset),
             model_path=args.model_path,

@@ -12,11 +12,12 @@ import pyarrow.parquet as pq
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from utils import compute_rank, compute_svd, load_samples
+from utils.analysis import compute_rank, compute_svd
+from utils.common import load_samples
 from experiments.exp1_L_M_table.table import centered_logits, select_header_tokens
-from experiments.exp3_L_M_diff import build_exp3_diff
+from experiments.exp3_L_M_diff.table import build_exp3_diff
 from experiments.exp3_L_M_diff.cli import main as exp3_main
-from utils import CausalLMInference
+from utils.inference import CausalLMInference
 
 
 class Exp3LMDiffTests(unittest.TestCase):
