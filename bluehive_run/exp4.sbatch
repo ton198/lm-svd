@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=8:00:00
-#SBATCH --output=bluehive_run/logs/slurm-exp4-%x-%j.out
-#SBATCH --error=bluehive_run/logs/slurm-exp4-%x-%j.err
+#SBATCH --output=bluehive_run/logs/slurm-%x-%j.out
+#SBATCH --error=bluehive_run/logs/slurm-%x-%j.err
 
 set -euo pipefail
 
