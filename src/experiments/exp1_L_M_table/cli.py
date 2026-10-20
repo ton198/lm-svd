@@ -53,6 +53,7 @@ def main(argv: list[str] | None = None) -> None:
                     result_dir=result_dir,
                     matrix_name=MATRIX_NAME,
                     centering=args.centering,
+                    device=args.device,
                     overwrite=args.overwrite,
                 )
             )

@@ -17,7 +17,7 @@ class AnalysisTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.matrix = (
-            np.outer([1, 2, 3, 4], [1, 0, 2, 0, 1, 3])
+            0.25 * np.outer([1, 2, 3, 4], [1, 0, 2, 0, 1, 3])
             + np.outer([0, 1, 0, -1], [2, 1, 0, 1, 0, 1])
         ).astype(np.float32)
         self.matrix_path = self.root / "feature_log_prob.npy"
@@ -31,6 +31,7 @@ class AnalysisTests(unittest.TestCase):
             matrix_path=self.matrix_path,
             output_dir=self.root,
             centering="none",
+            device="cpu",
             overwrite=False,
         )
 
@@ -49,7 +50,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(summary["rank"], 2)
         self.assertEqual(rank["rank"], 2)
         self.assertAlmostEqual(
-            rank["rank_tolerance"], float(S.max()) * 6 * np.finfo(np.float32).eps
+            rank["rank_tolerance"], float(S.max()) * 6 * np.finfo(np.float64).eps
         )
         path = visualize_svd(svd_dir=self.root, overwrite=False)
         self.assertTrue(path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
@@ -69,6 +70,7 @@ class AnalysisTests(unittest.TestCase):
             matrix_path=self.matrix_path,
             output_dir=self.root,
             centering="none",
+            device="cpu",
             overwrite=True,
         )
         self.assertEqual(compute_rank(svd_dir=self.root, overwrite=True)["rank"], 3)
@@ -106,15 +108,18 @@ class AnalysisTests(unittest.TestCase):
             json.dumps({"fixture": True}), encoding="utf-8"
         )
         matrix = self.matrix.astype(np.float64)
+        u, s, vt = np.linalg.svd(matrix, full_matrices=False)
         expected = {
             "none": matrix,
             "global": matrix - matrix.mean(),
             "row": matrix - matrix.mean(axis=1, keepdims=True),
+            "deflate1": matrix - s[0] * np.outer(u[:, 0], vt[0]),
         }
         formulas = {
             "none": "M",
             "global": "M - mean(M)",
             "row": "M - mean(M, axis=1, keepdims=True)",
+            "deflate1": "M - S[0] * outer(U[:, 0], Vt[0, :]), where M = U @ diag(S) @ Vt",
         }
         for centering in CENTERING_CHOICES:
             with self.subTest(centering=centering):
@@ -122,6 +127,7 @@ class AnalysisTests(unittest.TestCase):
                     exp2_main([
                         "analysis", "--results-root", str(self.root),
                         "--centering", centering,
+                        "--device", "cpu",
                     ])
                 output = run / "analysis" / centering
                 U = np.load(output / "svd_U.npy")
@@ -146,16 +152,22 @@ class AnalysisTests(unittest.TestCase):
                     self.assertLess(np.abs(reconstructed.sum(axis=1)).max(), 1e-5)
                 elif centering == "global":
                     self.assertLess(abs(reconstructed.mean()), 1e-6)
+                elif centering == "deflate1":
+                    np.testing.assert_allclose(S[:-1], s[1:], atol=1e-5)
+                    rank = json.loads((output / "rank.json").read_text())
+                    self.assertEqual(rank["rank"], 1)
 
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             exp2_main([
-                "analysis", "--results-root", str(self.root), "--centering", "row"
+                "analysis", "--results-root", str(self.root), "--centering", "row",
+                "--device", "cpu",
             ])
         with self.assertRaisesRegex(ValueError, "unknown centering"):
             compute_svd(
                 matrix_path=matrix_path,
                 output_dir=self.root / "bad",
                 centering="bogus",
+                device="cpu",
                 overwrite=False,
             )
         self.assertFalse((self.root / "bad").exists())
@@ -177,24 +189,39 @@ class AnalysisTests(unittest.TestCase):
                         result_dir=result_dir,
                         matrix_name="feature_log_prob.npy",
                         centering="none",
+                        device="cpu",
                         overwrite=False,
                     )
 
                 self.assertEqual(existing.read_bytes(), b"existing output")
                 self.assertEqual(set(output.iterdir()), {existing})
 
-    def test_rank_uses_input_precision_with_legacy_metadata(self) -> None:
-        np.save(self.root / "svd_S.npy", np.array([1.0, 1e-8], dtype=np.float64))
+    def test_rank_ignores_input_dtype_and_stale_rank_metadata(self) -> None:
+        tolerance = 1e12 * 5 * float(np.finfo(np.float64).eps)
+        singular_values = np.array(
+            [1e12, 1e5, tolerance, tolerance / 2, 0], dtype=np.float64
+        )
+        np.save(self.root / "svd_S.npy", singular_values)
         metadata_path = self.root / "svd_metadata.json"
-        metadata = {
-            "matrix_shape": [2, 2], "input_dtype": "float32",
-            "rank": 99, "rank_tolerance": 0,
-        }
-        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-        self.assertEqual(compute_rank(svd_dir=self.root, overwrite=False)["rank"], 1)
-        metadata["input_dtype"] = "float64"
-        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-        self.assertEqual(compute_rank(svd_dir=self.root, overwrite=True)["rank"], 2)
+        for input_dtype, stale_rank, stale_tolerance in (
+            ("float32", 1, 1e6),
+            ("float64", 99, 0),
+            ("int64", 0, 1e12),
+        ):
+            with self.subTest(input_dtype=input_dtype):
+                metadata = {
+                    "matrix_shape": [5, 5],
+                    "input_dtype": input_dtype,
+                    "rank": stale_rank,
+                    "rank_tolerance": stale_tolerance,
+                }
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                summary = compute_rank(svd_dir=self.root, overwrite=True)
+                rank = json.loads((self.root / "rank.json").read_text())
+                self.assertEqual(summary["rank"], 2)
+                self.assertEqual(rank["rank"], 2)
+                self.assertEqual(rank["rank_tolerance"], tolerance)
+                self.assertEqual(rank["input_dtype"], input_dtype)
 
 
 if __name__ == "__main__":

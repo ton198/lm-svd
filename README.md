@@ -10,7 +10,7 @@ All matrix experiments use the same sampled history/future token sequences but c
 | `exp2` | Conditional log probability of an entire future given a history | histories × futures | `feature_log_prob.npy` |
 | `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
 
-Each experiment has two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, analysis does not load a language model or need a GPU.
+Each experiment has two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, analysis does not load a language model. Analysis defaults to CUDA; use `--device cpu` to run without a GPU.
 
 ## 1. Install dependencies
 
@@ -197,7 +197,7 @@ RESULT_DIR="$RESULTS_ROOT/exp1_L_M_table/wikitext__gpt2-small"
 uv run exp1 inference --device cpu \
   --history-count 1 --future-count 1 --top-k 2 \
   --dataset wikitext --results-root "$RESULTS_ROOT"
-uv run exp1 analysis --model-path models/gpt2-small \
+uv run exp1 analysis --device cpu --model-path models/gpt2-small \
   --dataset wikitext --results-root "$RESULTS_ROOT" --centering global
 echo "Results: $RESULT_DIR"
 ```
@@ -245,7 +245,7 @@ RESULT_DIR="$RESULTS_ROOT/exp2_PFH/wikitext__gpt2-small"
 uv run exp2 inference --device cpu \
   --history-count 2 --future-count 2 --batch-size 2 \
   --dataset wikitext --results-root "$RESULTS_ROOT"
-uv run exp2 analysis --model-path models/gpt2-small \
+uv run exp2 analysis --device cpu --model-path models/gpt2-small \
   --dataset wikitext --results-root "$RESULTS_ROOT" --centering none
 echo "Results: $RESULT_DIR"
 ```
@@ -279,7 +279,7 @@ uv run exp3 analysis \
   --dataset "$DATASET" --results-root "$RESULTS_ROOT" --centering none
 ```
 
-Override the models with `--model-a-path` and `--model-b-path`. `inference` writes `matrix.npy` (the difference), `matrix_a.npy`, `matrix_b.npy`, `rows.parquet`, `columns.parquet`, and `metadata.json` under `$RESULT_DIR/inference/`. Column tokens and future-only logits in `columns.parquet` come from model A. Analysis processes only the difference `matrix.npy`, not the two component matrices. Each secondary centering strategy is linear, so `center(L_A - L_B) = center(L_A) - center(L_B)`.
+Override the models with `--model-a-path` and `--model-b-path`. `inference` writes `matrix.npy` (the difference), `matrix_a.npy`, `matrix_b.npy`, `rows.parquet`, `columns.parquet`, and `metadata.json` under `$RESULT_DIR/inference/`. Column tokens and future-only logits in `columns.parquet` come from model A. Analysis processes only the difference `matrix.npy`, not the two component matrices. `global` and `row` centering are linear, so `center(L_A - L_B) = center(L_A) - center(L_B)`; `deflate1` is not linear because it removes the leading singular component of the difference matrix itself.
 
 ## 7. Understand the analysis outputs
 
@@ -299,22 +299,28 @@ All experiments share the same `analysis` command. It reads the matrix and optio
     │   ├── rank.json
     │   └── svd_spectrum.png
     ├── global/  # same six files
-    └── row/     # same six files
+    ├── row/     # same six files
+    └── deflate1/  # same six files
 ```
+
+Analysis computes a thin float64 SVD with PyTorch on `--device cuda` by default. CUDA uses the accurate `gesvd` driver; `--device cpu` uses PyTorch's CPU SVD. Invalid devices and unavailable CUDA produce an error rather than silently switching devices. If GPU memory is insufficient, rerun that analysis with `--device cpu`. Saved factors remain NumPy arrays, and the numerical-rank tolerance is unchanged.
 
 `<run>` is a flat, string-joined directory name: `<dataset>__<model>` for exp1/exp2 (for example, `wikitext__gpt2-small`), or `<dataset>__<model_a>__minus__<model_b>` for exp3 (for example, `wikitext__gpt2-small__minus__gpt2-medium`). Model labels are the final directory names of the model paths. The dataset is not a separate directory level. Only the requested strategy directory is created.
 
 ### Secondary centering
 
-`analysis --centering {none,global,row}` selects how the stored matrix `M` is transformed before SVD; the default is `none`:
+`analysis --centering {none,global,row,deflate1}` selects how the stored matrix `M` is transformed before SVD; the default is `none`:
 
 | Strategy | Matrix decomposed |
 | --- | --- |
 | `none` | `M` |
 | `global` | `M - mean(M)` |
 | `row` | `M - mean(M, axis=1, keepdims=True)` |
+| `deflate1` | `M - S[0] * outer(U[:, 0], Vt[0, :])`, where `M = U @ diag(S) @ Vt` |
 
 Row centering subtracts each history's mean across all columns: futures × header tokens for exp1/exp3, or futures for exp2. This is **secondary** centering: it does not change the base vocabulary-mean logit subtraction in exp1/exp3, and exp2 inference still stores uncentered log-probability sums. Selecting only top-k header tokens can leave the stored exp1/exp3 matrix biased toward large values despite its base vocabulary centering.
+
+`deflate1` removes the leading singular component of `M`. It computes that component with a separate thin float64 SVD of `M` on the analysis `--device`, so this strategy runs two SVDs. The transformed matrix is then analyzed like every other strategy. Its spectrum equals the `none` spectrum without `S[0]`, followed by one rounding-level singular value for the removed direction. Rank uses the standard rule on this spectrum, so its tolerance scales with the original second singular value.
 
 For example, compare all strategies without rerunning inference:
 
@@ -322,7 +328,7 @@ For example, compare all strategies without rerunning inference:
 MODEL=gpt2-small
 DATASET=wikitext
 RESULTS_ROOT=data/experiment_results
-for CENTERING in none global row; do
+for CENTERING in none global row deflate1; do
   uv run exp2 analysis --model-path "models/$MODEL" \
     --dataset "$DATASET" --results-root "$RESULTS_ROOT" --centering "$CENTERING"
 done
@@ -330,9 +336,20 @@ done
 
 If `none` was already analyzed, add `--overwrite` to regenerate it.
 
-- **SVD:** Float64 thin SVD of the selected centered matrix. `(U * S) @ Vt` reconstructs that matrix, not the original stored matrix unless centering is `none`. The centered matrix is not saved separately. `svd_metadata.json` records `centering`, `centering_formula`, input path, shape and original dtype, computation dtype, singular-value extrema, the centered Frobenius norm and relative reconstruction error, and source matrix metadata under `matrix_metadata`. New SVD metadata does not contain rank fields.
-- **Numerical rank:** Counts singular values strictly greater than `S.max() * max(matrix.shape) * finfo(input_dtype).eps`. The original stored matrix dtype determines epsilon for all three strategies, even though centering and SVD use float64; non-floating input uses float64 epsilon. `rank.json` records the rank, tolerance, rule, matrix shape, input dtype, and singular-value count. Existing SVD metadata with legacy rank fields is accepted; rank is recomputed from the singular values.
-- **Visualization:** `svd_spectrum.png` contains singular-value decay with logarithmic index and singular-value axes, plus cumulative squared Frobenius energy with linear index and energy axes. Indices start at 1. Rank markers appear in both panels, and the singular-value panel also shows the tolerance. It uses Matplotlib's headless Agg backend. An all-zero spectrum is rejected because normalized energy is undefined, including when centering produces an all-zero matrix; SVD and rank outputs have already been written in that case. Existing manual `singular_value_decay.png` plots are untouched.
+- **SVD:** Float64 centering and thin SVD of the selected matrix, regardless of the original stored dtype. `(U * S) @ Vt` reconstructs that matrix, not the original stored matrix unless centering is `none`. The centered matrix is not saved separately. `svd_metadata.json` records `centering`, `centering_formula`, input path, shape and original dtype, computation dtype, singular-value extrema, the centered Frobenius norm and relative reconstruction error, and source matrix metadata under `matrix_metadata`. New SVD metadata does not contain rank fields. Inference and stored matrix dtypes are unchanged.
+- **Numerical rank:** Counts singular values strictly greater than `S.max() * max(matrix.shape) * finfo(float64).eps` for all input dtypes and all four centering strategies. `rank.json` records the rank, tolerance, rule, matrix shape, input dtype, and singular-value count; `input_dtype` records provenance only and does not determine epsilon. Existing SVD metadata with legacy rank fields is accepted; rank is recomputed from the singular values.
+- **Visualization:** `svd_spectrum.png` plots only singular values strictly greater than the numerical-rank tolerance for all four centering strategies. It contains singular-value decay with logarithmic index and singular-value axes, plus cumulative squared Frobenius energy normalized by the retained values' energy, with linear index and energy axes. Indices start at 1. Rank markers appear in both panels; no tolerance line is drawn. The full saved SVD and `rank.json`, including its tolerance, are unchanged by visualization. It uses Matplotlib's headless Agg backend. An all-zero spectrum is rejected because normalized energy is undefined, including when centering produces an all-zero matrix; SVD and rank outputs have already been written in that case. Existing manual `singular_value_decay.png` plots are untouched.
+
+Older float32 analyses used float32 epsilon for rank, so refresh their `rank.json` and `svd_spectrum.png` before using them. The saved singular values already come from float64 SVD: reuse them to recompute rank and redraw the plot without loading a model, rerunning inference, or repeating SVD. For each existing strategy directory, use the Python API (replace the path with your own):
+
+```python
+from pathlib import Path
+from utils import compute_rank, visualize_svd
+
+svd_dir = Path("data/experiment_results/exp2_PFH/wikitext__gpt2-small/analysis/none")
+compute_rank(svd_dir=svd_dir, overwrite=True)
+visualize_svd(svd_dir=svd_dir, overwrite=True)
+```
 
 ### Directory selection and existing results
 

@@ -13,15 +13,16 @@ RANK_NAME = "rank.json"
 PLOT_NAME = "svd_spectrum.png"
 INFERENCE_DIR = "inference"
 ANALYSIS_DIR = "analysis"
-CENTERING_CHOICES = ("none", "global", "row")
+CENTERING_CHOICES = ("none", "global", "row", "deflate1")
 CENTERING_FORMULAS = {
     "none": "M",
     "global": "M - mean(M)",
     "row": "M - mean(M, axis=1, keepdims=True)",
+    "deflate1": "M - S[0] * outer(U[:, 0], Vt[0, :]), where M = U @ diag(S) @ Vt",
 }
 
 
-def center_matrix(matrix: np.ndarray, centering: str) -> np.ndarray:
+def center_matrix(matrix: np.ndarray, centering: str, *, device: str) -> np.ndarray:
     if centering not in CENTERING_CHOICES:
         raise ValueError(
             f"unknown centering: {centering}; expected one of {', '.join(CENTERING_CHOICES)}"
@@ -31,11 +32,15 @@ def center_matrix(matrix: np.ndarray, centering: str) -> np.ndarray:
         return data - data.mean()
     if centering == "row":
         return data - data.mean(axis=1, keepdims=True)
+    if centering == "deflate1":
+        leading = matrix_svd(data, device=device)
+        data -= leading.S[0] * np.outer(leading.U[:, 0], leading.Vt[0])
+        return data
     return data
 
 
 def compute_svd(
-    *, matrix_path: Path, output_dir: Path, centering: str, overwrite: bool
+    *, matrix_path: Path, output_dir: Path, centering: str, device: str, overwrite: bool
 ) -> dict[str, int | float | str]:
     if not matrix_path.is_file():
         raise ValueError(f"matrix file does not exist: {matrix_path}")
@@ -51,8 +56,8 @@ def compute_svd(
             )
 
     matrix = np.load(matrix_path)
-    data = center_matrix(matrix, centering)
-    result = matrix_svd(data)
+    data = center_matrix(matrix, centering, device=device)
+    result = matrix_svd(data, device=device)
     frobenius_norm = float(np.linalg.norm(data))
     reconstruction_relative_error = (
         float(np.linalg.norm(data - (result.U * result.S) @ result.Vt) / frobenius_norm)
@@ -109,15 +114,14 @@ def compute_rank(*, svd_dir: Path, overwrite: bool) -> dict[str, int | float | s
     singular_values = np.load(singular_values_path)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     shape = tuple(metadata["matrix_shape"])
-    dtype = np.dtype(metadata["input_dtype"])
-    rank, tolerance = numerical_rank(singular_values, shape, dtype)
+    rank, tolerance = numerical_rank(singular_values, shape)
     rank_metadata = {
         "svd_dir": str(svd_dir),
         "matrix_shape": list(shape),
-        "input_dtype": str(dtype),
+        "input_dtype": metadata["input_dtype"],
         "rank": rank,
         "rank_tolerance": tolerance,
-        "rank_tolerance_rule": "S.max() * max(matrix.shape) * finfo(input_dtype).eps",
+        "rank_tolerance_rule": "S.max() * max(matrix.shape) * finfo(float64).eps",
         "singular_value_count": int(singular_values.size),
     }
     svd_dir.mkdir(parents=True, exist_ok=True)
@@ -143,13 +147,12 @@ def visualize_svd(*, svd_dir: Path, overwrite: bool) -> Path:
         )
 
     singular_values = np.load(singular_values_path)
-    squared_values = singular_values**2
-    total_energy = np.sum(squared_values)
-    if total_energy == 0:
+    if not np.any(singular_values):
         raise ValueError("all singular values are zero; nothing to plot")
     metadata = json.loads(rank_path.read_text(encoding="utf-8"))
     rank = metadata["rank"]
     tolerance = metadata["rank_tolerance"]
+    kept = singular_values[singular_values > tolerance]
     m, n = metadata["matrix_shape"]
 
     import matplotlib
@@ -157,16 +160,16 @@ def visualize_svd(*, svd_dir: Path, overwrite: bool) -> Path:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    indices = np.arange(1, singular_values.size + 1)
+    indices = np.arange(1, kept.size + 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     try:
         axes[0].set_xscale("log")
-        axes[0].semilogy(indices, np.where(singular_values > 0, singular_values, np.nan))
+        axes[0].semilogy(indices, kept)
         axes[0].axvline(rank, color="red", linestyle="--", label=f"rank = {rank}")
-        axes[0].axhline(tolerance, color="gray", linestyle=":", label="tolerance")
         axes[0].set(title="Singular values", xlabel="index", ylabel="singular value")
         axes[0].legend()
-        axes[1].plot(indices, np.cumsum(squared_values) / total_energy)
+        kept_squared = kept**2
+        axes[1].plot(indices, np.cumsum(kept_squared) / kept_squared.sum())
         axes[1].axvline(rank, color="red", linestyle="--", label=f"rank = {rank}")
         axes[1].set(
             title="Cumulative energy",
@@ -194,12 +197,13 @@ def add_analysis_command(subparsers) -> argparse.ArgumentParser:
         "--centering", choices=CENTERING_CHOICES, default="none",
         help="Secondary centering applied before SVD",
     )
+    parser.add_argument("--device", default="cuda", help="Torch device for the float64 SVD")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
     return parser
 
 
 def run_analysis(
-    *, result_dir: Path, matrix_name: str, centering: str, overwrite: bool
+    *, result_dir: Path, matrix_name: str, centering: str, device: str, overwrite: bool
 ) -> str:
     if centering not in CENTERING_CHOICES:
         raise ValueError(
@@ -218,6 +222,7 @@ def run_analysis(
         matrix_path=matrix_path,
         output_dir=output_dir,
         centering=centering,
+        device=device,
         overwrite=overwrite,
     )
     rank = compute_rank(svd_dir=output_dir, overwrite=overwrite)

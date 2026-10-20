@@ -150,6 +150,7 @@ class Exp3LMDiffTests(unittest.TestCase):
             matrix_path=output / "matrix.npy",
             output_dir=output,
             centering="none",
+            device="cpu",
             overwrite=False,
         )
         summary = compute_rank(svd_dir=output, overwrite=False)
@@ -197,6 +198,7 @@ class Exp3LMDiffTests(unittest.TestCase):
                 "--results-root", str(results_root),
                 "--model-a-path", str(self.model_a_path),
                 "--model-b-path", str(self.model_b_path),
+                "--device", "cpu",
             ])
         self.assertTrue((output / "inference" / "matrix.npy").is_file())
         analysis = output / "analysis" / "none"
