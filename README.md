@@ -310,7 +310,7 @@ uv run exp4 train
 uv run exp4 analysis
 ```
 
-Both stages default to `--dataset wikitext-large`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; use `--device cpu` for either stage without CUDA. Training uses all available histories and futures, rank 32, sequential nesting, history/future batches of 16 each, 100000 steps, learning rate `1e-2`, seed 0, and logging every 100 steps. Use `--history-count` / `--future-count` for leading subsets, `--history-batch` / `--future-batch` for block sizes, `--rank`, `--steps`, `--lr`, `--log-every`, or `--nesting joint` to adjust training.
+Both stages default to `--dataset wikitext-large`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; use `--device cpu` for either stage without CUDA. Training uses all available histories and futures, rank 32, sequential nesting, history/future batches of 64 each, 100000 steps, learning rate `1e-2`, seed 0, and logging every 100 steps. Use `--history-count` / `--future-count` for leading subsets, `--history-batch` / `--future-batch` for block sizes, `--rank`, `--steps`, `--lr`, `--log-every`, or `--nesting joint` to adjust training.
 
 Runs are stored under `<results-root>/exp4_neural_svd/<dataset>__<model-directory-name>/`. Pass matching dataset, results-root, and model-path flags to both stages for nondefault runs. The provided Slurm workflows cover exp1–exp3 only, not exp4.
 

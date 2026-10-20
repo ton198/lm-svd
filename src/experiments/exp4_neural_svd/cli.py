@@ -44,8 +44,8 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument(
         "--nesting", choices=("sequential", "joint"), default="sequential"
     )
-    train_parser.add_argument("--history-batch", type=positive_int, default=16)
-    train_parser.add_argument("--future-batch", type=positive_int, default=16)
+    train_parser.add_argument("--history-batch", type=positive_int, default=64)
+    train_parser.add_argument("--future-batch", type=positive_int, default=64)
     train_parser.add_argument("--steps", type=positive_int, default=100000)
     train_parser.add_argument("--lr", type=positive_float, default=1e-2)
     train_parser.add_argument("--seed", type=int, default=0)
