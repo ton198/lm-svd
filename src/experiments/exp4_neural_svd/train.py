@@ -120,7 +120,7 @@ def train_exp4(
     if overwrite:
         for path in [*outputs, checkpoint_path]:
             path.unlink(missing_ok=True)
-    else:
+    elif not checkpoint_path.exists():
         for path in outputs:
             if path.exists():
                 raise FileExistsError(
@@ -187,6 +187,47 @@ def train_exp4(
         del checkpoint
         print(f"resuming from step {step}", flush=True)
 
+    row_table = build_row_table([sample.sample_id for sample in histories])
+    future_table = pa.table(
+        {
+            "future_index": pa.array(range(len(futures)), type=pa.int32()),
+            "future_sample_id": pa.array(
+                [sample.sample_id for sample in futures], type=pa.int32()
+            ),
+        }
+    )
+    static_metadata = {
+        "samples_path": str(samples_path),
+        "model_path": str(model_path),
+        "device": device,
+        "history_count": len(histories),
+        "future_count": len(futures),
+        "vocab_size": inference.vocab_size,
+        "hidden_size": hidden_size,
+        "matrix_shape": [len(histories), columns],
+        "value": "logit(token | history + future) - mean(logits over full vocabulary)",
+        "column_order": "future-major, then token id",
+        "feature_parameterization": (
+            "f = history lookup (H, rank); g(f, z) = W_f @ (e_z - mean_e), "
+            "W_f in R^{rank x hidden}"
+        ),
+        "rank": rank,
+        "nesting": nesting,
+        "history_batch": history_batch,
+        "future_batch": future_batch,
+    }
+    optimizer_metadata = {
+        "lr": lr,
+        "seed": seed,
+        "optimizer": "SparseAdam",
+    }
+    convergence_metadata = {
+        "eval_every": eval_every,
+        "tol": tol,
+        "patience": patience,
+    }
+    source_metadata = read_source_metadata(samples_path)
+
     def save_checkpoint() -> None:
         payload = {
             "config": config,
@@ -203,6 +244,29 @@ def train_exp4(
         }
         output_dir.mkdir(parents=True, exist_ok=True)
         write_atomic(checkpoint_path, lambda tmp: torch.save(payload, tmp))
+
+    def write_outputs() -> None:
+        metadata = {
+            **static_metadata,
+            "steps": step,
+            **optimizer_metadata,
+            "pairs_evaluated": step * history_batch * future_batch,
+            "entry_mean_square": entry_mean_square_sum / step,
+            "final_loss": float(loss_history[-1]),
+            **convergence_metadata,
+            "converged": converged,
+            "final_relative_change": last_relative_change,
+            "source_metadata": source_metadata,
+        }
+        output_dir.mkdir(parents=True, exist_ok=True)
+        write_atomic(outputs[0], lambda tmp: torch.save(features.state_dict(), tmp))
+        write_atomic(outputs[1], lambda tmp: save_numpy(tmp, token_gram_t.cpu().numpy()))
+        write_atomic(
+            outputs[2], lambda tmp: save_numpy(tmp, np.asarray(loss_history, dtype=np.float64))
+        )
+        write_atomic(outputs[3], lambda tmp: pq.write_table(row_table, tmp))
+        write_atomic(outputs[4], lambda tmp: pq.write_table(future_table, tmp))
+        write_atomic(outputs[5], lambda tmp: save_json(tmp, metadata))
 
     started = time.perf_counter()
     while not converged and (max_steps is None or step < max_steps):
@@ -267,8 +331,9 @@ def train_exp4(
                 f"stable {stable_evaluations}/{patience}",
                 flush=True,
             )
-        if step % checkpoint_every == 0 or converged or step == max_steps:
+        if not converged and (step % checkpoint_every == 0 or step == max_steps):
             save_checkpoint()
+            write_outputs()
 
     pairs_evaluated = step * history_batch * future_batch
     if not converged:
@@ -282,57 +347,7 @@ def train_exp4(
             "stop_reason": "max_steps",
         }
 
-    row_table = build_row_table([sample.sample_id for sample in histories])
-    future_table = pa.table(
-        {
-            "future_index": pa.array(range(len(futures)), type=pa.int32()),
-            "future_sample_id": pa.array(
-                [sample.sample_id for sample in futures], type=pa.int32()
-            ),
-        }
-    )
-    metadata = {
-        "samples_path": str(samples_path),
-        "model_path": str(model_path),
-        "device": device,
-        "history_count": len(histories),
-        "future_count": len(futures),
-        "vocab_size": inference.vocab_size,
-        "hidden_size": hidden_size,
-        "matrix_shape": [len(histories), columns],
-        "value": "logit(token | history + future) - mean(logits over full vocabulary)",
-        "column_order": "future-major, then token id",
-        "feature_parameterization": (
-            "f = history lookup (H, rank); g(f, z) = W_f @ (e_z - mean_e), "
-            "W_f in R^{rank x hidden}"
-        ),
-        "rank": rank,
-        "nesting": nesting,
-        "history_batch": history_batch,
-        "future_batch": future_batch,
-        "steps": step,
-        "lr": lr,
-        "seed": seed,
-        "optimizer": "SparseAdam",
-        "pairs_evaluated": pairs_evaluated,
-        "entry_mean_square": entry_mean_square_sum / step,
-        "final_loss": float(loss_history[-1]),
-        "eval_every": eval_every,
-        "tol": tol,
-        "patience": patience,
-        "converged": True,
-        "final_relative_change": last_relative_change,
-        "source_metadata": read_source_metadata(samples_path),
-    }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_atomic(outputs[0], lambda tmp: torch.save(features.state_dict(), tmp))
-    write_atomic(outputs[1], lambda tmp: save_numpy(tmp, token_gram_t.cpu().numpy()))
-    write_atomic(
-        outputs[2], lambda tmp: save_numpy(tmp, np.asarray(loss_history, dtype=np.float64))
-    )
-    write_atomic(outputs[3], lambda tmp: pq.write_table(row_table, tmp))
-    write_atomic(outputs[4], lambda tmp: pq.write_table(future_table, tmp))
-    write_atomic(outputs[5], lambda tmp: save_json(tmp, metadata))
+    write_outputs()
     checkpoint_path.unlink(missing_ok=True)
     return {
         "output_dir": str(output_dir),

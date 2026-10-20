@@ -132,6 +132,9 @@ class Exp4NeuralSVDTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "converged")
         self.assertEqual(result["pairs_evaluated"], result["steps"] * 4 * 3)
         self.assertFalse((result_dir / "train" / "checkpoint.pt").exists())
+        metadata = json.loads((result_dir / "train" / "metadata.json").read_text())
+        self.assertIs(metadata["converged"], True)
+        self.assertEqual(metadata["steps"], result["steps"])
         analyze_exp4(result_dir=result_dir, device="cpu", overwrite=False)
         matrix = centered_logit_block(
             self.inference, self.histories, self.futures
@@ -159,7 +162,9 @@ class Exp4NeuralSVDTests(unittest.TestCase):
             with self.subTest(output_dir=output_dir):
                 self.assertEqual(result["stop_reason"], "max_steps")
                 self.assertEqual(result["steps"], 10)
-                self.assertFalse((output_dir / "metadata.json").exists())
+                metadata = json.loads((output_dir / "metadata.json").read_text())
+                self.assertEqual(metadata["steps"], 10)
+                self.assertIs(metadata["converged"], False)
         uninterrupted = torch.load(
             uninterrupted_dir / "checkpoint.pt", map_location="cpu", weights_only=True
         )
@@ -186,6 +191,36 @@ class Exp4NeuralSVDTests(unittest.TestCase):
                     self.assertTrue(
                         torch.equal(state[name], resumed_optimizer[parameter][name])
                     )
+        uninterrupted_features = torch.load(
+            uninterrupted_dir / "features.pt", map_location="cpu", weights_only=True
+        )
+        resumed_features = torch.load(
+            resumed_dir / "features.pt", map_location="cpu", weights_only=True
+        )
+        for name, tensor in uninterrupted_features.items():
+            with self.subTest(snapshot_feature=name):
+                self.assertTrue(torch.equal(tensor, resumed_features[name]))
+                self.assertTrue(torch.equal(tensor, uninterrupted["features"][name]))
+                self.assertTrue(
+                    torch.equal(resumed_features[name], resumed["features"][name])
+                )
+
+    def test_analysis_reads_unconverged_snapshot(self) -> None:
+        result_dir = self.root / "snapshot"
+        train_dir = result_dir / "train"
+        result = self._train(
+            train_dir, max_steps=3, checkpoint_every=2, eval_every=1000
+        )
+        self.assertEqual(result["stop_reason"], "max_steps")
+        self.assertTrue((train_dir / "checkpoint.pt").exists())
+        summary = analyze_exp4(result_dir=result_dir, device="cpu", overwrite=False)
+        self.assertIn("training: step 3, converged False", summary)
+        spectrum = json.loads((result_dir / "analysis" / "spectrum.json").read_text())
+        metadata = spectrum["train_metadata"]
+        self.assertEqual(metadata["steps"], 3)
+        self.assertIs(metadata["converged"], False)
+        self.assertIsNone(metadata["final_relative_change"])
+        self.assertEqual(np.load(train_dir / "loss_history.npy").shape, (3,))
 
     def test_resume_rejects_changed_config(self) -> None:
         output_dir = self.root / "changed_config" / "train"

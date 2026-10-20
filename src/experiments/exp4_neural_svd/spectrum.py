@@ -162,6 +162,7 @@ def analyze_exp4(
         (
             f"output_dir: {output_dir}",
             f"matrix: {history_count} x {columns}",
+            f"training: step {metadata['steps']}, converged {metadata['converged']}",
             f"singular values max/min: {singular_values.max():.6g} / {singular_values.min():.6g}",
             f"left_orthogonality_error: {left_orthogonality_error:.6g}",
             f"right_orthogonality_error: {right_orthogonality_error:.6g}",
