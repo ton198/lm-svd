@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=lm-svd-exp3
+#SBATCH --job-name=lm-svd-exp1-inference
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:A100:1
 #SBATCH --cpus-per-task=4
@@ -22,14 +22,10 @@ printf 'Job ID: %s\nNode: %s\nWorking directory: %s\n' \
 nvidia-smi
 source .venv/bin/activate
 
-# Override at submit time, e.g. DATASET=task-single-text sbatch bluehive_run/exp3.sbatch
+# Override at submit time, e.g. DATASET=task-single-text sbatch bluehive_run/exp1-inference.sbatch
 dataset="${DATASET:-wikitext}"
-run_args=(--dataset "$dataset" --model-a-path models/gpt2-small --model-b-path models/gpt2-medium --device cuda)
+run_args=(--dataset "$dataset" --model-path models/gpt2-small --device cuda)
 
 # Inference cannot resume; --overwrite recomputes and replaces any earlier matrix.
-printf 'Running exp3 inference on %s; log: %s/exp3-inference.out\n' "$dataset" "$log_dir"
-exp3 inference "${run_args[@]}" --overwrite > "$log_dir/exp3-inference.out" 2>&1
-
-# Inference failure or a Slurm timeout skips analysis.
-printf 'Running exp3 analysis on %s; log: %s/exp3-analysis.out\n' "$dataset" "$log_dir"
-exp3 analysis "${run_args[@]}" --overwrite > "$log_dir/exp3-analysis.out" 2>&1
+printf 'Running exp1 inference on %s; log: %s/exp1-inference.out\n' "$dataset" "$log_dir"
+exp1 inference "${run_args[@]}" --overwrite > "$log_dir/exp1-inference.out" 2>&1

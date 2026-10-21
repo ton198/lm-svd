@@ -22,7 +22,7 @@ printf 'Job ID: %s\nNode: %s\nWorking directory: %s\n' \
 nvidia-smi
 source .venv/bin/activate
 
-# Must match the exp4 train arguments so analysis reads the same run directory.
+# Must match exp4-train.sbatch arguments so analysis reads the same run directory.
 run_args=(--dataset wikitext-large --model-path models/gpt2-small --device cuda)
 
 # --overwrite makes repeated runs replace earlier analysis outputs (writes are atomic).

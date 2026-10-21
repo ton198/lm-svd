@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=lm-svd-exp4
+#SBATCH --job-name=lm-svd-exp4-train
 #SBATCH --partition=preempt
 #SBATCH --gres=gpu:A100:1
 #SBATCH --cpus-per-task=4
@@ -29,7 +29,3 @@ run_args=(--dataset wikitext-large --model-path models/gpt2-small --device cuda)
 # No --overwrite: resume the latest checkpoint instead of discarding training.
 printf 'Running exp4 train; log: %s/exp4-train.out\n' "$log_dir"
 exp4 train "${run_args[@]}" > "$log_dir/exp4-train.out" 2>&1
-
-# Training failure or a Slurm timeout skips analysis; saved snapshots remain usable.
-printf 'Running exp4 analysis; log: %s/exp4-analysis.out\n' "$log_dir"
-exp4 analysis "${run_args[@]}" --overwrite > "$log_dir/exp4-analysis.out" 2>&1

@@ -316,19 +316,19 @@ Runs are stored under `<results-root>/exp4_neural_svd/<dataset>__<model-director
 
 ### BlueHive
 
-After installing `.venv` and preparing `models/gpt2-small` and `data/history_future_samples/wikitext-large.parquet` on the cluster, submit the standalone exp4 job from the repository root:
+After installing `.venv` and preparing `models/gpt2-small` and `data/history_future_samples/wikitext-large.parquet` on the cluster, submit the training-only exp4 job from the repository root:
 
 ```bash
 cd /scratch/lli81/lm-svd
 mkdir -p bluehive_run/logs
-sbatch bluehive_run/exp4.sbatch
+sbatch bluehive_run/exp4-train.sbatch
 ```
 
-The job requests one H100, 4 CPUs, 16 GiB host memory, and three hours. It runs `exp4 train` with the defaults above, then `exp4 analysis --overwrite` to refresh analysis outputs. Training does not use `--overwrite`: it resumes an existing checkpoint, while completed training outputs without a checkpoint cause an error. Do not submit overlapping jobs against the same result directory.
+The training job requests one A100 on the `preempt` partition, 4 CPUs, 16 GiB host memory, and one day, with requeue enabled and Slurm logs appended. It runs only `exp4 train` with the defaults above. Training does not use `--overwrite`: it resumes an existing checkpoint, while completed training outputs without a checkpoint cause an error. Do not submit overlapping jobs against the same result directory.
 
-Training has no step cap; if it reaches the Slurm time limit or fails, analysis is skipped. Resubmit the same job to resume from the latest checkpoint. A saved snapshot can also be analyzed separately before convergence. Resource requests are not a measured guarantee that the full dataset fits or converges within three hours; adjust the script's batch sizes and memory/time requests based on observed usage.
+Training has no step cap; resubmit the same training job after a timeout or failure to resume from the latest checkpoint. Submit `sbatch bluehive_run/exp4-analysis.sbatch` separately to run `exp4 analysis --overwrite`, including on a saved snapshot before convergence. The analysis job requests one GPU on the `gpu` partition, 4 CPUs, 16 GiB host memory, and one hour. Exp4 analysis has no `--centering` option and runs once on the learned centered-logit matrix. Resource requests are not a measured guarantee that the full dataset fits or converges within the time limit; adjust the script's batch sizes and memory/time requests based on observed usage.
 
-Slurm stdout/stderr go to `bluehive_run/logs/slurm-lm-svd-exp4-<job-id>.out` and `.err`; stage logs go to `bluehive_run/logs/slurm-lm-svd-exp4-<job-id>/exp4-train.out` and `exp4-analysis.out`. Create the log directory before submission so Slurm can open its files.
+Slurm stdout/stderr go to `bluehive_run/logs/slurm-lm-svd-exp4-train-<job-id>.out` and `.err` for training, or `slurm-lm-svd-exp4-analysis-<job-id>.out` and `.err` for analysis. Stage logs go to the matching `bluehive_run/logs/slurm-<job-name>-<job-id>/` directory as `exp4-train.out` or `exp4-analysis.out`. Create the log directory before submission so Slurm can open its files.
 
 ### Outputs and interpretation
 

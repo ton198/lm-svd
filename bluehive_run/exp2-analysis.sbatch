@@ -26,6 +26,8 @@ source .venv/bin/activate
 dataset="${DATASET:-wikitext}"
 run_args=(--dataset "$dataset" --model-path models/gpt2-small --device cuda)
 
-# --overwrite makes repeated runs replace earlier analysis outputs (writes are atomic).
-printf 'Running exp2 analysis on %s; log: %s/exp2-analysis.out\n' "$dataset" "$log_dir"
-exp2 analysis "${run_args[@]}" --overwrite > "$log_dir/exp2-analysis.out" 2>&1
+# Run all centering modes; --overwrite replaces only that mode's analysis outputs.
+for centering in none global row deflate1; do
+    printf 'Running exp2 analysis on %s with centering %s; log: %s/exp2-analysis-%s.out\n' "$dataset" "$centering" "$log_dir" "$centering"
+    exp2 analysis "${run_args[@]}" --centering "$centering" --overwrite > "$log_dir/exp2-analysis-${centering}.out" 2>&1
+done
