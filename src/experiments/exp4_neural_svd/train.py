@@ -15,7 +15,7 @@ from utils.inference import CausalLMInference
 from utils.lm_table import build_row_table, read_source_metadata
 from utils.neural_svd import NestedLoRASVDLoss
 
-from .spectrum import learned_feature_moments
+from .spectrum import learned_feature_moments, learned_singular_values
 
 
 def centered_unembedding(inference: CausalLMInference) -> torch.Tensor:
@@ -307,8 +307,8 @@ def train_exp4(
                 hidden_size=hidden_size,
                 columns=columns,
             )
-            singular_values = (
-                f_rms * g_rms * math.sqrt(len(histories) * columns)
+            singular_values = learned_singular_values(
+                f_rms, g_rms, history_count=len(histories), columns=columns
             ).cpu().numpy()
             if previous_singular_values is None:
                 relative_change = math.inf

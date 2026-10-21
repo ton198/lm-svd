@@ -333,19 +333,21 @@ Slurm stdout/stderr go to `bluehive_run/logs/slurm-lm-svd-exp4-<job-id>.out` and
 ### Outputs and interpretation
 
 - `train/`: while training, `checkpoint.pt` stores feature weights, Adam moments, RNG state, loss history, and convergence state every `--checkpoint-every 100` steps and when capped. A default-size checkpoint is about 3 GB. Training automatically resumes from it; interruption between checkpoints loses at most 99 steps at the default interval. Each checkpoint also refreshes six analysis-ready snapshot files: `features.pt` (history and future lookup weights), `token_gram.npy` (the centered token embedding Gram matrix), `loss_history.npy`, `histories.parquet`, `futures.parquet`, and `metadata.json` (matrix definition, training settings/results, convergence statistics, and source provenance). Each file is replaced atomically, with metadata last; concurrent analysis can read files from adjacent snapshots. At convergence, training writes the final snapshot and removes the checkpoint.
-- `analysis/`: `singular_values.npy`, `left_singular_vectors.npy` (unit-norm columns), `spectrum.json`, and `neural_svd_spectrum.png`. The plot shows singular values on a log scale, cumulative captured energy, and training loss.
+- `analysis/`: exactly four files: `singular_values.npy`, `left_singular_vectors.npy` (unit-norm columns), `neural_svd_spectrum.png`, and `metadata.json`. The two arrays are written first, then the plot, and `metadata.json` last as the completion marker. Its four top-level sections, in order, are `input`, `spectrum`, `orthogonality`, and `loglog_fit`. `input` records the training directory, input filenames, matrix shape, and the complete training metadata under `train_metadata`; `spectrum` records factor and plot filenames, learned rank/order, singular values, the squared Frobenius norm estimate, and cumulative captured energy with their formulas. `orthogonality` contains `left_error`, `right_error`, and their definition. Input filenames are relative to `input.train_dir`; factor and plot filenames are relative to the analysis metadata directory.
+
+The plot shows singular values on log-log axes with a fitted line labeled by slope `k` and intercept `b`, cumulative captured energy, and training loss. The fit uses every learned singular value in learned order, with indices starting at 1: `log10(σ_i) = k * log10(i) + b`. The top-level `loglog_fit` section stores `slope`, `intercept`, `point_count`, `log_base`, and `formula`; the CLI also prints `k` and `b`. With fewer than two points the fit is skipped and its slope/intercept are null. Loss history is read from the training snapshot, not embedded in analysis metadata. Spectrum and energy panels share the exp1–exp3 plotting layer, but exp4 has no numerical-rank markers or fixed energy limits.
 
 Analysis computes feature statistics in torch float64 on the selected device and reads only `train/{features.pt,token_gram.npy,loss_history.npy,metadata.json}`. Future weights remain on CPU and move to the device in chunks of at most 1024 futures, using a flat 2-D matrix product with the token Gram matrix. Downstream diagnostics and output processing remain in NumPy. `--model-path` supplies only the directory name for locating the run; no language model or sample file is loaded. The token Gram matrix gives right-feature norms and inner products without constructing the enormous right-feature array. Analysis does **not** compute an exact matrix SVD, save right singular vectors, or estimate numerical rank. It does not accept `--centering`: no secondary centering is available because the matrix is not stored.
 
 For a capped feasibility smoke, run `uv run exp4 train --max-steps 2 --checkpoint-every 1 --log-every 1 --results-root /tmp/exp4-smoke`. It prints `stop_reason: max_steps` and leaves a checkpoint and analysis-ready snapshot. Run `uv run exp4 analysis --results-root /tmp/exp4-smoke` to analyze it; the summary reports the training step and convergence status. Rerun training with `--max-steps 4` to continue from step 2, or omit the cap to train until convergence. Rerun analysis with `--overwrite` to refresh its outputs. Add `--device cpu` to either command to run without CUDA.
 
-Singular values retain **learned order**, not sorted order. `spectrum.json` reports maximum absolute off-diagonal inner products for normalized left/right features (`left_orthogonality_error`, `right_orthogonality_error`), a sampled squared Frobenius norm estimate, cumulative captured energy, and training metadata. Captured energy divides cumulative squared learned singular values by that sampled norm estimate; it can exceed 1 before convergence and is reported without clipping. These are learned estimates, not a guarantee of convergence or exact leading singular values; inspect orthogonality, ordering, energy, and loss together.
+Singular values retain **learned order**, not sorted order. In `metadata.json`, `orthogonality.left_error` and `orthogonality.right_error` report maximum absolute off-diagonal inner products for normalized left/right features. `spectrum.frobenius_norm_sq_estimate` is the sampled squared Frobenius norm estimate, and `spectrum.captured_energy_fraction` divides cumulative squared learned singular values by that estimate; it can exceed 1 before convergence and is reported without clipping. Both the singular-value and captured-energy lists have length `spectrum.learned_rank`. These are learned estimates, not a guarantee of convergence or exact leading singular values; inspect orthogonality, ordering, energy, and loss together.
 
 Training resumes by default when a checkpoint exists, including when snapshot outputs exist alongside it. Resume requires matching sample/model paths, sample counts, rank, nesting, batch sizes, learning rate, seed, and convergence settings; device, logging/checkpoint intervals, and the total-step cap may change. Existing training outputs without a checkpoint require `--overwrite`, which discards both checkpoint and training outputs and restarts at step 0. Analysis also requires `--overwrite` to replace its outputs. Replacing training outputs does not refresh analysis; rerun `exp4 analysis --overwrite` when needed. Use `uv run exp4 <subcommand> --help` or `uv run python -m experiments.exp4_neural_svd <subcommand>`.
 
 ## 8. Understand exp1–exp3 analysis outputs
 
-Experiments exp1–exp3 share the same `analysis` workflow. It reads the matrix and optional sibling `metadata.json` from `<result-dir>/inference/`, then writes all six outputs to `<result-dir>/analysis/<centering>/`:
+Experiments exp1–exp3 each own their `analysis` workflow. It reads the matrix and optional sibling `metadata.json` from `<result-dir>/inference/`, then writes exactly five outputs to `<result-dir>/analysis/<centering>/`:
 
 ```text
 <results-root>/<experiment>/<run>/
@@ -357,12 +359,11 @@ Experiments exp1–exp3 share the same `analysis` workflow. It reads the matrix 
     │   ├── svd_U.npy
     │   ├── svd_S.npy
     │   ├── svd_Vt.npy
-    │   ├── svd_metadata.json
-    │   ├── rank.json
+    │   ├── metadata.json
     │   └── svd_spectrum.png
-    ├── global/  # same six files
-    ├── row/     # same six files
-    └── deflate1/  # same six files
+    ├── global/  # same five files
+    ├── row/     # same five files
+    └── deflate1/  # same five files
 ```
 
 Analysis computes a thin float64 SVD with PyTorch on `--device cuda` by default. CUDA uses the accurate `gesvd` driver; `--device cpu` uses PyTorch's CPU SVD. Invalid devices and unavailable CUDA produce an error rather than silently switching devices. If GPU memory is insufficient, rerun that analysis with `--device cpu`. Saved factors remain NumPy arrays, and the numerical-rank tolerance is unchanged.
@@ -398,20 +399,27 @@ done
 
 If `none` was already analyzed, add `--overwrite` to regenerate it.
 
-- **SVD:** Float64 centering and thin SVD of the selected matrix, regardless of the original stored dtype. `(U * S) @ Vt` reconstructs that matrix, not the original stored matrix unless centering is `none`. The centered matrix is not saved separately. `svd_metadata.json` records `centering`, `centering_formula`, input path, shape and original dtype, computation dtype, singular-value extrema, the centered Frobenius norm and relative reconstruction error, and source matrix metadata under `matrix_metadata`. New SVD metadata does not contain rank fields. Inference and stored matrix dtypes are unchanged.
-- **Numerical rank:** Counts singular values strictly greater than `S.max() * max(matrix.shape) * finfo(float64).eps` for all input dtypes and all four centering strategies. `rank.json` records the rank, tolerance, rule, matrix shape, input dtype, and singular-value count; `input_dtype` records provenance only and does not determine epsilon. Existing SVD metadata with legacy rank fields is accepted; rank is recomputed from the singular values.
-- **Visualization:** `svd_spectrum.png` plots only singular values strictly greater than the numerical-rank tolerance for all four centering strategies. It contains singular-value decay with logarithmic index and singular-value axes, plus cumulative squared Frobenius energy normalized by the retained values' energy, with linear index and energy axes. Indices start at 1. Rank markers appear in both panels; no tolerance line is drawn. The full saved SVD and `rank.json`, including its tolerance, are unchanged by visualization. It uses Matplotlib's headless Agg backend. An all-zero spectrum is rejected because normalized energy is undefined, including when centering produces an all-zero matrix; SVD and rank outputs have already been written in that case. Existing manual `singular_value_decay.png` plots are untouched.
+The single `metadata.json` contains six top-level sections in order: `input`, `centering`, `svd`, `rank`, `spectrum`, and `loglog_fit`:
 
-Older float32 analyses used float32 epsilon for rank, so refresh their `rank.json` and `svd_spectrum.png` before using them. The saved singular values already come from float64 SVD: reuse them to recompute rank and redraw the plot without loading a model, rerunning inference, or repeating SVD. For each existing strategy directory, use the Python API (replace the path with your own):
+- **Input and centering:** `input` records the matrix path, shape, original dtype, and optional inference metadata verbatim under `inference_metadata` (null if absent). `centering` records the selected `strategy` and `formula`.
+- **SVD:** Float64 centering and thin SVD of the selected matrix, regardless of the original stored dtype. `(U * S) @ Vt` reconstructs that matrix, not the original stored matrix unless centering is `none`. The centered matrix is not saved separately. `svd` records factor filenames, decomposition form, computation dtype/device, singular-value count and extrema, the centered Frobenius norm, and relative reconstruction error. Inference and stored matrix dtypes are unchanged.
+- **Numerical rank:** Counts singular values strictly greater than `S.max() * max(matrix.shape) * finfo(float64).eps` for all input dtypes and all four centering strategies. `rank` records `value`, `tolerance`, and `tolerance_rule`; the original input dtype is provenance only and does not determine epsilon.
+- **Visualization:** `svd_spectrum.png` plots only singular values strictly greater than the numerical-rank tolerance. It contains singular-value decay with logarithmic index and singular-value axes, plus cumulative squared Frobenius energy normalized by the retained values' energy, with linear index and energy axes. Indices start at 1. Rank markers appear in both panels; no tolerance line is drawn. `spectrum` records the plot filename, selection rule, index base, retained singular values, and cumulative energy fractions and formula. Both lists have length `rank.value`; the full spectrum remains in `svd_S.npy`. Plotting uses Matplotlib's headless Agg backend.
+- **Log-log fit:** The shared spectrum panel fits exactly the plotted values using `log10(σ_i) = k * log10(i) + b`, with indices starting at 1, and draws a dotted fit line labeled with `k` and `b`. The top-level `loglog_fit` section records `slope`, `intercept`, `point_count`, `log_base` (10), and `formula`; the CLI prints the coefficients and metadata path. Fewer than two retained values skips the fit, saves null slope/intercept, and omits the fitted line. The fit is not nested inside `spectrum`.
 
-```python
-from pathlib import Path
-from utils.analysis import compute_rank, visualize_svd
+Factor and plot references in metadata are bare filenames relative to the directory containing `metadata.json`; `input.matrix_path` records the inference matrix path as constructed from the result directory. Analysis writes the plot first, then the three factors, and `metadata.json` last as the completion marker. If no singular values exceed the rank tolerance (including an all-zero matrix after centering), analysis raises an error before writing any files or creating the analysis directory.
 
-svd_dir = Path("data/experiment_results/exp2_PFH/wikitext__gpt2-small/analysis/none")
-compute_rank(svd_dir=svd_dir, overwrite=True)
-visualize_svd(svd_dir=svd_dir, overwrite=True)
+The shared Python helpers operate on arrays, not saved analysis directories: `compute_svd(matrix, centering=..., device=...)` returns `(svd, summary)` with rank and tolerance on `svd`; `visualize_svd(singular_values, rank_tolerance=..., matrix_shape=..., plot_path=...)` writes the plot and returns `(spectrum, fit)` metadata dictionaries. Each experiment's `analysis.run_analysis` handles input/output and assembles its metadata.
+
+Refresh older analyses, including those that used float32 epsilon for rank, by rerunning the experiment's analysis command with `--overwrite`. This recomputes SVD from the stored inference matrix without loading a model or rerunning inference:
+
+```bash
+uv run exp2 analysis --model-path models/gpt2-small \
+  --dataset wikitext --results-root data/experiment_results \
+  --centering none --overwrite
 ```
+
+Rerunning analysis does not remove preexisting legacy JSON artifacts. Manually remove obsolete analysis JSON files after refreshing existing exp1–exp4 results, retaining the new `metadata.json`.
 
 ### Directory selection and existing results
 
@@ -421,7 +429,7 @@ Analysis uses only the model paths' directory names to locate the run: it does n
 
 Existing WikiText results have moved to the dataset-prefixed run directories above, and prepared sample files have been renamed to the plain dataset filenames. Historical `metadata.json` files are unchanged: their original `samples_path` values remain records of the inputs used at the time, even though those files have since been renamed.
 
-Inference refuses to replace its existing outputs without `--overwrite`. Analysis prechecks all six outputs for the selected strategy and refuses to start if any exists unless `--overwrite` is supplied; this prevents an existing rank or plot file from causing a late overwrite conflict after SVD. `analysis --overwrite` replaces only that strategy's analysis outputs, not inference files or other strategies. When regenerating inference, rerun analysis with `--overwrite` for every previously computed strategy you intend to use; overwriting inference does not refresh analysis.
+Inference refuses to replace its existing outputs without `--overwrite`. Analysis prechecks all five outputs for the selected strategy and refuses to start if any exists unless `--overwrite` is supplied; this prevents an existing factor, metadata, or plot file from causing a late overwrite conflict after SVD. `analysis --overwrite` replaces only that strategy's analysis outputs, not inference files or other strategies. When regenerating inference, rerun analysis with `--overwrite` for every previously computed strategy you intend to use; overwriting inference does not refresh analysis.
 
 Other useful options:
 
@@ -492,3 +500,18 @@ visible. exp4 uses the same learned-order convention with closed-form right-feat
 ```bash
 uv run python -m unittest discover -s tests
 ```
+
+The default suite keeps short-step training tests using a tiny random GPT-2 fixture. The convergence/SVD-recovery test is opt-in because it trains to convergence:
+
+```bash
+RUN_SLOW=1 uv run python -m unittest \
+  tests.test_exp4_neural_svd.Exp4NeuralSVDTests.test_training_and_analysis_recover_top_two_singular_values -v
+```
+
+For fast log-log spectrum verification without training, model downloads, or sample data, run:
+
+```bash
+uv run python -m unittest tests.test_analysis tests.test_exp4_neural_svd.Exp4AnalysisTests -v --durations 5
+```
+
+These tests cover power-law fits, learned component order, rank-one skipped fits, saved analysis artifacts, and plotting artists using small matrices and synthetic snapshots.

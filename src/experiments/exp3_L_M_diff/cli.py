@@ -2,12 +2,11 @@ import argparse
 from pathlib import Path
 
 from data_pipline.cli import positive_int
-from utils.analysis import INFERENCE_DIR, add_analysis_command, run_analysis
-from utils.experiment_paths import add_run_arguments, dataset_samples_path, run_dir
+from utils.analysis import CENTERING_CHOICES
+from utils.experiment_paths import INFERENCE_DIR, add_run_arguments, dataset_samples_path, run_dir
 
 
 EXPERIMENT = "exp3_L_M_diff"
-MATRIX_NAME = "matrix.npy"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -29,7 +28,11 @@ def main(argv: list[str] | None = None) -> None:
     inference_parser.add_argument("--future-count", type=positive_int, default=None)
     inference_parser.add_argument("--top-k", type=positive_int, default=50)
     inference_parser.add_argument("--overwrite", action="store_true")
-    analysis_parser = add_analysis_command(subparsers)
+    analysis_parser = subparsers.add_parser(
+        "analysis",
+        help="Run SVD, rank, and visualization on the inference matrix",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     add_run_arguments(analysis_parser)
     analysis_parser.add_argument(
         "--model-a-path", type=Path, default=Path("models/gpt2-small"),
@@ -39,6 +42,12 @@ def main(argv: list[str] | None = None) -> None:
         "--model-b-path", type=Path, default=Path("models/gpt2-medium"),
         help="Model whose run to analyze; only its directory name is used",
     )
+    analysis_parser.add_argument(
+        "--centering", choices=CENTERING_CHOICES, default="none",
+        help="Secondary centering applied before SVD",
+    )
+    analysis_parser.add_argument("--device", default="cuda", help="Torch device for the float64 SVD")
+    analysis_parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
     args = parser.parse_args(argv)
     try:
         result_dir = run_dir(
@@ -48,10 +57,11 @@ def main(argv: list[str] | None = None) -> None:
             f"{args.model_a_path.name}__minus__{args.model_b_path.name}",
         )
         if args.command == "analysis":
+            from .analysis import run_analysis
+
             print(
                 run_analysis(
                     result_dir=result_dir,
-                    matrix_name=MATRIX_NAME,
                     centering=args.centering,
                     device=args.device,
                     overwrite=args.overwrite,

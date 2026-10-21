@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from utils.analysis import compute_rank, compute_svd
+from utils.analysis import compute_svd
 from utils.common import load_samples
 from experiments.exp1_L_M_table.table import centered_logits, select_header_tokens
 from experiments.exp3_L_M_diff.table import build_exp3_diff
@@ -147,15 +147,8 @@ class Exp3LMDiffTests(unittest.TestCase):
         self.build(output, model_b=self.model_a_path)
         matrix = np.load(output / "matrix.npy")
         self.assertFalse(matrix.any())
-        compute_svd(
-            matrix_path=output / "matrix.npy",
-            output_dir=output,
-            centering="none",
-            device="cpu",
-            overwrite=False,
-        )
-        summary = compute_rank(svd_dir=output, overwrite=False)
-        self.assertEqual(summary["rank"], 0)
+        svd, _ = compute_svd(matrix, centering="none", device="cpu")
+        self.assertEqual(svd.rank, 0)
 
     def test_vocab_mismatch_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "model vocab sizes differ"):
@@ -203,8 +196,8 @@ class Exp3LMDiffTests(unittest.TestCase):
             ])
         self.assertTrue((output / "inference" / "matrix.npy").is_file())
         analysis = output / "analysis" / "none"
-        rank = json.loads((analysis / "rank.json").read_text(encoding="utf-8"))
-        self.assertEqual(rank["matrix_shape"], [2, 4])
+        metadata = json.loads((analysis / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["input"]["matrix_shape"], [2, 4])
         self.assertTrue(
             (analysis / "svd_spectrum.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
         )

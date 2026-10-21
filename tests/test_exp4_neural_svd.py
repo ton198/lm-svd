@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ import pyarrow.parquet as pq
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from experiments.exp4_neural_svd.spectrum import analyze_exp4
+from experiments.exp4_neural_svd.analysis import run_analysis
 from experiments.exp4_neural_svd.train import centered_logit_block, train_exp4
 from utils.common import load_samples
 from utils.inference import CausalLMInference
@@ -125,6 +126,10 @@ class Exp4NeuralSVDTests(unittest.TestCase):
                         atol=1e-6,
                     )
 
+    @unittest.skipUnless(
+        os.environ.get("RUN_SLOW") == "1",
+        "convergence training is slow; set RUN_SLOW=1 to run it",
+    )
     def test_training_and_analysis_recover_top_two_singular_values(self) -> None:
         result_dir = self.root / "convergence"
         result = self._train(result_dir / "train")
@@ -135,7 +140,7 @@ class Exp4NeuralSVDTests(unittest.TestCase):
         metadata = json.loads((result_dir / "train" / "metadata.json").read_text())
         self.assertIs(metadata["converged"], True)
         self.assertEqual(metadata["steps"], result["steps"])
-        analyze_exp4(result_dir=result_dir, device="cpu", overwrite=False)
+        run_analysis(result_dir=result_dir, device="cpu", overwrite=False)
         matrix = centered_logit_block(
             self.inference, self.histories, self.futures
         ).double().numpy()
@@ -213,13 +218,13 @@ class Exp4NeuralSVDTests(unittest.TestCase):
         )
         self.assertEqual(result["stop_reason"], "max_steps")
         self.assertTrue((train_dir / "checkpoint.pt").exists())
-        summary = analyze_exp4(result_dir=result_dir, device="cpu", overwrite=False)
+        summary = run_analysis(result_dir=result_dir, device="cpu", overwrite=False)
         self.assertIn("training: step 3, converged False", summary)
-        spectrum = json.loads((result_dir / "analysis" / "spectrum.json").read_text())
-        metadata = spectrum["train_metadata"]
-        self.assertEqual(metadata["steps"], 3)
-        self.assertIs(metadata["converged"], False)
-        self.assertIsNone(metadata["final_relative_change"])
+        metadata = json.loads((result_dir / "analysis" / "metadata.json").read_text())
+        train_metadata = metadata["input"]["train_metadata"]
+        self.assertEqual(train_metadata["steps"], 3)
+        self.assertIs(train_metadata["converged"], False)
+        self.assertIsNone(train_metadata["final_relative_change"])
         self.assertEqual(np.load(train_dir / "loss_history.npy").shape, (3,))
 
     def test_resume_rejects_changed_config(self) -> None:
@@ -252,6 +257,135 @@ class Exp4NeuralSVDTests(unittest.TestCase):
     def test_oversize_history_batch_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "exceeds history count 4"):
             self._train(self.root / "oversize" / "train", history_batch=5)
+
+
+class Exp4AnalysisTests(unittest.TestCase):
+    def _write_snapshot(self, result_dir: Path, values: np.ndarray) -> None:
+        train_dir = result_dir / "train"
+        train_dir.mkdir(parents=True)
+        r = values.size
+        torch.save(
+            {
+                "history.weight": torch.diag(
+                    torch.tensor(values, dtype=torch.float32)
+                ),
+                "future.weight": torch.eye(r, dtype=torch.float32).reshape(1, r * r),
+            },
+            train_dir / "features.pt",
+        )
+        np.save(train_dir / "token_gram.npy", np.eye(r, dtype=np.float64))
+        np.save(train_dir / "loss_history.npy", np.array([3.0, 2.0, 1.0]))
+        metadata = {
+            "history_count": r,
+            "future_count": 1,
+            "vocab_size": 4,
+            "hidden_size": r,
+            "rank": r,
+            "entry_mean_square": float((values**2).sum() / (r * 4)),
+            "steps": 3,
+            "converged": False,
+        }
+        (train_dir / "metadata.json").write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+
+    def test_log_log_fit_recovers_power_law_from_snapshot(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        result_dir = Path(temporary_directory.name)
+        values = 10.0 * np.arange(1, 4) ** -1.5
+        self._write_snapshot(result_dir, values)
+
+        summary = run_analysis(result_dir=result_dir, device="cpu", overwrite=False)
+
+        analysis_dir = result_dir / "analysis"
+        np.testing.assert_allclose(
+            np.load(analysis_dir / "singular_values.npy"), values, rtol=1e-6
+        )
+        metadata = json.loads((analysis_dir / "metadata.json").read_text())
+        self.assertEqual(
+            list(metadata), ["input", "spectrum", "orthogonality", "loglog_fit"]
+        )
+        self.assertEqual(
+            {path.name for path in analysis_dir.iterdir()},
+            {
+                "singular_values.npy",
+                "left_singular_vectors.npy",
+                "metadata.json",
+                "neural_svd_spectrum.png",
+            },
+        )
+        np.testing.assert_allclose(
+            metadata["spectrum"]["singular_values"], values, rtol=1e-6
+        )
+        self.assertEqual(metadata["spectrum"]["order"], "learned")
+        self.assertEqual(metadata["orthogonality"]["left_error"], 0.0)
+        fit = metadata["loglog_fit"]
+        self.assertAlmostEqual(fit["slope"], -1.5, places=6)
+        self.assertAlmostEqual(fit["intercept"], 1.0, places=6)
+        self.assertEqual(fit["point_count"], 3)
+        self.assertEqual(fit["log_base"], 10)
+        self.assertIn(
+            "loglog fit: k = -1.5, b = 1 (3 points, log10)",
+            summary.splitlines(),
+        )
+        self.assertEqual(
+            (analysis_dir / "neural_svd_spectrum.png").read_bytes()[:8],
+            b"\x89PNG\r\n\x1a\n",
+        )
+
+    def test_log_log_fit_uses_learned_order(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        result_dir = Path(temporary_directory.name)
+        values = (10.0 * np.arange(1, 4) ** -1.5)[::-1].copy()
+        self._write_snapshot(result_dir, values)
+
+        run_analysis(result_dir=result_dir, device="cpu", overwrite=False)
+
+        analysis_dir = result_dir / "analysis"
+        np.testing.assert_allclose(
+            np.load(analysis_dir / "singular_values.npy"), values, rtol=1e-6
+        )
+        metadata = json.loads((analysis_dir / "metadata.json").read_text())
+        fit = metadata["loglog_fit"]
+        expected_slope = np.polyfit(
+            np.log10([1, 2, 3]), np.log10(values), 1
+        )[0]
+        self.assertAlmostEqual(fit["slope"], expected_slope, places=6)
+        self.assertGreater(fit["slope"], 0)
+
+    def test_rank_one_snapshot_skips_fit(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        result_dir = Path(temporary_directory.name)
+        values = np.array([2.0])
+        self._write_snapshot(result_dir, values)
+
+        summary = run_analysis(result_dir=result_dir, device="cpu", overwrite=False)
+
+        analysis_dir = result_dir / "analysis"
+        metadata = json.loads((analysis_dir / "metadata.json").read_text())
+        fit = metadata["loglog_fit"]
+        self.assertIsNone(fit["slope"])
+        self.assertIsNone(fit["intercept"])
+        self.assertEqual(fit["point_count"], 1)
+        self.assertIn(
+            "loglog fit: skipped (fewer than 2 points: 1)", summary.splitlines()
+        )
+        self.assertTrue((analysis_dir / "neural_svd_spectrum.png").is_file())
+
+    def test_existing_outputs_require_overwrite(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        result_dir = Path(temporary_directory.name)
+        self._write_snapshot(result_dir, np.array([3.0, 2.0, 1.0]))
+
+        run_analysis(result_dir=result_dir, device="cpu", overwrite=False)
+        with self.assertRaisesRegex(FileExistsError, "pass --overwrite"):
+            run_analysis(result_dir=result_dir, device="cpu", overwrite=False)
+        run_analysis(result_dir=result_dir, device="cpu", overwrite=True)
+
 
 
 if __name__ == "__main__":

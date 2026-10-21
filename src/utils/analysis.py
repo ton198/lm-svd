@@ -1,18 +1,16 @@
-import argparse
-import json
 from pathlib import Path
 
 import numpy as np
 
-from .common import save_json, save_numpy, write_atomic
-from .linalg import matrix_svd, numerical_rank
+from .common import write_atomic
+from .linalg import MatrixSVD, matrix_svd
 
 
-SVD_NAMES = ("svd_U.npy", "svd_S.npy", "svd_Vt.npy", "svd_metadata.json")
-RANK_NAME = "rank.json"
-PLOT_NAME = "svd_spectrum.png"
-INFERENCE_DIR = "inference"
-ANALYSIS_DIR = "analysis"
+SVD_FORM = "thin: matrix = U @ diag(S) @ Vt"
+RANK_TOLERANCE_RULE = "S.max() * max(matrix.shape) * finfo(float64).eps"
+SPECTRUM_SELECTION = "singular values strictly greater than rank tolerance, descending"
+CUMULATIVE_ENERGY_FORMULA = "cumsum(S_kept**2) / sum(S_kept**2)"
+LOGLOG_FIT_FORMULA = "log10(singular_value) = slope * log10(index) + intercept, index starting at 1"
 CENTERING_CHOICES = ("none", "global", "row", "deflate1")
 CENTERING_FORMULAS = {
     "none": "M",
@@ -20,6 +18,71 @@ CENTERING_FORMULAS = {
     "row": "M - mean(M, axis=1, keepdims=True)",
     "deflate1": "M - S[0] * outer(U[:, 0], Vt[0, :]), where M = U @ diag(S) @ Vt",
 }
+
+
+def fit_log_log(values: np.ndarray) -> dict[str, float | int | str | None]:
+    indices = np.arange(1, values.size + 1)
+    if values.size < 2:
+        slope = intercept = None
+    else:
+        slope, intercept = np.polyfit(np.log10(indices), np.log10(values), 1)
+        slope, intercept = float(slope), float(intercept)
+    return {
+        "slope": slope,
+        "intercept": intercept,
+        "point_count": int(values.size),
+        "log_base": 10,
+        "formula": LOGLOG_FIT_FORMULA,
+    }
+
+
+def format_log_log_fit(fit: dict) -> str:
+    if fit["slope"] is None:
+        return f"skipped (fewer than 2 points: {fit['point_count']})"
+    return (
+        f"k = {fit['slope']:.6g}, b = {fit['intercept']:.6g} "
+        f"({fit['point_count']} points, log10)"
+    )
+
+
+def plot_spectrum_panels(
+    value_ax,
+    energy_ax,
+    values: np.ndarray,
+    energy_fraction: np.ndarray,
+    fit: dict,
+    *,
+    index_label: str,
+    energy_title: str,
+    energy_ylim: tuple[float, float] | None = None,
+    rank: int | None = None,
+) -> None:
+    indices = np.arange(1, values.size + 1)
+    value_ax.loglog(indices, values, label="singular values")
+    if fit["slope"] is not None:
+        value_ax.plot(
+            indices,
+            10 ** fit["intercept"] * indices.astype(np.float64) ** fit["slope"],
+            color="tab:orange",
+            linestyle=":",
+            label=f"log-log fit: k = {fit['slope']:.4g}, b = {fit['intercept']:.4g}",
+        )
+    if rank is not None:
+        value_ax.axvline(rank, color="red", linestyle="--", label=f"rank = {rank}")
+    value_ax.set(title="Singular values", xlabel=index_label, ylabel="singular value")
+    value_ax.legend()
+    energy_ax.plot(indices, energy_fraction)
+    if rank is not None:
+        energy_ax.axvline(rank, color="red", linestyle="--", label=f"rank = {rank}")
+    energy_ax.set(
+        title=energy_title,
+        xlabel=index_label,
+        ylabel="fraction of squared Frobenius norm",
+    )
+    if energy_ylim is not None:
+        energy_ax.set_ylim(*energy_ylim)
+    if rank is not None:
+        energy_ax.legend()
 
 
 def center_matrix(matrix: np.ndarray, centering: str, *, device: str) -> np.ndarray:
@@ -40,22 +103,8 @@ def center_matrix(matrix: np.ndarray, centering: str, *, device: str) -> np.ndar
 
 
 def compute_svd(
-    *, matrix_path: Path, output_dir: Path, centering: str, device: str, overwrite: bool
-) -> dict[str, int | float | str]:
-    if not matrix_path.is_file():
-        raise ValueError(f"matrix file does not exist: {matrix_path}")
-    if centering not in CENTERING_CHOICES:
-        raise ValueError(
-            f"unknown centering: {centering}; expected one of {', '.join(CENTERING_CHOICES)}"
-        )
-    for name in SVD_NAMES:
-        path = output_dir / name
-        if path.exists() and not overwrite:
-            raise FileExistsError(
-                f"output already exists: {path}; pass --overwrite to replace it"
-            )
-
-    matrix = np.load(matrix_path)
+    matrix: np.ndarray, *, centering: str, device: str
+) -> tuple[MatrixSVD, dict[str, int | float | str]]:
     data = center_matrix(matrix, centering, device=device)
     result = matrix_svd(data, device=device)
     frobenius_norm = float(np.linalg.norm(data))
@@ -64,176 +113,58 @@ def compute_svd(
         if frobenius_norm != 0
         else 0.0
     )
-    m, n = matrix.shape
-    matrix_metadata_path = matrix_path.parent / "metadata.json"
-    metadata = {
-        "input_path": str(matrix_path),
-        "matrix_shape": [m, n],
-        "input_dtype": str(matrix.dtype),
+    summary = {
+        "form": SVD_FORM,
         "compute_dtype": "float64",
-        "centering": centering,
-        "centering_formula": CENTERING_FORMULAS[centering],
-        "svd": "thin: matrix = U @ diag(S) @ Vt",
+        "device": device,
+        "singular_value_count": int(result.S.size),
         "singular_value_max": float(result.S[0]),
         "singular_value_min": float(result.S[-1]),
         "frobenius_norm": frobenius_norm,
         "reconstruction_relative_error": reconstruction_relative_error,
-        "matrix_metadata": (
-            json.loads(matrix_metadata_path.read_text(encoding="utf-8"))
-            if matrix_metadata_path.exists()
-            else None
-        ),
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for name, factor in zip(SVD_NAMES[:3], (result.U, result.S, result.Vt)):
-        write_atomic(output_dir / name, lambda tmp: save_numpy(tmp, factor))
-    write_atomic(output_dir / SVD_NAMES[3], lambda tmp: save_json(tmp, metadata))
-    return {
-        "output_dir": str(output_dir),
-        "centering": centering,
-        "rows": m,
-        "columns": n,
-        "singular_value_max": float(result.S[0]),
-        "singular_value_min": float(result.S[-1]),
-        "reconstruction_relative_error": reconstruction_relative_error,
-    }
+    return result, summary
 
 
-def compute_rank(*, svd_dir: Path, overwrite: bool) -> dict[str, int | float | str]:
-    singular_values_path = svd_dir / "svd_S.npy"
-    metadata_path = svd_dir / "svd_metadata.json"
-    for path in (singular_values_path, metadata_path):
-        if not path.is_file():
-            raise ValueError(f"SVD input does not exist: {path}")
-    output_path = svd_dir / RANK_NAME
-    if output_path.exists() and not overwrite:
-        raise FileExistsError(
-            f"output already exists: {output_path}; pass --overwrite to replace it"
-        )
-
-    singular_values = np.load(singular_values_path)
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    shape = tuple(metadata["matrix_shape"])
-    rank, tolerance = numerical_rank(singular_values, shape)
-    rank_metadata = {
-        "svd_dir": str(svd_dir),
-        "matrix_shape": list(shape),
-        "input_dtype": metadata["input_dtype"],
-        "rank": rank,
-        "rank_tolerance": tolerance,
-        "rank_tolerance_rule": "S.max() * max(matrix.shape) * finfo(float64).eps",
-        "singular_value_count": int(singular_values.size),
-    }
-    svd_dir.mkdir(parents=True, exist_ok=True)
-    write_atomic(output_path, lambda tmp: save_json(tmp, rank_metadata))
-    return {
-        "output_path": str(output_path),
-        "rank": rank,
-        "rank_tolerance": tolerance,
-        "singular_value_count": int(singular_values.size),
-    }
-
-
-def visualize_svd(*, svd_dir: Path, overwrite: bool) -> Path:
-    singular_values_path = svd_dir / "svd_S.npy"
-    rank_path = svd_dir / RANK_NAME
-    for path in (singular_values_path, rank_path):
-        if not path.is_file():
-            raise ValueError(f"visualization input does not exist: {path}")
-    output_path = svd_dir / PLOT_NAME
-    if output_path.exists() and not overwrite:
-        raise FileExistsError(
-            f"output already exists: {output_path}; pass --overwrite to replace it"
-        )
-
-    singular_values = np.load(singular_values_path)
-    if not np.any(singular_values):
+def visualize_svd(
+    singular_values: np.ndarray,
+    *,
+    rank_tolerance: float,
+    matrix_shape: tuple[int, int],
+    plot_path: Path,
+) -> tuple[dict, dict]:
+    kept = singular_values[singular_values > rank_tolerance]
+    if kept.size == 0:
         raise ValueError("all singular values are zero; nothing to plot")
-    metadata = json.loads(rank_path.read_text(encoding="utf-8"))
-    rank = metadata["rank"]
-    tolerance = metadata["rank_tolerance"]
-    kept = singular_values[singular_values > tolerance]
-    m, n = metadata["matrix_shape"]
+    fit = fit_log_log(kept)
+    kept_squared = kept**2
+    energy = np.cumsum(kept_squared) / kept_squared.sum()
+    m, n = matrix_shape
 
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    indices = np.arange(1, kept.size + 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     try:
-        axes[0].set_xscale("log")
-        axes[0].semilogy(indices, kept)
-        axes[0].axvline(rank, color="red", linestyle="--", label=f"rank = {rank}")
-        axes[0].set(title="Singular values", xlabel="index", ylabel="singular value")
-        axes[0].legend()
-        kept_squared = kept**2
-        axes[1].plot(indices, np.cumsum(kept_squared) / kept_squared.sum())
-        axes[1].axvline(rank, color="red", linestyle="--", label=f"rank = {rank}")
-        axes[1].set(
-            title="Cumulative energy",
-            xlabel="index",
-            ylabel="fraction of squared Frobenius norm",
-            ylim=(0, 1.01),
+        plot_spectrum_panels(
+            axes[0], axes[1], kept, energy, fit,
+            index_label="index", energy_title="Cumulative energy",
+            energy_ylim=(0, 1.01), rank=int(kept.size),
         )
-        axes[1].legend()
         fig.suptitle(f"{m} x {n} matrix")
         fig.tight_layout()
-        svd_dir.mkdir(parents=True, exist_ok=True)
-        write_atomic(output_path, lambda tmp: fig.savefig(tmp, format="png", dpi=150))
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(plot_path, lambda tmp: fig.savefig(tmp, format="png", dpi=150))
     finally:
         plt.close(fig)
-    return output_path
-
-
-def add_analysis_command(subparsers) -> argparse.ArgumentParser:
-    parser = subparsers.add_parser(
-        "analysis",
-        help="Run SVD, rank, and visualization on the inference matrix",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--centering", choices=CENTERING_CHOICES, default="none",
-        help="Secondary centering applied before SVD",
-    )
-    parser.add_argument("--device", default="cuda", help="Torch device for the float64 SVD")
-    parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
-    return parser
-
-
-def run_analysis(
-    *, result_dir: Path, matrix_name: str, centering: str, device: str, overwrite: bool
-) -> str:
-    if centering not in CENTERING_CHOICES:
-        raise ValueError(
-            f"unknown centering: {centering}; expected one of {', '.join(CENTERING_CHOICES)}"
-        )
-    matrix_path = result_dir / INFERENCE_DIR / matrix_name
-    output_dir = result_dir / ANALYSIS_DIR / centering
-    if not overwrite:
-        for name in (*SVD_NAMES, RANK_NAME, PLOT_NAME):
-            path = output_dir / name
-            if path.exists():
-                raise FileExistsError(
-                    f"output already exists: {path}; pass --overwrite to replace it"
-                )
-    svd = compute_svd(
-        matrix_path=matrix_path,
-        output_dir=output_dir,
-        centering=centering,
-        device=device,
-        overwrite=overwrite,
-    )
-    rank = compute_rank(svd_dir=output_dir, overwrite=overwrite)
-    plot_path = visualize_svd(svd_dir=output_dir, overwrite=overwrite)
-    return (
-        f"output_dir: {output_dir}\n"
-        f"centering: {centering}\n"
-        f"matrix: {svd['rows']} x {svd['columns']}\n"
-        f"singular values: max {svd['singular_value_max']:.6g}, "
-        f"min {svd['singular_value_min']:.6g}; "
-        f"reconstruction relative error {svd['reconstruction_relative_error']:.3e}\n"
-        f"rank: {rank['rank']} (tolerance {rank['rank_tolerance']:.6g})\n"
-        f"plot: {plot_path}"
-    )
+    spectrum = {
+        "plot": plot_path.name,
+        "selection": SPECTRUM_SELECTION,
+        "index_base": 1,
+        "singular_values": kept.tolist(),
+        "cumulative_energy_formula": CUMULATIVE_ENERGY_FORMULA,
+        "cumulative_energy_fraction": energy.tolist(),
+    }
+    return spectrum, fit

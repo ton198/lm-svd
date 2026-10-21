@@ -3,12 +3,16 @@ import math
 from pathlib import Path
 
 from data_pipline.cli import positive_int
-from utils.analysis import ANALYSIS_DIR
-from utils.experiment_paths import add_run_arguments, dataset_samples_path, run_dir
+from utils.experiment_paths import (
+    ANALYSIS_DIR,
+    TRAIN_DIR,
+    add_run_arguments,
+    dataset_samples_path,
+    run_dir,
+)
 
 
 EXPERIMENT = "exp4_neural_svd"
-TRAIN_DIR = "train"
 
 
 def positive_float(value: str) -> float:
@@ -82,9 +86,9 @@ def main(argv: list[str] | None = None) -> None:
             args.results_root, EXPERIMENT, args.dataset, args.model_path.name
         )
         if args.command == "analysis":
-            from .spectrum import analyze_exp4
+            from .analysis import run_analysis
 
-            print(analyze_exp4(
+            print(run_analysis(
                 result_dir=result_dir, device=args.device, overwrite=args.overwrite
             ))
             return
