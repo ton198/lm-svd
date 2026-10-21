@@ -24,8 +24,10 @@ printf 'Job ID: %s\nNode: %s\nWorking directory: %s\n' \
 nvidia-smi
 source .venv/bin/activate
 
-run_args=(--dataset wikitext-large --model-path models/gpt2-small --device cuda)
+# Override at submit time, e.g. DATASET=task-single-text sbatch bluehive_run/exp4-train.sbatch
+dataset="${DATASET:-wikitext-large}"
+run_args=(--dataset "$dataset" --model-path models/gpt2-small --device cuda)
 
 # No --overwrite: resume the latest checkpoint instead of discarding training.
-printf 'Running exp4 train; log: %s/exp4-train.out\n' "$log_dir"
+printf 'Running exp4 train on %s; log: %s/exp4-train.out\n' "$dataset" "$log_dir"
 exp4 train "${run_args[@]}" > "$log_dir/exp4-train.out" 2>&1

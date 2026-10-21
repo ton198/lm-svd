@@ -22,9 +22,10 @@ printf 'Job ID: %s\nNode: %s\nWorking directory: %s\n' \
 nvidia-smi
 source .venv/bin/activate
 
-# Must match exp4-train.sbatch arguments so analysis reads the same run directory.
-run_args=(--dataset wikitext-large --model-path models/gpt2-small --device cuda)
+# Must match the exp4 train arguments (including DATASET) so analysis reads the same run directory.
+dataset="${DATASET:-wikitext-large}"
+run_args=(--dataset "$dataset" --model-path models/gpt2-small --device cuda)
 
 # --overwrite makes repeated runs replace earlier analysis outputs (writes are atomic).
-printf 'Running exp4 analysis; log: %s/exp4-analysis.out\n' "$log_dir"
+printf 'Running exp4 analysis on %s; log: %s/exp4-analysis.out\n' "$dataset" "$log_dir"
 exp4 analysis "${run_args[@]}" --overwrite > "$log_dir/exp4-analysis.out" 2>&1
