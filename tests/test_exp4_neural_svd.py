@@ -11,7 +11,7 @@ import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
 from experiments.exp4_neural_svd.analysis import run_analysis
-from experiments.exp4_neural_svd.train import centered_logit_block, train_exp4
+from experiments.exp4_neural_svd.train import centered_logit_block, cosine_lr, train_exp4
 from utils.common import load_samples
 from utils.inference import CausalLMInference
 
@@ -85,6 +85,9 @@ class Exp4NeuralSVDTests(unittest.TestCase):
         tol: float = 1e-4,
         patience: int = 3,
         checkpoint_every: int = 1000,
+        lr_schedule: str = "constant",
+        min_lr: float = 1e-4,
+        lr_decay_steps: int = 20,
         overwrite: bool = False,
     ) -> dict:
         return train_exp4(
@@ -103,11 +106,68 @@ class Exp4NeuralSVDTests(unittest.TestCase):
             patience=patience,
             checkpoint_every=checkpoint_every,
             lr=1e-2,
+            lr_schedule=lr_schedule,
+            min_lr=min_lr,
+            lr_decay_steps=lr_decay_steps,
             seed=0,
             log_every=100000,
             output_dir=output_dir,
             overwrite=overwrite,
         )
+
+    def test_cosine_lr_boundaries(self) -> None:
+        kwargs = dict(
+            base_lr=1e-2, min_lr=1e-4, decay_start_step=10, decay_steps=20
+        )
+        for step in (5, 10):
+            with self.subTest(step=step):
+                self.assertEqual(cosine_lr(step, **kwargs), 1e-2)
+        self.assertAlmostEqual(
+            cosine_lr(20, **kwargs), (1e-2 + 1e-4) / 2, places=12
+        )
+        for step in (30, 40):
+            with self.subTest(step=step):
+                self.assertEqual(cosine_lr(step, **kwargs), 1e-4)
+
+    def test_legacy_constant_checkpoint_switches_to_cosine(self) -> None:
+        output_dir = self.root / "legacy_cosine" / "train"
+        self._train(output_dir, max_steps=3, checkpoint_every=1)
+        checkpoint_path = output_dir / "checkpoint.pt"
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        del checkpoint["lr_schedule"]
+        torch.save(checkpoint, checkpoint_path)
+        kwargs = dict(
+            lr_schedule="cosine",
+            lr_decay_steps=4,
+            max_steps=None,
+            checkpoint_every=1,
+        )
+        result = self._train(output_dir, **kwargs)
+        self.assertEqual(result["stop_reason"], "lr_schedule_end")
+        self.assertEqual(result["steps"], 7)
+        metadata = json.loads((output_dir / "metadata.json").read_text())
+        self.assertEqual(metadata["lr_schedule"]["decay_start_step"], 3)
+        self.assertEqual(metadata["lr_schedule"]["name"], "cosine")
+        self.assertEqual(metadata["final_lr"], 1e-4)
+        self.assertTrue(checkpoint_path.exists())
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        for group in checkpoint["optimizer"]["param_groups"]:
+            self.assertEqual(group["lr"], 1e-4)
+        result = self._train(output_dir, **kwargs)
+        self.assertEqual(result["stop_reason"], "lr_schedule_end")
+        self.assertEqual(result["steps"], 7)
+
+    def test_resume_rejects_changed_lr_schedule(self) -> None:
+        output_dir = self.root / "changed_schedule" / "train"
+        self._train(output_dir, lr_schedule="cosine", max_steps=2, lr_decay_steps=20)
+        with self.assertRaisesRegex(
+            ValueError, "checkpoint lr schedule mismatch.*decay_steps"
+        ):
+            self._train(output_dir, lr_schedule="cosine", lr_decay_steps=10)
+        with self.assertRaisesRegex(
+            ValueError, "checkpoint lr schedule mismatch.*name"
+        ):
+            self._train(output_dir, lr_schedule="constant")
 
     def test_centered_logit_block_matches_every_full_vocabulary_entry(self) -> None:
         block = centered_logit_block(self.inference, self.histories, self.futures)
@@ -151,64 +211,72 @@ class Exp4NeuralSVDTests(unittest.TestCase):
         self.assertTrue((result_dir / "analysis" / "neural_svd_spectrum.png").is_file())
 
     def test_interrupted_training_resumes_identically(self) -> None:
-        uninterrupted_dir = self.root / "uninterrupted" / "train"
-        resumed_dir = self.root / "resumed" / "train"
-        uninterrupted_result = self._train(
-            uninterrupted_dir, max_steps=10, eval_every=5, checkpoint_every=3
-        )
-        self._train(resumed_dir, max_steps=4, eval_every=5, checkpoint_every=3)
-        resumed_result = self._train(
-            resumed_dir, max_steps=10, eval_every=5, checkpoint_every=3
-        )
-        for output_dir, result in (
-            (uninterrupted_dir, uninterrupted_result),
-            (resumed_dir, resumed_result),
-        ):
-            with self.subTest(output_dir=output_dir):
-                self.assertEqual(result["stop_reason"], "max_steps")
-                self.assertEqual(result["steps"], 10)
-                metadata = json.loads((output_dir / "metadata.json").read_text())
-                self.assertEqual(metadata["steps"], 10)
-                self.assertIs(metadata["converged"], False)
-        uninterrupted = torch.load(
-            uninterrupted_dir / "checkpoint.pt", map_location="cpu", weights_only=True
-        )
-        resumed = torch.load(
-            resumed_dir / "checkpoint.pt", map_location="cpu", weights_only=True
-        )
-        self.assertEqual(uninterrupted["features"].keys(), resumed["features"].keys())
-        for name, tensor in uninterrupted["features"].items():
-            with self.subTest(feature=name):
-                self.assertTrue(torch.equal(tensor, resumed["features"][name]))
-        for name in ("loss_history", "generator"):
-            with self.subTest(state=name):
-                self.assertTrue(torch.equal(uninterrupted[name], resumed[name]))
-        for name in ("previous_singular_values", "stable_evaluations"):
-            with self.subTest(state=name):
-                self.assertEqual(uninterrupted[name], resumed[name])
-        uninterrupted_optimizer = uninterrupted["optimizer"]["state"]
-        resumed_optimizer = resumed["optimizer"]["state"]
-        self.assertEqual(len(uninterrupted_optimizer), 2)
-        self.assertEqual(uninterrupted_optimizer.keys(), resumed_optimizer.keys())
-        for parameter, state in uninterrupted_optimizer.items():
-            for name in ("exp_avg", "exp_avg_sq"):
-                with self.subTest(parameter=parameter, optimizer_state=name):
-                    self.assertTrue(
-                        torch.equal(state[name], resumed_optimizer[parameter][name])
-                    )
-        uninterrupted_features = torch.load(
-            uninterrupted_dir / "features.pt", map_location="cpu", weights_only=True
-        )
-        resumed_features = torch.load(
-            resumed_dir / "features.pt", map_location="cpu", weights_only=True
-        )
-        for name, tensor in uninterrupted_features.items():
-            with self.subTest(snapshot_feature=name):
-                self.assertTrue(torch.equal(tensor, resumed_features[name]))
-                self.assertTrue(torch.equal(tensor, uninterrupted["features"][name]))
-                self.assertTrue(
-                    torch.equal(resumed_features[name], resumed["features"][name])
+        for lr_schedule in ("constant", "cosine"):
+            with self.subTest(lr_schedule=lr_schedule):
+                uninterrupted_dir = self.root / lr_schedule / "uninterrupted" / "train"
+                resumed_dir = self.root / lr_schedule / "resumed" / "train"
+                kwargs = dict(
+                    eval_every=5, checkpoint_every=3,
+                    lr_schedule=lr_schedule, lr_decay_steps=20,
                 )
+                uninterrupted_result = self._train(
+                    uninterrupted_dir, max_steps=10, **kwargs
+                )
+                self._train(resumed_dir, max_steps=4, **kwargs)
+                resumed_result = self._train(resumed_dir, max_steps=10, **kwargs)
+                for output_dir, result in (
+                    (uninterrupted_dir, uninterrupted_result),
+                    (resumed_dir, resumed_result),
+                ):
+                    with self.subTest(output_dir=output_dir):
+                        self.assertEqual(result["stop_reason"], "max_steps")
+                        self.assertEqual(result["steps"], 10)
+                        metadata = json.loads((output_dir / "metadata.json").read_text())
+                        self.assertEqual(metadata["steps"], 10)
+                        self.assertIs(metadata["converged"], False)
+                uninterrupted = torch.load(
+                    uninterrupted_dir / "checkpoint.pt", map_location="cpu", weights_only=True
+                )
+                resumed = torch.load(
+                    resumed_dir / "checkpoint.pt", map_location="cpu", weights_only=True
+                )
+                self.assertEqual(uninterrupted["features"].keys(), resumed["features"].keys())
+                for name, tensor in uninterrupted["features"].items():
+                    with self.subTest(feature=name):
+                        self.assertTrue(torch.equal(tensor, resumed["features"][name]))
+                for name in ("loss_history", "generator"):
+                    with self.subTest(state=name):
+                        self.assertTrue(torch.equal(uninterrupted[name], resumed[name]))
+                for name in ("previous_singular_values", "stable_evaluations"):
+                    with self.subTest(state=name):
+                        self.assertEqual(uninterrupted[name], resumed[name])
+                self.assertEqual(
+                    uninterrupted["optimizer"]["param_groups"][0]["lr"],
+                    resumed["optimizer"]["param_groups"][0]["lr"],
+                )
+                uninterrupted_optimizer = uninterrupted["optimizer"]["state"]
+                resumed_optimizer = resumed["optimizer"]["state"]
+                self.assertEqual(len(uninterrupted_optimizer), 2)
+                self.assertEqual(uninterrupted_optimizer.keys(), resumed_optimizer.keys())
+                for parameter, state in uninterrupted_optimizer.items():
+                    for name in ("exp_avg", "exp_avg_sq"):
+                        with self.subTest(parameter=parameter, optimizer_state=name):
+                            self.assertTrue(
+                                torch.equal(state[name], resumed_optimizer[parameter][name])
+                            )
+                uninterrupted_features = torch.load(
+                    uninterrupted_dir / "features.pt", map_location="cpu", weights_only=True
+                )
+                resumed_features = torch.load(
+                    resumed_dir / "features.pt", map_location="cpu", weights_only=True
+                )
+                for name, tensor in uninterrupted_features.items():
+                    with self.subTest(snapshot_feature=name):
+                        self.assertTrue(torch.equal(tensor, resumed_features[name]))
+                        self.assertTrue(torch.equal(tensor, uninterrupted["features"][name]))
+                        self.assertTrue(
+                            torch.equal(resumed_features[name], resumed["features"][name])
+                        )
 
     def test_analysis_reads_unconverged_snapshot(self) -> None:
         result_dir = self.root / "snapshot"

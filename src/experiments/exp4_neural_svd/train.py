@@ -18,6 +18,18 @@ from utils.neural_svd import NestedLoRASVDLoss
 from .spectrum import learned_feature_moments, learned_singular_values
 
 
+def cosine_lr(
+    step: int,
+    *,
+    base_lr: float,
+    min_lr: float,
+    decay_start_step: int,
+    decay_steps: int,
+) -> float:
+    progress = min(max(step - decay_start_step, 0), decay_steps) / decay_steps
+    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
 def centered_unembedding(inference: CausalLMInference) -> torch.Tensor:
     head = inference.model.get_output_embeddings()
     if getattr(head, "bias", None) is not None:
@@ -93,6 +105,9 @@ def train_exp4(
     patience: int,
     checkpoint_every: int,
     lr: float,
+    lr_schedule: str,
+    min_lr: float,
+    lr_decay_steps: int,
     seed: int,
     log_every: int,
     output_dir: Path,
@@ -117,6 +132,10 @@ def train_exp4(
         raise ValueError(
             f"future_batch {future_batch} exceeds future count {len(futures)}"
         )
+    if lr_schedule not in ("constant", "cosine"):
+        raise ValueError(f"unknown lr_schedule: {lr_schedule}")
+    if lr_schedule == "cosine" and min_lr >= lr:
+        raise ValueError(f"min_lr {min_lr} must be smaller than lr {lr}")
     if overwrite:
         for path in [*outputs, checkpoint_path]:
             path.unlink(missing_ok=True)
@@ -162,6 +181,11 @@ def train_exp4(
     stable_evaluations = 0
     last_relative_change: float | None = None
     converged = False
+    lr_schedule_state = {"name": lr_schedule, "base_lr": lr}
+    if lr_schedule == "cosine":
+        lr_schedule_state.update(
+            min_lr=min_lr, decay_start_step=0, decay_steps=lr_decay_steps
+        )
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         saved_config = checkpoint["config"]
@@ -178,6 +202,29 @@ def train_exp4(
         optimizer.load_state_dict(checkpoint["optimizer"])
         generator.set_state(checkpoint["generator"])
         step = checkpoint["step"]
+        print(f"resuming from step {step}", flush=True)
+        saved = checkpoint.get(
+            "lr_schedule", {"name": "constant", "base_lr": saved_config["lr"]}
+        )
+        if saved["name"] == "constant" and lr_schedule == "cosine":
+            lr_schedule_state["decay_start_step"] = step
+            print(f"starting cosine lr decay at step {step}", flush=True)
+        elif saved["name"] == "cosine":
+            schedule_config = (
+                {"min_lr": min_lr, "decay_steps": lr_decay_steps}
+                if lr_schedule == "cosine"
+                else {"name": lr_schedule}
+            )
+            diffs = ", ".join(
+                f"{key}: {saved.get(key)!r} != {current!r}"
+                for key, current in schedule_config.items()
+                if saved.get(key) != current
+            )
+            if diffs:
+                raise ValueError(
+                    f"checkpoint lr schedule mismatch ({diffs}); pass --overwrite to start over"
+                )
+            lr_schedule_state["decay_start_step"] = saved["decay_start_step"]
         loss_history = checkpoint["loss_history"].tolist()
         entry_mean_square_sum = checkpoint["entry_mean_square_sum"]
         previous_singular_values = checkpoint["previous_singular_values"]
@@ -185,7 +232,6 @@ def train_exp4(
         last_relative_change = checkpoint["last_relative_change"]
         converged = checkpoint["converged"]
         del checkpoint
-        print(f"resuming from step {step}", flush=True)
 
     row_table = build_row_table([sample.sample_id for sample in histories])
     future_table = pa.table(
@@ -231,6 +277,7 @@ def train_exp4(
     def save_checkpoint() -> None:
         payload = {
             "config": config,
+            "lr_schedule": lr_schedule_state,
             "step": step,
             "features": features.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -250,6 +297,8 @@ def train_exp4(
             **static_metadata,
             "steps": step,
             **optimizer_metadata,
+            "lr_schedule": lr_schedule_state,
+            "final_lr": current_lr,
             "pairs_evaluated": step * history_batch * future_batch,
             "entry_mean_square": entry_mean_square_sum / step,
             "final_loss": float(loss_history[-1]),
@@ -268,9 +317,29 @@ def train_exp4(
         write_atomic(outputs[4], lambda tmp: pq.write_table(future_table, tmp))
         write_atomic(outputs[5], lambda tmp: save_json(tmp, metadata))
 
+    schedule_end = (
+        lr_schedule_state["decay_start_step"] + lr_decay_steps
+        if lr_schedule == "cosine"
+        else None
+    )
+    stops_on_convergence = lr_schedule == "constant"
+    current_lr = lr
     started = time.perf_counter()
-    while not converged and (max_steps is None or step < max_steps):
+    while not (converged and stops_on_convergence) and (max_steps is None or step < max_steps) and (schedule_end is None or step < schedule_end):
         step += 1
+        current_lr = (
+            lr
+            if lr_schedule == "constant"
+            else cosine_lr(
+                step,
+                base_lr=lr,
+                min_lr=min_lr,
+                decay_start_step=lr_schedule_state["decay_start_step"],
+                decay_steps=lr_decay_steps,
+            )
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
         history_indices = torch.randperm(len(histories), generator=generator)[:history_batch]
         future_indices = torch.randperm(len(futures), generator=generator)[:future_batch]
         block = centered_logit_block(
@@ -294,7 +363,7 @@ def train_exp4(
         if step % log_every == 0:
             elapsed = time.perf_counter() - started
             print(
-                f"step {step} loss {loss_value:.6g} elapsed {elapsed:.1f}s",
+                f"step {step} loss {loss_value:.6g} lr {current_lr:.6g} elapsed {elapsed:.1f}s",
                 flush=True,
             )
 
@@ -331,12 +400,12 @@ def train_exp4(
                 f"stable {stable_evaluations}/{patience}",
                 flush=True,
             )
-        if not converged and (step % checkpoint_every == 0 or step == max_steps):
+        if not (converged and stops_on_convergence) and (step % checkpoint_every == 0 or step == max_steps or step == schedule_end):
             save_checkpoint()
             write_outputs()
 
     pairs_evaluated = step * history_batch * future_batch
-    if not converged:
+    if not (converged and stops_on_convergence):
         return {
             "output_dir": str(output_dir),
             "rows": len(histories),
@@ -344,7 +413,11 @@ def train_exp4(
             "steps": step,
             "pairs_evaluated": pairs_evaluated,
             "final_loss": loss_history[-1],
-            "stop_reason": "max_steps",
+            "stop_reason": (
+                "lr_schedule_end"
+                if schedule_end is not None and step >= schedule_end
+                else "max_steps"
+            ),
         }
 
     write_outputs()

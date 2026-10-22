@@ -57,6 +57,15 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--patience", type=positive_int, default=3)
     train_parser.add_argument("--checkpoint-every", type=positive_int, default=100)
     train_parser.add_argument("--lr", type=positive_float, default=1e-2)
+    train_parser.add_argument(
+        "--lr-schedule", choices=("constant", "cosine"), default="cosine"
+    )
+    train_parser.add_argument("--min-lr", type=positive_float, default=1e-4)
+    train_parser.add_argument(
+        "--lr-decay-steps", type=positive_int, default=30000,
+        help="Cosine decay length in steps, counted from the start step "
+        "(0, or the step of a resumed constant-lr checkpoint)",
+    )
     train_parser.add_argument("--seed", type=int, default=0)
     train_parser.add_argument("--log-every", type=positive_int, default=100)
     train_parser.add_argument(
@@ -110,6 +119,9 @@ def main(argv: list[str] | None = None) -> None:
             patience=args.patience,
             checkpoint_every=args.checkpoint_every,
             lr=args.lr,
+            lr_schedule=args.lr_schedule,
+            min_lr=args.min_lr,
+            lr_decay_steps=args.lr_decay_steps,
             seed=args.seed,
             log_every=args.log_every,
             output_dir=result_dir / TRAIN_DIR,
