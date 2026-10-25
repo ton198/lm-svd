@@ -64,6 +64,38 @@ class CausalLMInference:
                 )
         return ids
 
+    def final_hidden_states(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if (
+            not isinstance(input_ids, torch.Tensor)
+            or input_ids.ndim != 2
+            or input_ids.shape[0] == 0
+            or input_ids.shape[1] == 0
+            or input_ids.dtype
+            not in (
+                torch.uint8,
+                torch.uint16,
+                torch.uint32,
+                torch.uint64,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            )
+        ):
+            raise ValueError("input_ids must be a non-empty 2-D integer tensor")
+        if input_ids.shape[1] > self.max_length:
+            raise ValueError(
+                f"token_ids length {input_ids.shape[1]} exceeds model maximum {self.max_length}"
+            )
+        ids = input_ids.to(device=self.device, dtype=torch.long)
+        if torch.any(ids < 0) or torch.any(ids >= self.vocab_size):
+            raise ValueError(f"token ids must be in [0, {self.vocab_size})")
+        with torch.no_grad():
+            hidden = self.model.base_model(
+                input_ids=ids, use_cache=False
+            ).last_hidden_state
+        return hidden.to(dtype=torch.float32)
+
     def next_token_logits(self, token_ids: Sequence[int]) -> torch.Tensor:
         ids = self._validate_ids(token_ids)
 

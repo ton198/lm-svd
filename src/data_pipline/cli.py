@@ -1,4 +1,5 @@
 import argparse
+import math
 from pathlib import Path
 
 
@@ -9,6 +10,16 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a positive integer") from error
     if number < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def positive_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive float") from error
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive float")
     return number
 
 
@@ -52,6 +63,30 @@ def main(argv: list[str] | None = None) -> None:
     add_window_arguments(
         large, history_count=10000, future_count=10000,
         output=Path("data/history_future_samples/wikitext-large.parquet"),
+    )
+    token_stream = subparsers.add_parser(
+        "build-token-stream",
+        help="Tokenize a full split into one token stream for exp6/exp7",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    token_stream.add_argument(
+        "--dataset-dir", type=Path, default=Path("data/original/wikitext"),
+        help="Local dataset root",
+    )
+    token_stream.add_argument(
+        "--config", default="wikitext-103-raw-v1", help="Dataset configuration directory",
+    )
+    token_stream.add_argument("--split", default="train", help="Parquet split prefix")
+    token_stream.add_argument(
+        "--tokenizer-path", type=Path, default=Path("models/gpt2-small"),
+        help="Local tokenizer directory; no Hub downloads",
+    )
+    token_stream.add_argument(
+        "--output", type=Path, default=Path("data/token_streams/wikitext-103-train.npy"),
+        help="Output NumPy token stream",
+    )
+    token_stream.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing output",
     )
     task_inputs = subparsers.add_parser(
         "build-task-inputs",
@@ -111,6 +146,22 @@ def main(argv: list[str] | None = None) -> None:
                 seed=args.seed,
                 output_dir=args.output_dir,
                 overwrite=args.overwrite,
+            )
+            return
+        if args.command == "build-token-stream":
+            from .token_stream import build_token_stream
+
+            summary = build_token_stream(
+                dataset_dir=args.dataset_dir,
+                config=args.config,
+                split=args.split,
+                tokenizer_path=args.tokenizer_path,
+                output=args.output,
+                overwrite=args.overwrite,
+            )
+            print(
+                f"output: {summary['output']}\n"
+                f"stream_tokens: {summary['stream_tokens']}"
             )
             return
         from .windows import build_windows_table

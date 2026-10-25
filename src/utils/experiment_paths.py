@@ -5,6 +5,8 @@ import re
 
 SAMPLES_DIR = Path("data/history_future_samples")
 DEFAULT_DATASET = "wikitext"
+STREAMS_DIR = Path("data/token_streams")
+DEFAULT_STREAM = "wikitext-103-train"
 DEFAULT_RESULTS_ROOT = Path("data/experiment_results")
 INFERENCE_DIR = "inference"
 TRAIN_DIR = "train"
@@ -27,6 +29,17 @@ def dataset_samples_path(dataset: str) -> Path:
         names = ", ".join(sorted(p.stem for p in SAMPLES_DIR.glob("*.parquet"))) or "none"
         raise ValueError(
             f"unknown dataset: {dataset}; available: {names} (files in {SAMPLES_DIR})"
+        )
+    return path
+
+
+def token_stream_path(stream: str) -> Path:
+    validate_dataset_name(stream)
+    path = STREAMS_DIR / f"{stream}.npy"
+    if not path.is_file():
+        names = ", ".join(sorted(p.stem for p in STREAMS_DIR.glob("*.npy"))) or "none"
+        raise ValueError(
+            f"unknown stream: {stream}; available: {names} (files in {STREAMS_DIR})"
         )
     return path
 

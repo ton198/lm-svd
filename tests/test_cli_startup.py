@@ -11,6 +11,10 @@ class CLIStartupTests(unittest.TestCase):
             "experiments.exp2_PFH.cli",
             "experiments.exp3_L_M_diff.cli",
             "experiments.exp4_neural_svd.cli",
+            "experiments.exp5_L_M_neural_svd.cli",
+            "experiments.exp6_stream_gpt2_mlp.cli",
+            "experiments.exp7_stream_transformer.cli",
+            "experiments.exp8_stream_token_mlp.cli",
         ):
             with self.subTest(module=module):
                 code = f"""

@@ -4,10 +4,24 @@ import unittest
 import torch
 from torch import nn
 
-from utils.neural_svd import NestedLoRASVDLoss, nesting_masks, neural_svd_spectrum
+from utils.neural_svd import NestedLoRASVDLoss, cosine_lr, nesting_masks, neural_svd_spectrum
 
 
 class NeuralSVDTests(unittest.TestCase):
+    def test_cosine_lr_boundaries(self) -> None:
+        kwargs = dict(
+            base_lr=1e-2, min_lr=1e-4, decay_start_step=10, decay_steps=20
+        )
+        for step in (5, 10):
+            with self.subTest(step=step):
+                self.assertEqual(cosine_lr(step, **kwargs), 1e-2)
+        self.assertAlmostEqual(
+            cosine_lr(20, **kwargs), (1e-2 + 1e-4) / 2, places=12
+        )
+        for step in (30, 40):
+            with self.subTest(step=step):
+                self.assertEqual(cosine_lr(step, **kwargs), 1e-4)
+
     def test_masks_weight_columns_by_prefixes_containing_them(self) -> None:
         vector_mask, matrix_mask = nesting_masks(3)
         torch.testing.assert_close(vector_mask, torch.tensor([1, 2 / 3, 1 / 3]))

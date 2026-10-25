@@ -9,6 +9,7 @@ matrix or kernel ``A(row, column)``; column ``l`` of ``f g^T`` converges to the
 ``l``-th singular triplet of the operator ``(T g)(row) = E_column[A(row, column) g(column)]``.
 """
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -35,6 +36,18 @@ def nesting_masks(
     vector_mask = weights.flip(0).cumsum(0).flip(0).float()
     matrix_mask = torch.minimum(vector_mask[:, None], vector_mask[None, :])
     return vector_mask, matrix_mask
+
+
+def cosine_lr(
+    step: int,
+    *,
+    base_lr: float,
+    min_lr: float,
+    decay_start_step: int,
+    decay_steps: int,
+) -> float:
+    progress = min(max(step - decay_start_step, 0), decay_steps) / decay_steps
+    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
 class _NestedLoRASVDFunction(torch.autograd.Function):

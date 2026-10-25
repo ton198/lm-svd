@@ -23,6 +23,10 @@ exp1 = "experiments.exp1_L_M_table.cli:main"
 exp2 = "experiments.exp2_PFH.cli:main"
 exp3 = "experiments.exp3_L_M_diff.cli:main"
 exp4 = "experiments.exp4_neural_svd.cli:main"
+exp5 = "experiments.exp5_L_M_neural_svd.cli:main"
+exp6 = "experiments.exp6_stream_gpt2_mlp.cli:main"
+exp7 = "experiments.exp7_stream_transformer.cli:main"
+exp8 = "experiments.exp8_stream_token_mlp.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
