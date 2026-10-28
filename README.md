@@ -290,6 +290,8 @@ uv run exp2 analysis --model-path "models/$MODEL" \
 
 `inference` writes `feature_log_prob.npy` and `metadata.json` under the unchanged `$RESULT_DIR/inference/` path; `exp2 analysis` reads `inference/feature_log_prob.npy`. Legacy conditional results are not migrated. Replacing existing outputs requires `--overwrite`; the metadata's score definition and `bos_token_id` distinguish joint runs from legacy runs.
 
+On CIRC BlueHive, `bluehive_run/exp2-inference.sbatch` and `bluehive_run/exp2-analysis.sbatch` both request partition `h100`, QoS `h100`, and one H100 GPU. They retain 4 CPUs and 16G memory, with 6 hours for inference and 1 hour for analysis. Submit from the repository root with matching `DATASET` values and an `afterok` dependency; analysis runs all four centering modes. Both scripts overwrite existing outputs, so cancel any older jobs for the same dataset before resubmitting.
+
 ### Small CPU smoke run
 
 The expected shape is `2 × 2`.

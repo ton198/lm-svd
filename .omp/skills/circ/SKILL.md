@@ -26,6 +26,8 @@ description: Operate the lm-svd checkout on the CIRC BlueHive cluster over SSH â
 - Chain stages with `--parsable` and `--dependency=afterok:<id>`. `--parsable` may print `id;cluster`, so strip with `${id%%;*}`.
 - Example: `inf=$(DATASET=wikitext sbatch --parsable bluehive_run/exp2-inference.sbatch); DATASET=wikitext sbatch --parsable --dependency=afterok:${inf%%;*} bluehive_run/exp2-analysis.sbatch`.
 - Partition `gpu`: A100 and V100 nodes.
+- exp2 inference and analysis default to partition `h100`, QoS `h100`, and `gpu:H100:1` (5 nodes, 4 H100 GPUs per node). Keep both stages on this partition; the account `xxu67_lab` has `h100` QoS access.
+- When moving an existing exp2 run between partitions, cancel its old inference and dependent analysis jobs before resubmitting. Both stages overwrite the same dataset output directories; rebuild each `afterok` dependency with the new inference job ID.
 
 ## Monitoring
 - Queue: `squeue -u lli81 -o "%i %j %T %M %l %R"`.
