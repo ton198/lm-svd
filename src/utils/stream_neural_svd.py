@@ -142,6 +142,18 @@ def learned_probe_spectrum(
     )
 
 
+def leading_relative_change(
+    singular_values: np.ndarray, previous: list[float] | None, components: int
+) -> float:
+    """Max relative change of the first `components` learned-order singular values."""
+    if previous is None:
+        return math.inf
+    prev = np.asarray(previous[:components])
+    if np.any(prev <= 0):
+        return math.inf
+    return float(np.max(np.abs(singular_values[:components] - prev) / prev))
+
+
 @dataclass(frozen=True)
 class ProbeReference:
     singular_values: np.ndarray  # float64, (histories,), descending operator units
@@ -216,6 +228,7 @@ def train_stream_neural_svd(
     eval_every: int,
     tol: float,
     patience: int,
+    convergence_rank: int,
     checkpoint_every: int,
     lr: float,
     lr_schedule: str,
@@ -300,10 +313,14 @@ def train_stream_neural_svd(
         "probe_histories": probe_histories,
         "probe_futures": probe_futures,
         "probe_seed": probe_seed,
+        "features": features.config,
+    }
+    convergence_components = min(convergence_rank, rank)
+    convergence_settings = {
         "eval_every": eval_every,
         "tol": tol,
         "patience": patience,
-        "features": features.config,
+        "convergence_rank": convergence_components,
     }
     lr_schedule_state = {"name": lr_schedule, "base_lr": lr}
     if lr_schedule == "cosine":
@@ -319,7 +336,12 @@ def train_stream_neural_svd(
     converged = False
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        saved_config = checkpoint["config"]
+        # Checkpoints written before convergence settings became resumable store them in config.
+        saved_config = {
+            key: value
+            for key, value in checkpoint["config"].items()
+            if key not in ("eval_every", "tol", "patience")
+        }
         if saved_config != config:
             diffs = ", ".join(
                 f"{key}: {saved_config.get(key)!r} != {current!r}"
@@ -340,6 +362,10 @@ def train_stream_neural_svd(
         last_relative_change = checkpoint["last_relative_change"]
         converged = checkpoint["converged"]
         print(f"resuming from step {step}", flush=True)
+        if checkpoint.get("convergence") != convergence_settings:
+            stable_evaluations = 0
+            converged = False
+            print("convergence settings changed; resetting probe stability count", flush=True)
         del checkpoint
 
     static_metadata = {
@@ -379,6 +405,7 @@ def train_stream_neural_svd(
         "eval_every": eval_every,
         "tol": tol,
         "patience": patience,
+        "convergence_rank": convergence_components,
         "probe_histories": probe_histories,
         "probe_futures": probe_futures,
         "probe_seed": probe_seed,
@@ -387,6 +414,7 @@ def train_stream_neural_svd(
     def save_checkpoint() -> None:
         payload = {
             "config": config,
+            "convergence": convergence_settings,
             "lr_schedule": lr_schedule_state,
             "step": step,
             "features": features.state_dict(),
@@ -430,14 +458,12 @@ def train_stream_neural_svd(
         write_atomic(outputs[2], save_probe)
         write_atomic(outputs[3], lambda tmp: save_json(tmp, metadata))
 
-    schedule_end = lr_decay_steps if lr_schedule == "cosine" else None
-    stops_on_convergence = lr_schedule == "constant"
+    convergence_start = lr_decay_steps if lr_schedule == "cosine" else 0
     current_lr = optimizer.param_groups[0]["lr"]
     started = time.perf_counter()
     while (
-        not (converged and stops_on_convergence)
+        not (converged and step >= convergence_start)
         and (max_steps is None or step < max_steps)
-        and (schedule_end is None or step < schedule_end)
     ):
         step += 1
         current_lr = (
@@ -488,16 +514,9 @@ def train_stream_neural_svd(
                 token_gram,
                 vocab_size=inference.vocab_size,
             ).singular_values
-            if previous_singular_values is None:
-                relative_change = math.inf
-            else:
-                prev = np.asarray(previous_singular_values)
-                if np.any(prev <= 0):
-                    relative_change = math.inf
-                else:
-                    relative_change = float(
-                        np.max(np.abs(singular_values - prev) / prev)
-                    )
+            relative_change = leading_relative_change(
+                singular_values, previous_singular_values, convergence_components
+            )
             stable_evaluations = (
                 stable_evaluations + 1 if relative_change < tol else 0
             )
@@ -505,28 +524,22 @@ def train_stream_neural_svd(
             last_relative_change = relative_change
             converged = stable_evaluations >= patience
             print(
-                f"step {step} singular-value relative change {relative_change:.3g} "
+                f"step {step} top-{convergence_components} singular-value relative change {relative_change:.3g} "
                 f"stable {stable_evaluations}/{patience}",
                 flush=True,
             )
-        if not (converged and stops_on_convergence) and (
-            step % checkpoint_every == 0
-            or step == max_steps
-            or step == schedule_end
+        if not (converged and step >= convergence_start) and (
+            step % checkpoint_every == 0 or step == max_steps
         ):
             save_checkpoint()
             write_outputs()
 
-    if converged and stops_on_convergence:
+    if converged and step >= convergence_start:
         write_outputs()
         checkpoint_path.unlink(missing_ok=True)
         stop_reason = "converged"
     else:
-        stop_reason = (
-            "lr_schedule_end"
-            if schedule_end is not None and step >= schedule_end
-            else "max_steps"
-        )
+        stop_reason = "max_steps"
     return {
         "output_dir": str(output_dir),
         "steps": step,

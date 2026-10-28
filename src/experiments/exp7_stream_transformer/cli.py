@@ -91,6 +91,7 @@ def main(argv: list[str] | None = None) -> None:
             eval_every=args.eval_every,
             tol=args.tol,
             patience=args.patience,
+            convergence_rank=args.convergence_rank,
             checkpoint_every=args.checkpoint_every,
             lr=args.lr,
             lr_schedule=args.lr_schedule,

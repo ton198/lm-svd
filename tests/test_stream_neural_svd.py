@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from utils.stream_neural_svd import (
     centered_unembedding,
     column_features,
     learned_probe_spectrum,
+    leading_relative_change,
     probe_reference,
     train_stream_neural_svd,
 )
@@ -156,6 +158,7 @@ class StreamNeuralSVDTests(unittest.TestCase):
             eval_every=5,
             tol=1e-3,
             patience=3,
+            convergence_rank=2,
             checkpoint_every=3,
             lr=1e-3,
             lr_schedule="constant",
@@ -342,6 +345,18 @@ class StreamNeuralSVDTests(unittest.TestCase):
                 self.assertAlmostEqual(spectrum.left_orthogonality_error, expected_left_error, places=12)
                 self.assertAlmostEqual(spectrum.right_orthogonality_error, expected_right_error, places=12)
 
+    def test_leading_relative_change_ignores_trailing_components(self) -> None:
+        previous = [1.0, 1e-4]
+        current = np.array([1.0005, 2e-4])
+        self.assertAlmostEqual(
+            leading_relative_change(current, previous, 1), 5e-4, places=12
+        )
+        self.assertEqual(leading_relative_change(current, previous, 2), 1.0)
+        self.assertEqual(leading_relative_change(current, None, 1), math.inf)
+        self.assertEqual(
+            leading_relative_change(current, [0.0, 1.0], 1), math.inf
+        )
+
     def test_learned_probe_spectrum_rejects_zero_feature_columns(self) -> None:
         ids = torch.arange(3)[:, None]
         gram = self.token_matrix.double().T @ self.token_matrix.double()
@@ -360,6 +375,41 @@ class StreamNeuralSVDTests(unittest.TestCase):
                         _TableFeatures(rows, weights), ids, ids, gram,
                         vocab_size=11, chunk=2,
                     )
+
+    def test_cosine_holds_min_lr_and_stops_on_convergence_after_decay(self) -> None:
+        output_dir = self.root / "cosine_convergence"
+        result = self._train(
+            output_dir,
+            lr_schedule="cosine",
+            lr_decay_steps=12,
+            eval_every=5,
+            patience=1,
+            tol=1e9,
+            max_steps=None,
+        )
+        self.assertEqual(result["stop_reason"], "converged")
+        self.assertEqual(result["steps"], 12)
+        self.assertFalse((output_dir / "checkpoint.pt").exists())
+        metadata = json.loads((output_dir / "metadata.json").read_text())
+        self.assertIs(metadata["converged"], True)
+        self.assertEqual(metadata["final_lr"], 1e-5)
+
+    def test_resumed_cosine_checkpoint_trains_past_decay_end(self) -> None:
+        output_dir = self.root / "cosine_resume_past_decay"
+        first = self._train(
+            output_dir, lr_schedule="cosine", lr_decay_steps=4, max_steps=4
+        )
+        self.assertEqual(first["stop_reason"], "max_steps")
+        self.assertEqual(first["steps"], 4)
+        second = self._train(
+            output_dir, lr_schedule="cosine", lr_decay_steps=4, max_steps=8, tol=1e-12
+        )
+        self.assertEqual(second["stop_reason"], "max_steps")
+        self.assertEqual(second["steps"], 8)
+        metadata = json.loads((output_dir / "metadata.json").read_text())
+        self.assertEqual(metadata["final_lr"], 1e-5)
+        self.assertEqual(len(np.load(output_dir / "loss_history.npy")), 8)
+        self.assertEqual(metadata["tol"], 1e-12)
 
     def test_interrupted_training_resumes_identically(self) -> None:
         for schedule in ("constant", "cosine"):
@@ -454,13 +504,13 @@ class StreamNeuralSVDTests(unittest.TestCase):
                     lr_schedule="cosine",
                     lr_decay_steps=30000,
                     min_lr=1e-5,
-                    max_steps=None,
+                    max_steps=60000,
                     eval_every=1000,
                     checkpoint_every=1000,
                 )
-                self.assertEqual(result["stop_reason"], "lr_schedule_end")
-                self.assertEqual(result["steps"], 30000)
-                self.assertEqual(result["pairs_evaluated"], 30000 * 8 * 8)
+                self.assertEqual(result["stop_reason"], "converged")
+                self.assertGreaterEqual(result["steps"], 30000)
+                self.assertEqual(result["pairs_evaluated"], result["steps"] * 8 * 8)
                 metadata = json.loads((output_dir / "metadata.json").read_text())
                 builder = {
                     "exp6": build_mlp_features,

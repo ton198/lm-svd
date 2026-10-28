@@ -597,7 +597,7 @@ All four experiments default to `--stream wikitext-103-train`, `--model-path mod
 | `--history-batch`, `--future-batch` | `64`, `64` |
 | `--probe-histories`, `--probe-futures`, `--probe-seed` | `1024`, `1024`, `1` |
 | `--lr`, `--lr-schedule`, `--min-lr`, `--lr-decay-steps` | `1e-3`, `cosine`, `1e-5`, `30000` |
-| `--eval-every`, `--tol`, `--patience` | `1000`, `1e-3`, `3` |
+| `--eval-every`, `--tol`, `--patience`, `--convergence-rank` | `1000`, `1e-3`, `3`, `32` |
 | `--checkpoint-every`, `--log-every`, `--seed` | `100`, `100`, `0` |
 | `--max-steps` | No cap |
 
@@ -654,9 +654,9 @@ The capped runs report `stop_reason: max_steps`; continuation prints `resuming f
 
 BlueHive templates are `bluehive_run/exp9-train.sbatch` and `bluehive_run/exp9-analysis.sbatch`. Submit from the repository root after provisioning the local models and stream. Training intentionally omits `--overwrite` to resume checkpoints; analysis reads the encoder path from training metadata.
 
-Cosine decay starts at step 0 without warmup and stops at `--lr-decay-steps` with `stop_reason: lr_schedule_end`, even if the probe stabilizes earlier. Resuming does not restart or extend that schedule. `--lr-schedule constant` instead stops on probe stability (`converged`); `--max-steps` caps either schedule. Probe stability means relative changes in learned singular values stay below `--tol` for `--patience` evaluations; it is not an exact-reference accuracy criterion.
+Cosine decay starts at step 0 without warmup, reaches `--min-lr` after `--lr-decay-steps` (30,000 by default), and holds that rate until convergence. It does not stop before the decay endpoint even if the probe stabilizes earlier; resuming does not restart or extend the decay. `--lr-schedule constant` stops on convergence without a decay wait. The optional `--max-steps` caps either schedule. Probe stability means the maximum relative change among the leading `--convergence-rank` singular values in learned order stays below `--tol` for `--patience` evaluations. The convergence rank defaults to 32 and is capped at `--rank`; this stability check is not an exact-reference accuracy criterion.
 
-Resume configuration must match, including architecture, rank, windows, batches, stream/model paths, optimizer/schedule settings, seed, and probe/evaluation settings. Mismatches raise `checkpoint config mismatch`; there is **no** constant-to-cosine migration. The step cap and logging/checkpoint intervals can change. Existing training outputs without a checkpoint require `--overwrite`, which restarts at step 0 rather than resuming. Analysis likewise requires `--overwrite` to replace its outputs; replacing training does not refresh existing analysis. Do not run overlapping writers against the same directory.
+Resume configuration must match, including architecture, rank, windows, batches, stream/model paths, optimizer/schedule settings, seed, and probe selection settings. Mismatches raise `checkpoint config mismatch`; there is **no** constant-to-cosine migration. The convergence settings `--eval-every`, `--tol`, `--patience`, and `--convergence-rank` can change on resume, resetting the probe-stability count. Legacy checkpoints with convergence settings stored in their configuration are also accepted and reset probe stability on resume. The step cap and logging/checkpoint intervals can change. Existing training outputs without a checkpoint require `--overwrite`, which restarts at step 0 rather than resuming. Analysis likewise requires `--overwrite` to replace its outputs; replacing training does not refresh existing analysis. Do not run overlapping writers against the same directory.
 
 ### Paths, outputs, and probe interpretation
 
@@ -666,7 +666,7 @@ Run directories are `<results-root>/<experiment>/<stream>__<model-directory-name
 - `train/loss_history.npy`: one loss per completed step.
 - `train/probe.npz`: fixed history/future start indices, sampled once using the probe seed.
 - `train/metadata.json`: configuration, stream metadata, steps, loss/entry-energy estimates, convergence state, and latest probe spectrum (null before the first evaluation); written last. Shared `parameter_counts` records `trainable_total` and `modules` (trainable counts by top-level child module) for exp6/exp7/exp8/exp9. These counts are metadata only, not part of the resume configuration, so adding them does not invalidate existing checkpoints. Frozen teacher and sentence-encoder parameters are excluded.
-- `train/checkpoint.pt`: resumable state, saved with a refreshed snapshot every checkpoint interval, at the step cap, and at the cosine schedule end. Constant-schedule convergence removes the checkpoint.
+- `train/checkpoint.pt`: resumable state, saved with a refreshed snapshot every checkpoint interval and at the step cap. Convergence removes the checkpoint.
 - `analysis/`: six files: `singular_values.npy`, `reference_singular_values.npy`, `left_singular_vectors.npy`, `reference_left_singular_vectors.npy`, `neural_svd_spectrum.png`, and `metadata.json` (written last). Vector arrays are probe-histories × rank, with unit-norm columns. The plot compares learned/reference spectra and cumulative energy alongside training loss.
 
 Unlike exp4 analysis, **analysis reloads both the token stream and the local teacher model from paths saved in training metadata** to reconstruct the probe and exact reference. Analysis `--model-path` only names the run directory; it does not override the saved teacher path. Keep those inputs available. `--reference-future-batch 4` controls futures per reference forward: with `Hp` probe histories, each forward contains `q * Hp` concatenated sequences. Lower `q` to reduce peak memory (at the cost of more forwards); the reference still evaluates every probe history/future pair.
@@ -713,7 +713,7 @@ STREAM=wikitext-103-train RANK=128 sbatch bluehive_run/exp8-train.sbatch
 STREAM=wikitext-103-train sbatch bluehive_run/exp8-analysis.sbatch
 ```
 
-Training scripts default to `STREAM=wikitext-103-train`, `RANK=256`; all four accept these overrides. They request one H100 on `preempt`, 4 CPUs, 64 GiB host memory, and one day, with requeue and appended Slurm logs. Resubmit to resume; the scripts do not pass `--overwrite`. If rank 256 exhausts H100 memory, use `RANK=128` for any experiment in a fresh run (or explicitly restart incompatible existing outputs); code defaults stay unchanged. Analysis scripts use the same `STREAM` override, read the saved rank rather than `RANK`, and run with `--overwrite`. They request one GPU on `gpu`, 4 CPUs, 32 GiB host memory, and **four hours** for the exact probe reference.
+Training scripts default to `STREAM=wikitext-103-train`, `RANK=256`; all four accept these overrides. They request one H100 on `preempt`, 4 CPUs, 64 GiB host memory, and two days. Slurm sends `USR1` 600 seconds before the time limit, triggering automatic requeue and resume from the latest checkpoint; both training stage and Slurm logs are appended across requeues. Training errors fail the job without requeueing. Use `scancel <job-id>` to stop repeated requeues. The scripts do not pass `--overwrite`. If rank 256 exhausts H100 memory, use `RANK=128` for any experiment in a fresh run (or explicitly restart incompatible existing outputs); code defaults stay unchanged. Analysis scripts use the same `STREAM` override, read the saved rank rather than `RANK`, and run with `--overwrite`. They request one GPU on `gpu`, 4 CPUs, 32 GiB host memory, and **four hours** for the exact probe reference.
 
 Slurm logs are `bluehive_run/logs/slurm-lm-svd-exp{6,7,8,9}-{train,analysis}-<job-id>.{out,err}`; stage logs live under the corresponding `slurm-<job-name>-<job-id>/` directory as `exp{6,7,8,9}-{train,analysis}.out` (for example, `exp8-train.out` or `exp8-analysis.out`). Use `uv run exp6 <subcommand> --help`, `uv run exp7 <subcommand> --help`, `uv run exp8 <subcommand> --help`, or `uv run exp9 <subcommand> --help` for all flags; module entry points are `experiments.exp6_stream_gpt2_mlp`, `experiments.exp7_stream_transformer`, `experiments.exp8_stream_token_mlp`, and `experiments.exp9_stream_sentence_mlp`.
 
@@ -785,7 +785,7 @@ RUN_SLOW=1 uv run python -m unittest \
   tests.test_exp4_neural_svd.Exp4NeuralSVDTests.test_training_and_analysis_recover_top_two_singular_values -v
 ```
 
-Streaming exp6/exp7/exp8 also have opt-in tiny-model top-two singular-value recovery tests (30,000-step cosine training for each architecture; no downloaded model or dataset needed):
+Streaming exp6/exp7/exp8 also have opt-in tiny-model top-two singular-value recovery tests (30,000-step cosine decay followed by training until convergence, with a 60,000-step guard for each architecture; no downloaded model or dataset needed):
 
 ```bash
 RUN_SLOW=1 uv run python -m unittest tests.test_stream_neural_svd -v

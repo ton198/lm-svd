@@ -4,8 +4,9 @@
 #SBATCH --gres=gpu:H100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --time=1-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --requeue
+#SBATCH --signal=B:USR1@600
 #SBATCH --open-mode=append
 #SBATCH --output=bluehive_run/logs/slurm-%x-%j.out
 #SBATCH --error=bluehive_run/logs/slurm-%x-%j.err
@@ -30,5 +31,13 @@ rank="${RANK:-256}"
 run_args=(--stream "$stream" --model-path models/gpt2-small --device cuda --rank "$rank")
 
 # No --overwrite: resume the latest checkpoint instead of discarding training.
-printf 'Running exp8 train on %s with rank %s; log: %s/exp8-train.out\n' "$stream" "$rank" "$log_dir"
-exp8 train "${run_args[@]}" > "$log_dir/exp8-train.out" 2>&1
+printf 'Running exp8 train on %s with rank %s; log (appended): %s/exp8-train.out\n' "$stream" "$rank" "$log_dir"
+# Near the time limit, requeue this job; the next run resumes from train/checkpoint.pt.
+requeue() {
+    printf 'Time limit near; requeueing job %s\n' "$SLURM_JOB_ID"
+    scontrol requeue "$SLURM_JOB_ID"
+}
+trap requeue USR1
+# Append: requeues reuse the job ID and log directory.
+exp8 train "${run_args[@]}" >> "$log_dir/exp8-train.out" 2>&1 &
+wait $!
