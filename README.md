@@ -14,12 +14,32 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp6` | Full-vocabulary centered logit on iid stream windows; frozen GPT-2 + trainable MLP features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
 | `exp7` | Same streaming operator; trainable small Transformer features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
 | `exp8` | Same streaming operator; trainable token embeddings + MLP features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
+| `exp9` | Same streaming operator; frozen MiniLM sentence embeddings + trainable MLP features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
 
 Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead uses `train` → `analysis`, defaults to the larger `wikitext-large` dataset, and analyzes learned features on CPU without loading a model or materializing the matrix.
 
 **exp5** has only `analysis`: it learns singular components from exp1's stored matrix and always compares them with exp1's exact SVD for the selected centering. It performs no inference and loads no language model.
 
-**exp6/exp7/exp8** use `train` → `analysis` on a token stream rather than a fixed sample table. Both stages load the local language model; analysis compares learned features against an exact fixed-probe reference.
+**exp6/exp7/exp8/exp9** use `train` → `analysis` on a token stream rather than a fixed sample table. Both stages load the local language model; analysis compares learned features against an exact fixed-probe reference.
+
+## Navigation
+
+- [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
+- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-conditional-future-log-probability-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
+- [Streaming exp6–exp9](#experiments-6-7-8-and-9-streaming-full-vocabulary-neuralsvd) · [Python inference API](#python-inference-api) · [NeuralSVD utility API](#neuralsvd-utility-api) · [Tests](#tests)
+
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `src/experiments/` | Experiment commands and workflows |
+| `src/data_pipline/` | Sample and token-stream preparation |
+| `src/utils/` | Shared inference, analysis, and NeuralSVD utilities |
+| `scripts/` | Download and result synchronization scripts |
+| `bluehive_run/` | BlueHive Slurm job scripts and logs |
+| `tests/` | Automated tests |
+| `docs/` | Additional documentation, including [sample generation](docs/samples.md) |
+| `data/`, `models/` | Local datasets, results, token streams, and model files |
 
 ## 1. Install dependencies
 
@@ -34,27 +54,30 @@ Matrix generation defaults to CUDA and uses float32 model weights. Use `--device
 ## 2. Download models for offline inference
 
 ```bash
-# Download or reuse the inference files for both models.
+# Download or reuse inference files for GPT-2 Small, GPT-2 Medium, and MiniLM.
 uv run python scripts/download_models.py
 
 # Optional: download just one model.
 uv run python scripts/download_models.py --models medium
 ```
 
-The script downloads **complete inference files**, not every file in the upstream repositories. Each local directory contains `model.safetensors`, `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, and `merges.txt`. These include the full model weights, not just a tokenizer. Duplicate PyTorch, TensorFlow, Flax, Rust, and ONNX weight formats are not downloaded.
+The script downloads **complete inference files**, not every file in the upstream repositories. Each GPT-2 directory contains `model.safetensors`, `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, and `merges.txt`. MiniLM contains `config.json`, `model.safetensors`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, and `vocab.txt`. These include the full model weights, not just tokenizers. Duplicate PyTorch, TensorFlow, Flax, Rust, and ONNX weight formats are not downloaded.
 
 | Local directory | Hugging Face repository | Pinned revision |
 | --- | --- | --- |
 | `models/gpt2-small` | [openai-community/gpt2](https://huggingface.co/openai-community/gpt2) | `607a30d783dfa663caf39e06633721c8d4cfcd7e` |
 | `models/gpt2-medium` | [openai-community/gpt2-medium](https://huggingface.co/openai-community/gpt2-medium) | `6dcaa7a952f72f9298047fd5137cd6e4f05f41da` |
+| `models/all-MiniLM-L6-v2` | [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) | `1110a243fdf4706b3f48f1d95db1a4f5529b4d41` |
 
-Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of `gpt2-small` and `gpt2-medium`; by default it is the repository's `models/` directory. Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
+Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of all three model directories; by default it is the repository's `models/` directory. Use `--models minilm` to download only the exp9 encoder. Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
 
-After downloading both models and source data, all tokenization and model inference can run offline.
+After downloading the required models and source data, all tokenization and model inference can run offline.
 
-Both models have been verified with local-only tokenizer loading and CPU inference, including next-token logits and conditional continuation log probabilities.
+Both GPT-2 models have been verified with local-only tokenizer loading and CPU inference, including next-token logits and conditional continuation log probabilities. MiniLM has been verified with local-only sentence encoding and an exp9 CUDA train/analysis/resume smoke.
 
 ## 3. Prepare shared history/future samples
+
+For how each sample set is generated, with examples traced back to the raw sources, see [docs/samples.md](docs/samples.md).
 
 ### WikiText windows
 
@@ -531,7 +554,7 @@ Other useful options:
 
 Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv run exp3 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>`, `uv run python -m experiments.exp2_PFH <subcommand>`, and `uv run python -m experiments.exp3_L_M_diff <subcommand>`.
 
-## Experiments 6, 7, and 8: streaming full-vocabulary NeuralSVD
+## Experiments 6, 7, 8, and 9: streaming full-vocabulary NeuralSVD
 
 These independent experiments replace exp4's per-sample lookup tables with functions of token content. Each step independently draws fresh history and future window starts **uniformly with replacement** from the token stream (duplicates are allowed). Histories and futures are not required to be adjacent in the original text. Every sampled future contributes **all vocabulary tokens** (50,257 for GPT-2); there is no top-k selection, secondary centering, or first-component removal.
 
@@ -555,11 +578,13 @@ uv run exp7 train
 uv run exp7 analysis
 uv run exp8 train
 uv run exp8 analysis
+uv run exp9 train
+uv run exp9 analysis
 ```
 
 The builder defaults to `--dataset-dir data/original/wikitext --config wikitext-103-raw-v1 --split train --tokenizer-path models/gpt2-small --output data/token_streams/wikitext-103-train.npy`. It writes a 1-D integer `.npy` token stream and sibling `.json` with tokenizer, vocabulary, split, dtype, and token-count metadata. Use `--overwrite` to replace them. Training memory-maps the array; it does not use the Parquet history/future sample tables. For another stream, write `data/token_streams/NAME.npy` and its JSON, and pass `--stream NAME`. Use a tokenizer matching the teacher model.
 
-All three experiments default to `--stream wikitext-103-train`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; `--device cpu` is supported. Shared training defaults:
+All four experiments default to `--stream wikitext-103-train`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; `--device cpu` is supported. Shared training defaults:
 
 | Flags | Defaults |
 | --- | --- |
@@ -577,8 +602,9 @@ All three experiments default to `--stream wikitext-103-train`, `--model-path mo
 - **exp6** (`exp6_stream_gpt2_mlp`): frozen GPT-2 encodes each window; concatenate the final-token hidden state and mean hidden state. Separate left/right MLPs use non-affine LayerNorm, two GELU hidden layers, and output heads. `--mlp-width 1024` controls both hidden layers. GPT-2 weights are neither optimized nor saved in the feature state.
 - **exp7** (`exp7_stream_transformer`): separate history/future Transformers train from scratch on token IDs, with learned token/position embeddings, pre-norm layers, GELU, no dropout, and unmasked attention within each window. Concatenated final-token/mean pooling feeds left/right linear heads. Defaults are `--model-dim 256 --layers 4 --heads 4`; model dimension must be divisible by heads. GPT-2 only supplies the target blocks and centered token embeddings.
 - **exp8** (`exp8_stream_token_mlp`): independent history/future token embeddings and MLPs train from scratch. Each window's embeddings are concatenated in position order into `window_tokens * embedding_dim` features, preserving order without additional positional encoding. Defaults are `--embedding-dim 256 --mlp-width 1024`. Each MLP uses non-affine LayerNorm, two `Linear → GELU` hidden layers, and a left rank-output or right rank-times-teacher-hidden-size output head, matching exp6's MLP structure. GPT-2 does not compute the input features: it only supplies target blocks, centered token embeddings, and their vocabulary/hidden-size and token-RMS information.
+- **exp9** (`exp9_stream_sentence_mlp`): decode each entire GPT-2 history/future window to text, then encode it with frozen `sentence-transformers/all-MiniLM-L6-v2`, attention-mask mean pooling, and L2 normalization into one 384-dimensional vector. Windows may cross sentence boundaries or start inside words; no splitting or repair is applied. Defaults are `--encoder-path models/all-MiniLM-L6-v2 --max-seq-length 256 --mlp-width 1024`. MiniLM retokenization truncates at this sequence limit. One shared float32 encoder stays in eval mode, outside feature parameters, state dicts, and module counts; independent left/right MLPs use exp6's structure with 384-dimensional inputs. Both the local GPT-2 tokenizer and MiniLM model/tokenizer are required. Encoder path and architecture are saved in `features` metadata, so analysis needs no encoder flags.
 
-All three right heads produce `(future_batch, rank, teacher_hidden_size)` weights, contracted with the centered unembedding for vocabulary features, with a fixed initialization scale based on hidden size and token RMS.
+All four right heads produce `(future_batch, rank, teacher_hidden_size)` weights, contracted with the centered unembedding for vocabulary features, with a fixed initialization scale based on hidden size and token RMS.
 
 With GPT-2's vocabulary/hidden size, default windows 64/32, rank 256, embedding dimension 256, and MLP width 1024, exp8's trainable parameters are:
 
@@ -592,12 +618,20 @@ With GPT-2's vocabulary/hidden size, default windows 64/32, rank 256, embedding 
 
 The total is confirmed by `sum(p.numel() for p in features.parameters())` for the default architecture; the large right output head dominates.
 
+For exp9 with GPT-2 Small, rank 256, and MLP width 1024, measured trainable counts exclude both frozen models:
+
+| Component | Parameters |
+| --- | ---: |
+| Left MLP | 1,706,240 |
+| Right MLP | 202,967,040 |
+| **Total** | **204,673,280** |
+
 ### Smoke, resume, and schedules
 
 For a short capped CUDA run of each architecture, using a separate result root:
 
 ```bash
-for e in exp6 exp7 exp8; do
+for e in exp6 exp7 exp8 exp9; do
   uv run "$e" train --rank 4 --history-batch 4 --future-batch 4 \
     --probe-histories 32 --probe-futures 8 --max-steps 20 \
     --eval-every 10 --checkpoint-every 10 --log-every 5 \
@@ -605,8 +639,8 @@ for e in exp6 exp7 exp8; do
   uv run "$e" analysis --results-root /tmp/stream-smoke --reference-future-batch 2
 done
 
-# Continue the exp8 smoke from step 20; retain its configuration.
-uv run exp8 train --rank 4 --history-batch 4 --future-batch 4 \
+# Continue the exp9 smoke from step 20; retain its configuration.
+uv run exp9 train --rank 4 --history-batch 4 --future-batch 4 \
   --probe-histories 32 --probe-futures 8 --max-steps 30 \
   --eval-every 10 --checkpoint-every 10 --log-every 5 \
   --results-root /tmp/stream-smoke
@@ -614,22 +648,26 @@ uv run exp8 train --rank 4 --history-batch 4 --future-batch 4 \
 
 The capped runs report `stop_reason: max_steps`; continuation prints `resuming from step 20`. This is a feasibility smoke, not a convergence claim. Training automatically restores feature weights, Adam moments, sampling RNG, loss history, and probe-stability state from `train/checkpoint.pt`.
 
+BlueHive templates are `bluehive_run/exp9-train.sbatch` and `bluehive_run/exp9-analysis.sbatch`. Submit from the repository root after provisioning the local models and stream. Training intentionally omits `--overwrite` to resume checkpoints; analysis reads the encoder path from training metadata.
+
 Cosine decay starts at step 0 without warmup and stops at `--lr-decay-steps` with `stop_reason: lr_schedule_end`, even if the probe stabilizes earlier. Resuming does not restart or extend that schedule. `--lr-schedule constant` instead stops on probe stability (`converged`); `--max-steps` caps either schedule. Probe stability means relative changes in learned singular values stay below `--tol` for `--patience` evaluations; it is not an exact-reference accuracy criterion.
 
 Resume configuration must match, including architecture, rank, windows, batches, stream/model paths, optimizer/schedule settings, seed, and probe/evaluation settings. Mismatches raise `checkpoint config mismatch`; there is **no** constant-to-cosine migration. The step cap and logging/checkpoint intervals can change. Existing training outputs without a checkpoint require `--overwrite`, which restarts at step 0 rather than resuming. Analysis likewise requires `--overwrite` to replace its outputs; replacing training does not refresh existing analysis. Do not run overlapping writers against the same directory.
 
 ### Paths, outputs, and probe interpretation
 
-Run directories are `<results-root>/exp6_stream_gpt2_mlp/<stream>__<model-directory-name>/`, `<results-root>/exp7_stream_transformer/<stream>__<model-directory-name>/`, and `<results-root>/exp8_stream_token_mlp/<stream>__<model-directory-name>/`. Rank and architecture flags are not encoded in the directory name. Pass matching stream, results-root, and model-path flags to locate a nondefault run for analysis.
+Run directories are `<results-root>/<experiment>/<stream>__<model-directory-name>/`, where `<experiment>` is `exp6_stream_gpt2_mlp`, `exp7_stream_transformer`, `exp8_stream_token_mlp`, or `exp9_stream_sentence_mlp`. Rank and architecture flags are not encoded in the directory name. Pass matching stream, results-root, and model-path flags to locate a nondefault run for analysis.
 
 - `train/features.pt`: trainable feature state and buffers.
 - `train/loss_history.npy`: one loss per completed step.
 - `train/probe.npz`: fixed history/future start indices, sampled once using the probe seed.
-- `train/metadata.json`: configuration, stream metadata, steps, loss/entry-energy estimates, convergence state, and latest probe spectrum (null before the first evaluation); written last. Shared `parameter_counts` records `trainable_total` and `modules` (trainable counts by top-level child module) for exp6/exp7/exp8. These counts are metadata only, not part of the resume configuration, so adding them does not invalidate existing checkpoints. Frozen teacher parameters are excluded.
+- `train/metadata.json`: configuration, stream metadata, steps, loss/entry-energy estimates, convergence state, and latest probe spectrum (null before the first evaluation); written last. Shared `parameter_counts` records `trainable_total` and `modules` (trainable counts by top-level child module) for exp6/exp7/exp8/exp9. These counts are metadata only, not part of the resume configuration, so adding them does not invalidate existing checkpoints. Frozen teacher and sentence-encoder parameters are excluded.
 - `train/checkpoint.pt`: resumable state, saved with a refreshed snapshot every checkpoint interval, at the step cap, and at the cosine schedule end. Constant-schedule convergence removes the checkpoint.
 - `analysis/`: six files: `singular_values.npy`, `reference_singular_values.npy`, `left_singular_vectors.npy`, `reference_left_singular_vectors.npy`, `neural_svd_spectrum.png`, and `metadata.json` (written last). Vector arrays are probe-histories × rank, with unit-norm columns. The plot compares learned/reference spectra and cumulative energy alongside training loss.
 
 Unlike exp4 analysis, **analysis reloads both the token stream and the local teacher model from paths saved in training metadata** to reconstruct the probe and exact reference. Analysis `--model-path` only names the run directory; it does not override the saved teacher path. Keep those inputs available. `--reference-future-batch 4` controls futures per reference forward: with `Hp` probe histories, each forward contains `q * Hp` concatenated sequences. Lower `q` to reduce peak memory (at the cost of more forwards); the reference still evaluates every probe history/future pair.
+
+For exp9, analysis also reloads the local sentence encoder using the path and sequence limit saved in training `features` metadata. Keep that directory and the teacher tokenizer available alongside the stream and teacher weights.
 
 Singular values are in **operator units**, with no finite-matrix `sqrt(m*n)` multiplier. For a probe with `Hp` histories, `Fp` futures and vocabulary `V`, the exact reference is the SVD of the dense probe table divided by `sqrt(Hp * Fp * V)`. Analysis obtains it through the history Gram matrix and token Gram matrix rather than materializing the vocabulary-wide table. Its values are sorted descending; learned values retain **learned order**. These units differ from exp4's finite-table matrix singular values.
 
@@ -644,23 +682,25 @@ Stable probe norms, low loss, or a completed learning-rate schedule alone do not
 
 ### Comparing architectures fairly
 
-Run exp6, exp7, and exp8 with the same stream, rank, history/future windows and batches, learning-rate schedule, training steps, and probe seed. Compare singular-value relative errors, left-vector alignment, prefix subspace overlap, captured energy, trainable parameter counts, time per step, and peak GPU memory. Keep the teacher and probe sizes fixed as well so the target operator and exact-reference comparison are shared.
+Run exp6, exp7, exp8, and exp9 with the same stream, rank, history/future windows and batches, learning-rate schedule, training steps, and probe seed. Compare singular-value relative errors, left-vector alignment, prefix subspace overlap, captured energy, trainable parameter counts, time per step, and peak GPU memory. Keep the teacher and probe sizes fixed as well so the target operator and exact-reference comparison are shared.
 
 **exp8 versus exp6 asks whether frozen GPT-2 input representations help** when using the same MLP structure. exp8 versus exp7 compares complete architectures, not parameter-matched MLP and Transformer backbones. A parameter-matched capacity comparison requires a separate width adjustment while keeping the output heads fixed.
 
 ### BlueHive
 
-Prepare `.venv`, the local model, and token-stream `.npy`/`.json` on the cluster, then submit from the repository root:
+Prepare `.venv`, the local GPT-2 model, the MiniLM encoder for exp9, and token-stream `.npy`/`.json` on the cluster, then submit from the repository root:
 
 ```bash
 mkdir -p bluehive_run/logs
 sbatch bluehive_run/exp6-train.sbatch
 sbatch bluehive_run/exp7-train.sbatch
 sbatch bluehive_run/exp8-train.sbatch
+sbatch bluehive_run/exp9-train.sbatch
 # Submit analysis separately after a snapshot is available.
 sbatch bluehive_run/exp6-analysis.sbatch
 sbatch bluehive_run/exp7-analysis.sbatch
 sbatch bluehive_run/exp8-analysis.sbatch
+sbatch bluehive_run/exp9-analysis.sbatch
 
 # Optional training overrides; use the same STREAM for analysis.
 STREAM=wikitext-103-train RANK=128 sbatch bluehive_run/exp6-train.sbatch
@@ -669,9 +709,9 @@ STREAM=wikitext-103-train RANK=128 sbatch bluehive_run/exp8-train.sbatch
 STREAM=wikitext-103-train sbatch bluehive_run/exp8-analysis.sbatch
 ```
 
-Training scripts default to `STREAM=wikitext-103-train`, `RANK=256`; all three accept these overrides. They request one H100 on `preempt`, 4 CPUs, 64 GiB host memory, and one day, with requeue and appended Slurm logs. Resubmit to resume; the scripts do not pass `--overwrite`. If rank 256 exhausts H100 memory, use `RANK=128` for any experiment in a fresh run (or explicitly restart incompatible existing outputs); code defaults stay unchanged. Analysis scripts use the same `STREAM` override, read the saved rank rather than `RANK`, and run with `--overwrite`. They request one GPU on `gpu`, 4 CPUs, 32 GiB host memory, and **four hours** for the exact probe reference.
+Training scripts default to `STREAM=wikitext-103-train`, `RANK=256`; all four accept these overrides. They request one H100 on `preempt`, 4 CPUs, 64 GiB host memory, and one day, with requeue and appended Slurm logs. Resubmit to resume; the scripts do not pass `--overwrite`. If rank 256 exhausts H100 memory, use `RANK=128` for any experiment in a fresh run (or explicitly restart incompatible existing outputs); code defaults stay unchanged. Analysis scripts use the same `STREAM` override, read the saved rank rather than `RANK`, and run with `--overwrite`. They request one GPU on `gpu`, 4 CPUs, 32 GiB host memory, and **four hours** for the exact probe reference.
 
-Slurm logs are `bluehive_run/logs/slurm-lm-svd-exp{6,7,8}-{train,analysis}-<job-id>.{out,err}`; stage logs live under the corresponding `slurm-<job-name>-<job-id>/` directory as `exp{6,7,8}-{train,analysis}.out` (for example, `exp8-train.out` or `exp8-analysis.out`). Use `uv run exp6 <subcommand> --help`, `uv run exp7 <subcommand> --help`, or `uv run exp8 <subcommand> --help` for all flags; module entry points are `experiments.exp6_stream_gpt2_mlp`, `experiments.exp7_stream_transformer`, and `experiments.exp8_stream_token_mlp`.
+Slurm logs are `bluehive_run/logs/slurm-lm-svd-exp{6,7,8,9}-{train,analysis}-<job-id>.{out,err}`; stage logs live under the corresponding `slurm-<job-name>-<job-id>/` directory as `exp{6,7,8,9}-{train,analysis}.out` (for example, `exp8-train.out` or `exp8-analysis.out`). Use `uv run exp6 <subcommand> --help`, `uv run exp7 <subcommand> --help`, `uv run exp8 <subcommand> --help`, or `uv run exp9 <subcommand> --help` for all flags; module entry points are `experiments.exp6_stream_gpt2_mlp`, `experiments.exp7_stream_transformer`, `experiments.exp8_stream_token_mlp`, and `experiments.exp9_stream_sentence_mlp`.
 
 ## Python inference API
 

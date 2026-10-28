@@ -3,3 +3,5 @@ models
 .venv
 __pycache__
 logs
+.pytest_cache/
+*.py[cod]

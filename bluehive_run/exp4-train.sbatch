@@ -3,7 +3,7 @@
 #SBATCH --partition=preempt
 #SBATCH --gres=gpu:H100:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
 #SBATCH --requeue
 #SBATCH --open-mode=append
@@ -24,10 +24,11 @@ printf 'Job ID: %s\nNode: %s\nWorking directory: %s\n' \
 nvidia-smi
 source .venv/bin/activate
 
-# Override at submit time, e.g. DATASET=task-single-text sbatch bluehive_run/exp4-train.sbatch
+# Override at submit time, e.g. DATASET=task-single-text RANK=128 sbatch bluehive_run/exp4-train.sbatch
 dataset="${DATASET:-wikitext-large}"
-run_args=(--dataset "$dataset" --model-path models/gpt2-small --device cuda)
+rank="${RANK:-256}"
+run_args=(--dataset "$dataset" --model-path models/gpt2-small --device cuda --rank "$rank")
 
 # No --overwrite: resume the latest checkpoint instead of discarding training.
-printf 'Running exp4 train on %s; log: %s/exp4-train.out\n' "$dataset" "$log_dir"
+printf 'Running exp4 train on %s with rank %s; log: %s/exp4-train.out\n' "$dataset" "$rank" "$log_dir"
 exp4 train "${run_args[@]}" > "$log_dir/exp4-train.out" 2>&1

@@ -13,21 +13,9 @@ from torch import nn
 from utils.common import Sample, load_samples, save_json, save_numpy, write_atomic
 from utils.inference import CausalLMInference
 from utils.lm_table import build_row_table, read_source_metadata
-from utils.neural_svd import NestedLoRASVDLoss
+from utils.neural_svd import NestedLoRASVDLoss, cosine_lr
 
 from .spectrum import learned_feature_moments, learned_singular_values
-
-
-def cosine_lr(
-    step: int,
-    *,
-    base_lr: float,
-    min_lr: float,
-    decay_start_step: int,
-    decay_steps: int,
-) -> float:
-    progress = min(max(step - decay_start_step, 0), decay_steps) / decay_steps
-    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
 def centered_unembedding(inference: CausalLMInference) -> torch.Tensor:
@@ -64,8 +52,8 @@ class Exp4Features(nn.Module):
         generator: torch.Generator,
     ) -> None:
         super().__init__()
-        self.history = nn.Embedding(history_count, rank, sparse=True)
-        self.future = nn.Embedding(future_count, rank * hidden_size, sparse=True)
+        self.history = nn.Embedding(history_count, rank)
+        self.future = nn.Embedding(future_count, rank * hidden_size)
         self.rank = rank
         self.hidden_size = hidden_size
         nn.init.normal_(self.history.weight, mean=0, std=0.1, generator=generator)
@@ -154,7 +142,7 @@ def train_exp4(
         len(histories), len(futures), rank, hidden_size, token_rms, generator
     ).to(device)
     loss_fn = NestedLoRASVDLoss(rank, sequential=(nesting == "sequential")).to(device)
-    optimizer = torch.optim.SparseAdam(features.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(features.parameters(), lr=lr)
     token_matrix_double = token_matrix.double()
     token_gram_t = token_matrix_double.T @ token_matrix_double
     del token_matrix_double
@@ -169,6 +157,7 @@ def train_exp4(
         "history_batch": history_batch,
         "future_batch": future_batch,
         "lr": lr,
+        "optimizer": "Adam",
         "seed": seed,
         "eval_every": eval_every,
         "tol": tol,
@@ -265,7 +254,7 @@ def train_exp4(
     optimizer_metadata = {
         "lr": lr,
         "seed": seed,
-        "optimizer": "SparseAdam",
+        "optimizer": "Adam",
     }
     convergence_metadata = {
         "eval_every": eval_every,

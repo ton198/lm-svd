@@ -1,8 +1,7 @@
 import argparse
-import math
 from pathlib import Path
 
-from data_pipline.cli import positive_int
+from data_pipline.cli import positive_float, positive_int
 from utils.experiment_paths import (
     ANALYSIS_DIR,
     TRAIN_DIR,
@@ -13,16 +12,6 @@ from utils.experiment_paths import (
 
 
 EXPERIMENT = "exp4_neural_svd"
-
-
-def positive_float(value: str) -> float:
-    try:
-        number = float(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("must be a positive float") from error
-    if not math.isfinite(number) or number <= 0:
-        raise argparse.ArgumentTypeError("must be a positive float")
-    return number
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -42,7 +31,9 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--device", default="cuda")
     train_parser.add_argument("--history-count", type=positive_int, default=None)
     train_parser.add_argument("--future-count", type=positive_int, default=None)
-    train_parser.add_argument("--rank", type=positive_int, default=32)
+    train_parser.add_argument(
+        "--rank", type=positive_int, default=256, help="Number of learned components"
+    )
     train_parser.add_argument(
         "--nesting", choices=("sequential", "joint"), default="sequential"
     )

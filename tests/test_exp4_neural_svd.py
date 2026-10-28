@@ -11,7 +11,7 @@ import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
 from experiments.exp4_neural_svd.analysis import run_analysis
-from experiments.exp4_neural_svd.train import centered_logit_block, cosine_lr, train_exp4
+from experiments.exp4_neural_svd.train import centered_logit_block, train_exp4
 from utils.common import load_samples
 from utils.inference import CausalLMInference
 
@@ -114,20 +114,6 @@ class Exp4NeuralSVDTests(unittest.TestCase):
             output_dir=output_dir,
             overwrite=overwrite,
         )
-
-    def test_cosine_lr_boundaries(self) -> None:
-        kwargs = dict(
-            base_lr=1e-2, min_lr=1e-4, decay_start_step=10, decay_steps=20
-        )
-        for step in (5, 10):
-            with self.subTest(step=step):
-                self.assertEqual(cosine_lr(step, **kwargs), 1e-2)
-        self.assertAlmostEqual(
-            cosine_lr(20, **kwargs), (1e-2 + 1e-4) / 2, places=12
-        )
-        for step in (30, 40):
-            with self.subTest(step=step):
-                self.assertEqual(cosine_lr(step, **kwargs), 1e-4)
 
     def test_legacy_constant_checkpoint_switches_to_cosine(self) -> None:
         output_dir = self.root / "legacy_cosine" / "train"
@@ -302,6 +288,16 @@ class Exp4NeuralSVDTests(unittest.TestCase):
             ValueError, "checkpoint config mismatch.*history_batch"
         ):
             self._train(output_dir, max_steps=4, history_batch=3)
+
+    def test_resume_rejects_sparse_adam_checkpoint(self) -> None:
+        output_dir = self.root / "legacy_optimizer" / "train"
+        self._train(output_dir, max_steps=2, checkpoint_every=1)
+        checkpoint_path = output_dir / "checkpoint.pt"
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        del checkpoint["config"]["optimizer"]
+        torch.save(checkpoint, checkpoint_path)
+        with self.assertRaisesRegex(ValueError, "checkpoint config mismatch.*optimizer"):
+            self._train(output_dir, max_steps=4)
 
     def test_overwrite_restarts_from_scratch(self) -> None:
         output_dir = self.root / "overwrite" / "train"
