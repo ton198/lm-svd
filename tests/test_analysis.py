@@ -13,6 +13,7 @@ import numpy as np
 
 from utils.analysis import (
     CENTERING_CHOICES,
+    LOGLOG_FIT_WEIGHTING,
     compute_svd,
     fit_log_log,
     plot_spectrum_panels,
@@ -67,6 +68,22 @@ class AnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(fit["intercept"], 1.0, places=10)
         self.assertEqual(fit["point_count"], 5)
         self.assertEqual(fit["log_base"], 10)
+
+    def test_log_log_fit_weights_indices_by_log_cell_width(self) -> None:
+        i = np.arange(1, 1001, dtype=np.float64)
+        values = np.where(i <= 10, i**-1.0, 10.0**-1.0 * (i / 10.0)**-3.0)
+        fit = fit_log_log(values)
+
+        sw = np.sqrt(np.log10((i + 0.5) / (i - 0.5)))
+        design = np.column_stack([np.log10(i), np.ones(i.size)]) * sw[:, None]
+        expected_slope, expected_intercept = np.linalg.lstsq(
+            design, np.log10(values) * sw, rcond=None
+        )[0]
+        self.assertAlmostEqual(fit["slope"], expected_slope, places=10)
+        self.assertAlmostEqual(fit["intercept"], expected_intercept, places=10)
+        unweighted_slope = np.polyfit(np.log10(i), np.log10(values), 1)[0]
+        self.assertGreater(fit["slope"], unweighted_slope)
+        self.assertEqual(fit["weighting"], LOGLOG_FIT_WEIGHTING)
 
     def test_spectrum_panels_draw_fit_and_optional_rank(self) -> None:
         values = 10.0 * np.arange(1, 6) ** -1.5

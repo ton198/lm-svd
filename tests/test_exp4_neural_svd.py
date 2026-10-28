@@ -413,9 +413,10 @@ class Exp4AnalysisTests(unittest.TestCase):
         )
         metadata = json.loads((analysis_dir / "metadata.json").read_text())
         fit = metadata["loglog_fit"]
-        expected_slope = np.polyfit(
-            np.log10([1, 2, 3]), np.log10(values), 1
-        )[0]
+        idx = np.arange(1, 4, dtype=np.float64)
+        sw = np.sqrt(np.log10((idx + 0.5) / (idx - 0.5)))
+        design = np.column_stack([np.log10(idx), np.ones(3)]) * sw[:, None]
+        expected_slope = np.linalg.lstsq(design, np.log10(values) * sw, rcond=None)[0][0]
         self.assertAlmostEqual(fit["slope"], expected_slope, places=6)
         self.assertGreater(fit["slope"], 0)
 

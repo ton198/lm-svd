@@ -11,6 +11,7 @@ RANK_TOLERANCE_RULE = "S.max() * max(matrix.shape) * finfo(float64).eps"
 SPECTRUM_SELECTION = "singular values strictly greater than rank tolerance, descending"
 CUMULATIVE_ENERGY_FORMULA = "cumsum(S_kept**2) / sum(S_kept**2)"
 LOGLOG_FIT_FORMULA = "log10(singular_value) = slope * log10(index) + intercept, index starting at 1"
+LOGLOG_FIT_WEIGHTING = "least squares weighted by log-index cell width: weight_i = log10((index + 0.5) / (index - 0.5))"
 CENTERING_CHOICES = ("none", "global", "row", "deflate1")
 CENTERING_FORMULAS = {
     "none": "M",
@@ -25,7 +26,9 @@ def fit_log_log(values: np.ndarray) -> dict[str, float | int | str | None]:
     if values.size < 2:
         slope = intercept = None
     else:
-        slope, intercept = np.polyfit(np.log10(indices), np.log10(values), 1)
+        log_indices = np.log10(indices)
+        weights = np.log10((indices + 0.5) / (indices - 0.5))
+        slope, intercept = np.polyfit(log_indices, np.log10(values), 1, w=np.sqrt(weights))
         slope, intercept = float(slope), float(intercept)
     return {
         "slope": slope,
@@ -33,6 +36,7 @@ def fit_log_log(values: np.ndarray) -> dict[str, float | int | str | None]:
         "point_count": int(values.size),
         "log_base": 10,
         "formula": LOGLOG_FIT_FORMULA,
+        "weighting": LOGLOG_FIT_WEIGHTING,
     }
 
 
