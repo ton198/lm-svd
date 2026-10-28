@@ -7,7 +7,7 @@ Experiments use sampled history/future token sequences but construct different m
 | Experiment | Matrix entry | Matrix shape | Matrix file |
 | --- | --- | --- | --- |
 | `exp1` | Centered next-token logit for a future-specific header token | histories × (futures × top-k) | `matrix.npy` |
-| `exp2` | Conditional log probability of an entire future given a history | histories × futures | `feature_log_prob.npy` |
+| `exp2` | Joint log probability of history + future given BOS | histories × futures | `feature_log_prob.npy` |
 | `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
 | `exp4` | Centered next-token logit for every vocabulary token | histories × (futures × vocabulary) | Not stored; online NeuralSVD |
 | `exp5` | Same stored top-k centered-logit matrix as exp1 | histories × (futures × top-k) | Reads exp1's `matrix.npy`; NeuralSVD decomposition |
@@ -25,7 +25,7 @@ Experiments **exp1–exp3** have two subcommands, run in order: `inference` buil
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
-- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-conditional-future-log-probability-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
+- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-joint-historyfuture-log-probability-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
 - [Streaming exp6–exp9](#experiments-6-7-8-and-9-streaming-full-vocabulary-neuralsvd) · [Python inference API](#python-inference-api) · [NeuralSVD utility API](#neuralsvd-utility-api) · [Tests](#tests)
 
 ## Project layout
@@ -256,15 +256,17 @@ echo "Results: $RESULT_DIR"
 ```
 
 
-## 5. Experiment 2: conditional future log-probability matrix
+## 5. Experiment 2: joint history/future log-probability matrix
 
-For each history/future pair, sum the conditional log probabilities of the future's tokens:
+For each history/future pair, sum the log probabilities of the history and future tokens starting from BOS:
 
 ```text
-B[history, future] = sum_t log p(future_t | history + future_<t)
+B[history, future] = log p(history + future | BOS) = sum_t log p(history_t | BOS + history_<t) + sum_t log p(future_t | BOS + history + future_<t)
 ```
 
-These are log-probability **sums**, not averages, probabilities, or centered logits. Rows correspond to histories; columns correspond to futures. Futures may have different token lengths, including within a batch; the summed scores remain length-sensitive.
+These are log-probability **sums**, not averages, probabilities, or centered logits. Rows correspond to histories; columns correspond to futures. Histories and futures may have different token lengths, including within a batch; both lengths affect the summed scores.
+
+The model configuration must provide `bos_token_id`; there is no fallback if it is missing. GPT-2 uses `<|endoftext|>` (50256) as the document-start context, even for histories sampled from the middle of documents. Inference metadata records `bos_token_id` and the score definition.
 
 ### Full workflow
 
@@ -286,7 +288,7 @@ uv run exp2 analysis --model-path "models/$MODEL" \
   --dataset "$DATASET" --results-root "$RESULTS_ROOT" --centering none
 ```
 
-`inference` writes `feature_log_prob.npy` and `metadata.json` under `$RESULT_DIR/inference/`. Keep the matrix filename unchanged: `exp2 analysis` reads `inference/feature_log_prob.npy`.
+`inference` writes `feature_log_prob.npy` and `metadata.json` under the unchanged `$RESULT_DIR/inference/` path; `exp2 analysis` reads `inference/feature_log_prob.npy`. Legacy conditional results are not migrated. Replacing existing outputs requires `--overwrite`; the metadata's score definition and `bos_token_id` distinguish joint runs from legacy runs.
 
 ### Small CPU smoke run
 
@@ -493,7 +495,7 @@ Analysis computes a thin float64 SVD with PyTorch on `--device cuda` by default.
 | `row` | `M - mean(M, axis=1, keepdims=True)` |
 | `deflate1` | `M - S[0] * outer(U[:, 0], Vt[0, :])`, where `M = U @ diag(S) @ Vt` |
 
-Row centering subtracts each history's mean across all columns: futures × header tokens for exp1/exp3, or futures for exp2. This is **secondary** centering: it does not change the base vocabulary-mean logit subtraction in exp1/exp3, and exp2 inference still stores uncentered log-probability sums. Selecting only top-k header tokens can leave the stored exp1/exp3 matrix biased toward large values despite its base vocabulary centering.
+Row centering subtracts each history's mean across all columns: futures × header tokens for exp1/exp3, or futures for exp2. This is **secondary** centering: it does not change the base vocabulary-mean logit subtraction in exp1/exp3, and exp2 inference still stores uncentered joint log-probability sums. Selecting only top-k header tokens can leave the stored exp1/exp3 matrix biased toward large values despite its base vocabulary centering.
 
 `deflate1` removes the leading singular component of `M`. It computes that component with a separate thin float64 SVD of `M` on the analysis `--device`, so this strategy runs two SVDs. The transformed matrix is then analyzed like every other strategy. Its spectrum equals the `none` spectrum without `S[0]`, followed by one rounding-level singular value for the removed direction. Rank uses the standard rule on this spectrum, so its tolerance scales with the original second singular value.
 

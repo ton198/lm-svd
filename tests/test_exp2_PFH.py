@@ -26,10 +26,14 @@ class Exp2PFHTests(unittest.TestCase):
             n_embd=8,
             n_layer=1,
             n_head=2,
-            bos_token_id=None,
+            bos_token_id=0,
             eos_token_id=None,
         )
         GPT2LMHeadModel(config).save_pretrained(cls.model_path)
+        cls.no_bos_model_path = cls.root / "model-no-bos"
+        no_bos_config = GPT2Config.from_dict(config.to_dict())
+        no_bos_config.bos_token_id = None
+        GPT2LMHeadModel(no_bos_config).save_pretrained(cls.no_bos_model_path)
         cls.samples_path = cls.root / "samples.parquet"
         schema = pa.schema(
             [
@@ -83,21 +87,41 @@ class Exp2PFHTests(unittest.TestCase):
         self.assertEqual(metadata["history_sample_ids"], [0, 1])
         self.assertEqual(metadata["future_sample_ids"], [2, 3])
         self.assertEqual(metadata["source_metadata"], {"fixture": True})
+        self.assertEqual(metadata["bos_token_id"], 0)
+        self.assertEqual(
+            metadata["value"],
+            "log p(history + future | BOS) = sum_t log p(history_t | BOS + history_<t) + sum_t log p(future_t | BOS + history + future_<t)",
+        )
 
         inference = CausalLMInference(self.model_path, "cpu")
         histories = ([1, 2, 3], [4, 5, 6])
         futures = ([7, 8], [9, 10])
         for history_index, history in enumerate(histories):
             for future_index, future in enumerate(futures):
-                prefix = list(history)
+                prefix = [0]
                 expected = 0.0
-                for token_id in future:
+                for token_id in [*history, *future]:
                     logits = inference.next_token_logits(prefix)
                     expected += torch.log_softmax(logits, dim=-1)[token_id].item()
                     prefix.append(token_id)
                 self.assertAlmostEqual(
                     matrix[history_index, future_index], expected, delta=1e-5
                 )
+
+    def test_model_without_bos_is_rejected(self) -> None:
+        output = self.root / "no-bos-output"
+        with self.assertRaisesRegex(ValueError, "no bos_token_id"):
+            build_exp2_pfh(
+                samples_path=self.samples_path,
+                model_path=self.no_bos_model_path,
+                device="cpu",
+                history_count=None,
+                future_count=None,
+                batch_size=1,
+                output_dir=output,
+                overwrite=False,
+            )
+        self.assertFalse((output / "feature_log_prob.npy").exists())
 
     def test_existing_output_requires_overwrite_before_model_load(self) -> None:
         output = self.root / "existing"

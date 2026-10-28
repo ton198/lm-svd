@@ -41,6 +41,10 @@ class CausalLMInference:
     def max_length(self) -> int:
         return self.model.config.max_position_embeddings
 
+    @property
+    def bos_token_id(self) -> int | None:
+        return self.model.config.bos_token_id
+
     def _validate_ids(self, token_ids: Sequence[int]) -> list[int]:
         ids: list[int] = []
         for token_id in token_ids:

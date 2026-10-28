@@ -32,13 +32,22 @@ def build_exp2_pfh(
 
     histories, futures = load_samples(samples_path, history_count, future_count)
     inference = CausalLMInference(model_path, device)
+    bos = inference.bos_token_id
+    if bos is None:
+        raise ValueError(
+            "model config has no bos_token_id; exp2 joint log probability needs a sequence-start token"
+        )
     matrix = np.empty((len(histories), len(futures)), dtype=np.float64)
     started = time.perf_counter()
     continuation_ids = [future.token_ids for future in futures]
     for history_index, history in enumerate(histories):
-        matrix[history_index] = inference.continuation_log_probs(
-            history.token_ids, continuation_ids, batch_size
+        history_log_prob = inference.continuation_log_probs(
+            [bos], [history.token_ids], 1
+        )[0].item()
+        future_log_probs = inference.continuation_log_probs(
+            [bos, *history.token_ids], continuation_ids, batch_size
         ).numpy()
+        matrix[history_index] = history_log_prob + future_log_probs
         print(
             f"history {history_index + 1}/{len(histories)} done, elapsed {time.perf_counter() - started:.1f}s",
             flush=True,
@@ -53,7 +62,8 @@ def build_exp2_pfh(
         "history_count": len(histories),
         "future_count": len(futures),
         "batch_size": batch_size,
-        "value": "sum_t log p(future_t | history + future_<t>)",
+        "bos_token_id": bos,
+        "value": "log p(history + future | BOS) = sum_t log p(history_t | BOS + history_<t) + sum_t log p(future_t | BOS + history + future_<t)",
         "rows": "histories",
         "columns": "futures",
         "matrix_shape": list(matrix.shape),
