@@ -549,6 +549,27 @@ def train_stream_neural_svd(
     }
 
 
+def load_trained_features(
+    train_dir: Path,
+    build_features: Callable[[dict, CausalLMInference], nn.Module],
+    device: str,
+) -> tuple[dict, CausalLMInference, nn.Module]:
+    metadata_path = train_dir / "metadata.json"
+    features_path = train_dir / "features.pt"
+    for path in (metadata_path, features_path):
+        if not path.is_file():
+            raise ValueError(f"training input does not exist: {path}")
+    train_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    inference = CausalLMInference(Path(train_metadata["model_path"]), device)
+    features = build_features(train_metadata["features"], inference)
+    features.load_state_dict(
+        torch.load(features_path, map_location="cpu", weights_only=True)
+    )
+    features.to(device)
+    features.eval()
+    return train_metadata, inference, features
+
+
 def run_stream_analysis(
     *,
     result_dir: Path,
@@ -589,15 +610,10 @@ def run_stream_analysis(
                     f"output already exists: {path}; pass --overwrite to replace it"
                 )
 
-    train_metadata = json.loads(train_paths["metadata"].read_text(encoding="utf-8"))
-    inference = CausalLMInference(Path(train_metadata["model_path"]), device)
-    stream = TokenStream(Path(train_metadata["stream_path"]))
-    features = build_features(train_metadata["features"], inference)
-    features.load_state_dict(
-        torch.load(train_paths["features"], map_location="cpu", weights_only=True)
+    train_metadata, inference, features = load_trained_features(
+        train_dir, build_features, device
     )
-    features.to(device)
-    features.eval()
+    stream = TokenStream(Path(train_metadata["stream_path"]))
     with np.load(train_paths["probe"]) as probe:
         history_ids = stream.windows(
             torch.from_numpy(probe["history_starts"]),

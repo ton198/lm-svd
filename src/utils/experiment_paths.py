@@ -11,6 +11,7 @@ DEFAULT_RESULTS_ROOT = Path("data/experiment_results")
 INFERENCE_DIR = "inference"
 TRAIN_DIR = "train"
 ANALYSIS_DIR = "analysis"
+LINGEN_DIR = "lingen"
 _DATASET_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 

@@ -195,18 +195,18 @@ The submission creates three independently scheduled array tasks (`--array=1-3`)
 
 The `h100` partition and `gpu:H100:1` GRES spelling must match the cluster configuration. Each task's resource request is not a measured guarantee that its experiment's full dataset will fit in memory or finish within two hours; reduce inference batch size for GPU-memory pressure or adjust the host-memory/time request based on observed usage.
 
-### Sync analysis results from BlueHive
+### Sync analysis and lingen results from BlueHive
 
-Run locally to pull only `data/experiment_results/<exp>/<run>/analysis/` trees:
+Run locally to pull only `data/experiment_results/<exp>/<run>/{analysis,lingen}/` trees:
 
 ```bash
-scripts/sync_circ_analysis.sh -n  # Preview transfers and deletions.
-scripts/sync_circ_analysis.sh
+scripts/sync_circ_analysis.sh -n --itemize-changes  # Preview transfers and deletions.
+scripts/sync_circ_analysis.sh --max-delete=0 --itemize-changes  # Guard against deletions.
 ```
 
 The script uses the SSH alias `circ` and remote repository `/scratch/lli81/projects/ur_research/lm-svd`. Override either with `REMOTE` or `REMOTE_ROOT`. It runs from the local repository root regardless of the calling directory.
 
-`--delete` is enabled: local analysis files absent from the remote are removed. Excluded `inference/`, `train/`, and loose files are neither copied nor deleted. Empty experiment/run directories without analysis are pruned from the transfer list. Additional arguments are passed to rsync.
+`--delete` is enabled: local analysis and lingen files absent from the remote are removed unless guarded by `--max-delete=0`. Excluded `inference/`, `train/`, and loose files are neither copied nor deleted. Empty experiment/run directories without analysis or lingen are pruned from the transfer list. Additional arguments are passed to rsync.
 
 ## 4. Experiment 1: centered-logit matrix
 
@@ -724,6 +724,40 @@ STREAM=wikitext-103-train sbatch bluehive_run/exp8-analysis.sbatch
 Training scripts default to `STREAM=wikitext-103-train`, `RANK=256`; all five accept these overrides. They request one H100 on `preempt`, 4 CPUs, 64 GiB host memory, and two days. Slurm sends `USR1` 600 seconds before the time limit, triggering automatic requeue and resume from the latest checkpoint; both training stage and Slurm logs are appended across requeues. Training errors fail the job without requeueing. Use `scancel <job-id>` to stop repeated requeues. The scripts do not pass `--overwrite`. If rank 256 exhausts H100 memory, use `RANK=128` for any experiment in a fresh run (or explicitly restart incompatible existing outputs); code defaults stay unchanged. Analysis scripts use the same `STREAM` override, read the saved rank rather than `RANK`, and run with `--overwrite`. They request one GPU on `gpu`, 4 CPUs, 32 GiB host memory, and **four hours** for the exact probe reference.
 
 Slurm logs are `bluehive_run/logs/slurm-lm-svd-exp{6,7,8,9,10}-{train,analysis}-<job-id>.{out,err}`; stage logs live under the corresponding `slurm-<job-name>-<job-id>/` directory as `exp{6,7,8,9,10}-{train,analysis}.out` (for example, `exp10-train.out` or `exp10-analysis.out`). Use `uv run expN <subcommand> --help` for all flags (`N` is 6–10); module entry points are `experiments.exp6_stream_gpt2_mlp`, `experiments.exp7_stream_transformer`, `experiments.exp8_stream_token_mlp`, `experiments.exp9_stream_sentence_mlp`, and `experiments.exp10_stream_sentence_mlp_joint`.
+
+### lingen: next-token distribution evaluation
+
+`lingen` evaluates an exp6–exp10 training snapshot against the teacher on a training or held-out token stream. Build the validation stream once, then choose the experiment and evaluation mode:
+
+```bash
+uv run data-pipline build-token-stream --split validation \
+  --output data/token_streams/wikitext-103-validation.npy
+uv run lingen onestep --experiment exp8
+uv run lingen onestep --experiment exp8 --eval-stream wikitext-103-validation
+uv run lingen autoregressive --experiment exp8 --eval-stream wikitext-103-validation
+```
+
+The stream builder requires the local WikiText validation data and GPT-2 tokenizer. `--stream` (default `wikitext-103-train`) and the directory name of `--model-path` (default `models/gpt2-small`) locate the training run under `--results-root` (default `data/experiment_results`); the teacher is loaded from the path saved in training metadata, not from the CLI model path. `--eval-stream` defaults to `--stream` and selects `data/token_streams/<name>.npy` and its metadata. exp9 and exp10 also require the local MiniLM encoder at the path saved in training metadata, and autoregressive decoding requires the saved teacher's tokenizer.
+
+For history `h` and future `f`, lingen reconstructs centered logits as `(sum_k u_k(h) W_k(f)) Etilde^T`, where `u` is the learned row feature, `W` the learned future weights, and `Etilde` the vocabulary-centered unembedding. The features already absorb the singular values: **do not multiply by sigma again**. The learned distribution `q` is the softmax of these logits; the teacher distribution `p` is the softmax of GPT-2 logits at the last position of `h+f`.
+
+`onestep` samples independent history and future windows and compares `p` and `q`. `autoregressive` samples from `q` at temperature 1; at every step it compares GPT-2 and lingen on the same current context, drops the oldest token, appends the sample, and splits the fixed-length `H+F` window back into `H` history and `F` future tokens. A separate GPT-2 free run starts from the same initial contexts and slides its own window in the same way.
+
+Both modes report KL(p‖q), KL(q‖p), and top-k overlap for k=1, 5, 10, 50: intersection size divided by k (or by vocabulary size when smaller). Top-1 overlap is agreement. The per-pair/step centered logit relative error is the **squared** error `||A - Ahat||² / ||A||²`; onestep also reports the aggregate `sum ||A - Ahat||² / sum ||A||²`, not the mean of per-pair ratios. Autoregressive results include token negative log-likelihoods and GPT-2 perplexities on lingen and GPT-2 generated tokens.
+
+Defaults are `--device cuda`, `--seed 0`, onestep `--pairs 4096 --batch-size 128`, and autoregressive `--sequences 64 --steps 96`; use `--device cpu` when needed. Outputs are under `<results-root>/<experiment>/<stream>__<model-directory-name>/lingen/<eval-stream>/<mode>/`. Onestep writes `metrics.npz` and `metadata.json`; autoregressive writes those plus decoded `samples.jsonl` and `autoregressive.png`. Metadata records inputs, configuration, definitions and summary, and is written last. Existing outputs require `--overwrite`. The evaluation uses the currently saved `train/features.pt` snapshot, which may be from ongoing training; check the recorded training step and rerun with `--overwrite` after training if a later snapshot is needed.
+
+On BlueHive, submit from the repository root after installing `.venv`, preparing the models, training snapshots, and source data:
+
+```bash
+mkdir -p bluehive_run/logs
+sbatch bluehive_run/lingen.sbatch
+# Example: evaluate a subset against validation only.
+EXPERIMENTS="exp8 exp9" EVAL_STREAMS="wikitext-103-validation" \
+  STREAM=wikitext-103-train sbatch bluehive_run/lingen.sbatch
+```
+
+The job requests one GPU on `gpu`, 4 CPUs, 32 GiB and four hours. Defaults are `EXPERIMENTS="exp6 exp7 exp8 exp9 exp10"`, `EVAL_STREAMS="wikitext-103-train wikitext-103-validation"`, and `STREAM=wikitext-103-train`. It builds the validation stream if its `.npy` is missing, then runs both modes for every selected experiment and evaluation stream with `--overwrite`; a failed command stops the job. Slurm stdout/stderr are `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>.{out,err}`; per-mode logs and `build-validation-stream.out` (when built) are under `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>/`. Use the guarded [sync commands](#sync-analysis-and-lingen-results-from-bluehive) to preview and download the results.
 
 ## Python inference API
 

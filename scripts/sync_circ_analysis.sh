@@ -1,5 +1,5 @@
 #!/bin/bash
-# Pull only <exp>/<run>/analysis/ trees of data/experiment_results from circ.
+# Pull only <exp>/<run>/{analysis,lingen}/ trees of data/experiment_results from circ.
 # Extra args go to rsync, e.g. -n (dry run).
 set -euo pipefail
 
@@ -13,6 +13,7 @@ rsync -avzhP --delete --prune-empty-dirs \
     --include='/*/' \
     --include='/*/*/' \
     --include='/*/*/analysis/***' \
+    --include='/*/*/lingen/***' \
     --exclude='*' \
     "$@" \
     "${REMOTE}:${REMOTE_ROOT}/data/experiment_results/" \
