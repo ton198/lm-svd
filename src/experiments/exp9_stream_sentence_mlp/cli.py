@@ -9,9 +9,9 @@ from utils.stream_cli import add_stream_analysis_arguments, add_stream_train_arg
 EXPERIMENT = "exp9_stream_sentence_mlp"
 
 
-def main(argv: list[str] | None = None) -> None:
+def run_cli(argv: list[str] | None, *, prog: str, experiment: str, nesting: str | None) -> None:
     parser = argparse.ArgumentParser(
-        prog="exp9",
+        prog=prog,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -21,6 +21,8 @@ def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     add_stream_train_arguments(train_parser)
+    if nesting is not None:
+        train_parser.set_defaults(nesting=nesting)
     train_parser.add_argument(
         "--encoder-path",
         type=Path,
@@ -36,9 +38,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     add_stream_analysis_arguments(analysis_parser)
     args = parser.parse_args(argv)
+    if nesting is not None and args.command == "train" and args.nesting != nesting:
+        parser.error(f"{prog} always trains with --nesting {nesting}; use exp9 for sequential nesting")
     try:
         result_dir = run_dir(
-            args.results_root, EXPERIMENT, args.stream, args.model_path.name
+            args.results_root, experiment, args.stream, args.model_path.name
         )
         if args.command == "analysis":
             from .features import build_features
@@ -111,3 +115,7 @@ def main(argv: list[str] | None = None) -> None:
         f"pairs_evaluated: {summary['pairs_evaluated']}\n"
         f"final_loss: {summary['final_loss']}"
     )
+
+
+def main(argv: list[str] | None = None) -> None:
+    run_cli(argv, prog="exp9", experiment=EXPERIMENT, nesting=None)

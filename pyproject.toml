@@ -28,6 +28,7 @@ exp6 = "experiments.exp6_stream_gpt2_mlp.cli:main"
 exp7 = "experiments.exp7_stream_transformer.cli:main"
 exp8 = "experiments.exp8_stream_token_mlp.cli:main"
 exp9 = "experiments.exp9_stream_sentence_mlp.cli:main"
+exp10 = "experiments.exp10_stream_sentence_mlp_joint.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
