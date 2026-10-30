@@ -16,6 +16,9 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp8` | Same streaming operator; trainable token embeddings + MLP features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
 | `exp9` | Same streaming operator; frozen MiniLM sentence embeddings + trainable MLP features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
 | `exp10` | Same operator and frozen MiniLM + MLP features as exp9; joint NestedLoRA nesting | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
+| `exp11` | Same streaming operator; distilled causal student with a constant-first-component skip | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
+| `exp12` | Same as exp11, with randomly initialized student | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
+| `exp13` | Same as exp11, without the skip component | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
 
 Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead uses `train` → `analysis`, defaults to the larger `wikitext-large` dataset, and analyzes learned features on CPU without loading a model or materializing the matrix.
 
@@ -23,11 +26,14 @@ Experiments **exp1–exp3** have two subcommands, run in order: `inference` buil
 
 **exp6/exp7/exp8/exp9/exp10** use `train` → `analysis` on a token stream rather than a fixed sample table. Both stages load the local language model; analysis compares learned features against an exact fixed-probe reference.
 
+**exp11/exp12/exp13** use the same streaming operator with a causal student; exp11 distillation precedes training for exp11 and exp13. See [student experiments](#experiments-11-12-and-13-causal-student-neuralsvd).
+
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
 - [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-joint-historyfuture-log-probability-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
 - [Streaming exp6–exp10](#experiments-6-7-8-9-and-10-streaming-full-vocabulary-neuralsvd) · [Python inference API](#python-inference-api) · [NeuralSVD utility API](#neuralsvd-utility-api) · [Tests](#tests)
+- [Student exp11–exp13](#experiments-11-12-and-13-causal-student-neuralsvd)
 
 ## Project layout
 
@@ -758,6 +764,56 @@ EXPERIMENTS="exp8 exp9" EVAL_STREAMS="wikitext-103-validation" \
 ```
 
 The job requests one GPU on `gpu`, 4 CPUs, 32 GiB and four hours. Defaults are `EXPERIMENTS="exp6 exp7 exp8 exp9 exp10"`, `EVAL_STREAMS="wikitext-103-train wikitext-103-validation"`, and `STREAM=wikitext-103-train`. It builds the validation stream if its `.npy` is missing, then runs both modes for every selected experiment and evaluation stream with `--overwrite`; a failed command stops the job. Slurm stdout/stderr are `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>.{out,err}`; per-mode logs and `build-validation-stream.out` (when built) are under `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>/`. Use the guarded [sync commands](#sync-analysis-and-lingen-results-from-bluehive) to preview and download the results.
+
+## Experiments 11, 12, and 13: causal student NeuralSVD
+
+These experiments learn the streaming full-vocabulary operator above using one shared causal student for history and future windows. The student has its own Transformer; it contains no GPT-2 Transformer layers. GPT-2 supplies the teacher signal and frozen vocabulary-centered unembedding, which the student uses for token inputs and output logits. The frozen unembedding is not included in `features.pt`.
+
+| Experiment | Student initialization | First component |
+| --- | --- | --- |
+| `exp11` (`exp11_stream_student`) | Distilled | Constant left function × student future logits (skip) |
+| `exp12` (`exp12_stream_student_nodistill`) | Random | Same skip |
+| `exp13` (`exp13_stream_student_noskip`) | Distilled, from the same exp11 checkpoint | Ordinary learned component |
+
+Thus exp11 versus exp12 is the distillation ablation, and exp11 versus exp13 is the skip ablation. Defaults are rank 64, `--model-dim 256 --layers 4 --heads 4 --max-positions 96`, and `--column-dim 256`. At these defaults with GPT-2 Small, trainable parameter counts are 12,080,960 for exp11/exp12 and 12,212,800 for exp13, excluding the frozen unembedding and teacher. History and future windows must each fit within `--max-positions`.
+
+Prepare the local GPT-2 model and token stream as for exp6–exp10, then run:
+
+```bash
+uv run exp11 distill
+uv run exp11 train
+uv run exp12 train
+uv run exp13 train
+
+# Evaluate training snapshots with onestep only.
+for e in exp11 exp12 exp13; do
+  uv run lingen onestep --experiment "$e"
+done
+```
+
+Distillation matches the teacher's next-token distribution at every position in sampled windows. It defaults to 20,000 steps and writes `distill/student.pt`, `loss_history.npy`, and `metadata.json` under `<results-root>/exp11_stream_student/<stream>__<model-directory-name>/`. Metadata, written last, records completion, student configuration, loss and fixed-probe KL history (`probe_kl_all` and `probe_kl_last`). Periodic snapshots have `complete: false` and a resumable `checkpoint.pt`; completion writes `complete: true` and removes the checkpoint. A matching interrupted run resumes automatically; incompatible checkpoint configuration is rejected. Existing outputs without a checkpoint require `--overwrite`, which discards them and starts over.
+
+Both exp11 and exp13 default to that same exp11 `distill/student.pt`. Their training requires the checkpoint and its sibling `metadata.json` to exist, metadata to say `complete: true`, and the student configuration (`model_dim`, `layers`, `heads`, `max_positions`) to match the requested training flags. Use `--student-checkpoint PATH` to select another completed compatible distillation; exp12 needs no distillation checkpoint. Keep stream, model and results-root flags consistent when using the default path.
+
+Each experiment writes its streaming snapshot under its own `<results-root>/<experiment>/<stream>__<model-directory-name>/train/`, including `features.pt`, loss history, probe, metadata and resumable checkpoint as described for exp6–exp10. Training metadata records the student configuration, skip, initialization and checkpoint provenance, plus trainable parameter counts. A training resume restores its saved features and requires compatible configuration; `--overwrite` restarts instead. Each experiment also supports `analysis`; use matching run-location flags and see `uv run exp11 --help` or `uv run expN train --help` for options.
+
+On BlueHive, submit from the repository root after provisioning `.venv`, GPT-2 and the token stream. exp11 and exp13 must wait for successful distillation; exp12 can train independently:
+
+```bash
+mkdir -p bluehive_run/logs
+d=$(sbatch --parsable bluehive_run/exp11-distill.sbatch); d=${d%%;*}
+sbatch --dependency=afterok:$d bluehive_run/exp11-train.sbatch
+sbatch --dependency=afterok:$d bluehive_run/exp13-train.sbatch
+sbatch bluehive_run/exp12-train.sbatch
+```
+
+The training scripts default to rank 64 and a 30,000-step cap; `RANK`, `MAX_STEPS`, and `STREAM` can be set when submitting. They omit `--overwrite` so matching checkpoints resume. After training completes, evaluate only onestep:
+
+```bash
+EXPERIMENTS="exp11 exp12 exp13" MODES=onestep sbatch bluehive_run/lingen.sbatch
+```
+
+The lingen script otherwise defaults to both modes and both training and validation evaluation streams. Set `EVAL_STREAMS` to select streams; onestep outputs are `lingen/<eval-stream>/onestep/metrics.npz` and `metadata.json` within each experiment run.
 
 ## Python inference API
 

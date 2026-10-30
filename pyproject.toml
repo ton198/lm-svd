@@ -29,6 +29,9 @@ exp7 = "experiments.exp7_stream_transformer.cli:main"
 exp8 = "experiments.exp8_stream_token_mlp.cli:main"
 exp9 = "experiments.exp9_stream_sentence_mlp.cli:main"
 exp10 = "experiments.exp10_stream_sentence_mlp_joint.cli:main"
+exp11 = "experiments.exp11_stream_student.cli:main"
+exp12 = "experiments.exp12_stream_student_nodistill.cli:main"
+exp13 = "experiments.exp13_stream_student_noskip.cli:main"
 lingen = "experiments.lingen.cli:main"
 
 [build-system]

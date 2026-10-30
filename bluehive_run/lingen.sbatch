@@ -25,13 +25,14 @@ source .venv/bin/activate
 train_stream="${STREAM:-wikitext-103-train}"
 experiments="${EXPERIMENTS:-exp6 exp7 exp8 exp9 exp10}"
 eval_streams="${EVAL_STREAMS:-wikitext-103-train wikitext-103-validation}"
+modes="${MODES:-onestep autoregressive}"
 if [[ ! -f data/token_streams/wikitext-103-validation.npy ]]; then
     data-pipline build-token-stream --split validation \
         --output data/token_streams/wikitext-103-validation.npy > "$log_dir/build-validation-stream.out" 2>&1
 fi
 for e in $experiments; do
     for s in $eval_streams; do
-        for mode in onestep autoregressive; do
+        for mode in $modes; do
             printf 'Running lingen %s %s on %s\n' "$mode" "$e" "$s"
             lingen "$mode" --experiment "$e" --stream "$train_stream" --eval-stream "$s" \
                 --model-path models/gpt2-small --device cuda --overwrite \

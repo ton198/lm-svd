@@ -8,6 +8,9 @@ from experiments.exp7_stream_transformer.cli import EXPERIMENT as EXP7
 from experiments.exp8_stream_token_mlp.cli import EXPERIMENT as EXP8
 from experiments.exp9_stream_sentence_mlp.cli import EXPERIMENT as EXP9
 from experiments.exp10_stream_sentence_mlp_joint.cli import EXPERIMENT as EXP10
+from experiments.exp11_stream_student.cli import EXPERIMENT as EXP11
+from experiments.exp12_stream_student_nodistill.cli import EXPERIMENT as EXP12
+from experiments.exp13_stream_student_noskip.cli import EXPERIMENT as EXP13
 from utils.experiment_paths import (
     DEFAULT_RESULTS_ROOT,
     DEFAULT_STREAM,
@@ -24,6 +27,9 @@ EXPERIMENTS = {
     "exp8": (EXP8, "experiments.exp8_stream_token_mlp.features"),
     "exp9": (EXP9, "experiments.exp9_stream_sentence_mlp.features"),
     "exp10": (EXP10, "experiments.exp9_stream_sentence_mlp.features"),
+    "exp11": (EXP11, "experiments.exp11_stream_student.features"),
+    "exp12": (EXP12, "experiments.exp11_stream_student.features"),
+    "exp13": (EXP13, "experiments.exp11_stream_student.features"),
 }
 
 

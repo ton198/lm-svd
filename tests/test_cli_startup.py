@@ -17,6 +17,9 @@ class CLIStartupTests(unittest.TestCase):
             "experiments.exp8_stream_token_mlp.cli",
             "experiments.exp9_stream_sentence_mlp.cli",
             "experiments.exp10_stream_sentence_mlp_joint.cli",
+            "experiments.exp11_stream_student.cli",
+            "experiments.exp12_stream_student_nodistill.cli",
+            "experiments.exp13_stream_student_noskip.cli",
         ):
             with self.subTest(module=module):
                 code = f"""
