@@ -19,6 +19,7 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp11` | Same streaming operator; distilled causal student with a constant-first-component skip | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
 | `exp12` | Same as exp11, with randomly initialized student | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
 | `exp13` | Same as exp11, without the skip component | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
+| `exp14` | Paper-style LinGen coefficient fitting and generation | Finite top-k table and full-vocabulary NeuralSVD surrogate | Finite matrices and fitted coefficients |
 
 Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead uses `train` → `analysis`, defaults to the larger `wikitext-large` dataset, and analyzes learned features on CPU without loading a model or materializing the matrix.
 
@@ -28,12 +29,14 @@ Experiments **exp1–exp3** have two subcommands, run in order: `inference` buil
 
 **exp11/exp12/exp13** use the same streaming operator with a causal student; exp11 distillation precedes training for exp11 and exp13. See [student experiments](#experiments-11-12-and-13-causal-student-neuralsvd).
 
+**exp14** fits GPT-2 Small LinGen coefficients and evaluates their generation on Small and Large; it is separate from the NeuralSVD-reconstruction `lingen` CLI. See [paper LinGen](#experiment-14-paper-style-lingen).
+
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
 - [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-joint-historyfuture-log-probability-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
 - [Streaming exp6–exp10](#experiments-6-7-8-9-and-10-streaming-full-vocabulary-neuralsvd) · [Python inference API](#python-inference-api) · [NeuralSVD utility API](#neuralsvd-utility-api) · [Tests](#tests)
-- [Student exp11–exp13](#experiments-11-12-and-13-causal-student-neuralsvd)
+- [Student exp11–exp13](#experiments-11-12-and-13-causal-student-neuralsvd) · [Paper LinGen exp14](#experiment-14-paper-style-lingen)
 
 ## Project layout
 
@@ -61,7 +64,7 @@ Matrix generation defaults to CUDA and uses float32 model weights. Use `--device
 ## 2. Download models for offline inference
 
 ```bash
-# Download or reuse inference files for GPT-2 Small, GPT-2 Medium, and MiniLM.
+# Download or reuse inference files for GPT-2 Small, Medium, Large, and MiniLM.
 uv run python scripts/download_models.py
 
 # Optional: download just one model.
@@ -74,13 +77,14 @@ The script downloads **complete inference files**, not every file in the upstrea
 | --- | --- | --- |
 | `models/gpt2-small` | [openai-community/gpt2](https://huggingface.co/openai-community/gpt2) | `607a30d783dfa663caf39e06633721c8d4cfcd7e` |
 | `models/gpt2-medium` | [openai-community/gpt2-medium](https://huggingface.co/openai-community/gpt2-medium) | `6dcaa7a952f72f9298047fd5137cd6e4f05f41da` |
+| `models/gpt2-large` | [openai-community/gpt2-large](https://huggingface.co/openai-community/gpt2-large) | `32b71b12589c2f8d625668d2335a01cac3249519` |
 | `models/all-MiniLM-L6-v2` | [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) | `1110a243fdf4706b3f48f1d95db1a4f5529b4d41` |
 
-Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of all three model directories; by default it is the repository's `models/` directory. Use `--models minilm` to download only the exp9/exp10 encoder. Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
+Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of all four model directories; by default it is the repository's `models/` directory. Use `--models minilm` to download only the exp9/exp10 encoder, or `--models large` for GPT-2 Large. Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
 
 After downloading the required models and source data, all tokenization and model inference can run offline.
 
-Both GPT-2 models have been verified with local-only tokenizer loading and CPU inference, including next-token logits and conditional continuation log probabilities. MiniLM has been verified with local-only sentence encoding and an exp9 CUDA train/analysis/resume smoke.
+GPT-2 Small and Medium have been verified with local-only tokenizer loading and CPU inference, including next-token logits and conditional continuation log probabilities. MiniLM has been verified with local-only sentence encoding and an exp9 CUDA train/analysis/resume smoke.
 
 ## 3. Prepare shared history/future samples
 
@@ -814,6 +818,39 @@ EXPERIMENTS="exp11 exp12 exp13" MODES=onestep sbatch bluehive_run/lingen.sbatch
 ```
 
 The lingen script otherwise defaults to both modes and both training and validation evaluation streams. Set `EVAL_STREAMS` to select streams; onestep outputs are `lingen/<eval-stream>/onestep/metrics.npz` and `metadata.json` within each experiment run.
+
+## Experiment 14: paper-style LinGen
+
+`exp14` implements the LinGen coefficient-fitting and generation procedure of [Golowich, Liu and Shetty](https://arxiv.org/abs/2510.24966), separately from the `lingen` CLI's NeuralSVD logit reconstruction. Coefficients are always fitted with GPT-2 Small. For each target, finite coefficients regress its centered logits against basis histories on a future-specific top-50 token table; NeuralSVD coefficients regress in exp6 feature space using an estimated full-vocabulary Gram matrix; and the single-token baseline regresses on full-vocabulary next-token logits without futures. Each method has a real-set option (`opt1`) and a nonsense option (`opt2`), in which tokens are permuted among the basis histories and among the futures; targets remain real.
+
+Algorithm 1 applies the fitted coefficients to **the evaluation model's own** centered-logit basis rows at each generated prefix. Thus Small evaluates within-model, while Large tests transfer of the same Small-fitted coefficients. The seventh variant is a five-token short-context model. Each variant samples its own trajectories at temperature 1; at each position the evaluation model's full-target distribution `p` and the variant distribution `q` are compared on that same trajectory. The primary metric is KL(p‖q), with total equal to the sum of per-position means; reverse KL, top-k overlap, and logit error are also recorded.
+
+The default dataset uses fixed 64-token histories and 32-token futures, with 2,048 basis histories, 1,024 finite-table futures, 50 targets, five generations per target and 15 generated tokens. The paper instead uses variable 8–30-token windows, 40,000 basis histories and 10,000 futures. The NeuralSVD Gram estimate averages over all 10,000 dataset stream futures and the full vocabulary; it is a learned surrogate estimated from those futures, **not** the exact infinite-table teacher objective. Fit metadata records the exp6 snapshot training step used.
+
+Prepare `wikitext-large`, the Small and Large models, and an exp6 GPT-2 Small training snapshot first. The default snapshot is `data/experiment_results/exp6_stream_gpt2_mlp/wikitext-103-train__gpt2-small/train`; select another with `--nsvd-train-dir`.
+
+```bash
+uv run exp14 fit
+uv run exp14 generate --eval-model-path models/gpt2-small
+uv run exp14 generate --eval-model-path models/gpt2-large
+uv run exp14 report
+```
+
+The default run directory is `data/experiment_results/exp14_paper_lingen/wikitext-large__gpt2-small/`. `fit/` contains sets, coefficients, finite matrices, headers and metadata with residual diagnostics. Each `lingen/<eval-model>/` contains one `.npz` per variant, decoded `samples.jsonl` and summary `metadata.json`; `analysis/` contains `summary.json` and `kl_by_position.png`, and report prints a per-model, per-variant table. Generation resumes completed variants only when their saved configuration matches; mismatched settings require `--overwrite`. Generation `--overwrite` removes existing variant outputs and regenerates them; fit and report also require `--overwrite` to replace existing outputs. The existing BlueHive sync script copies `lingen/` and `analysis/`, but not `fit/`.
+
+On BlueHive, after preparing the data, models and snapshot, submit fit before both generation jobs:
+
+```bash
+mkdir -p bluehive_run/logs
+f=$(sbatch --parsable bluehive_run/exp14-fit.sbatch); f=${f%%;*}
+sbatch --dependency=afterok:$f bluehive_run/exp14-generate.sbatch
+EVAL_MODEL=models/gpt2-large sbatch --dependency=afterok:$f bluehive_run/exp14-generate.sbatch
+# Lower memory use if needed:
+PAIR_BATCH=2048 sbatch bluehive_run/exp14-fit.sbatch
+EVAL_MODEL=models/gpt2-large BASIS_CHUNK=1 sbatch bluehive_run/exp14-generate.sbatch
+```
+
+Fit defaults to `PAIR_BATCH=4096` and overwrites its fit output; generation defaults to `EVAL_MODEL=models/gpt2-small` and `BASIS_CHUNK=2`, and resumes without overwriting completed variants. Do not replace fit output while dependent generation jobs are using it.
 
 ## Python inference API
 
