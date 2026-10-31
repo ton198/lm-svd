@@ -11,6 +11,16 @@ from utils.experiment_paths import DEFAULT_RESULTS_ROOT, DEFAULT_STREAM, TRAIN_D
 EXPERIMENT = "exp15_lingen_diagnostics"
 
 
+def add_direct_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--eval-stream", default="wikitext-103-validation")
+    parser.add_argument("--calibration-histories", type=positive_int, default=512)
+    parser.add_argument("--calibration-futures", type=positive_int, default=256)
+    parser.add_argument("--calibration-seed", type=int, default=11)
+    parser.add_argument("--tau-futures", type=positive_int, default=64)
+    parser.add_argument("--validation-pairs", type=positive_int, default=16384)
+    parser.add_argument("--validation-seed", type=int, default=12)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="exp15", formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -30,17 +40,11 @@ def main(argv: list[str] | None = None) -> None:
         subparser.add_argument("--pair-batch", type=positive_int, default=4096)
         subparser.add_argument("--overwrite", action="store_true")
         if command == "direct":
-            subparser.add_argument("--eval-stream", default="wikitext-103-validation")
+            add_direct_arguments(subparser)
             subparser.add_argument(
                 "--experiments", nargs="+", choices=tuple(EXPERIMENTS),
                 default=["exp6", "exp7", "exp8", "exp9", "exp10", "exp11", "exp12"],
             )
-            subparser.add_argument("--calibration-histories", type=positive_int, default=512)
-            subparser.add_argument("--calibration-futures", type=positive_int, default=256)
-            subparser.add_argument("--calibration-seed", type=int, default=11)
-            subparser.add_argument("--tau-futures", type=positive_int, default=64)
-            subparser.add_argument("--validation-pairs", type=positive_int, default=16384)
-            subparser.add_argument("--validation-seed", type=int, default=12)
         else:
             subparser.add_argument("--fit-dataset", default="wikitext-large")
             subparser.add_argument("--gram-batch", type=positive_int, default=256)
@@ -53,12 +57,26 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "direct":
             from .direct import run_direct
 
+            if len(set(args.experiments)) != len(args.experiments):
+                raise ValueError("duplicate experiments")
+            runs = {
+                name: (
+                    run_dir(args.results_root, EXPERIMENTS[name][0], args.stream, args.model_path.name) / TRAIN_DIR,
+                    EXPERIMENTS[name][1],
+                )
+                for name in args.experiments
+            }
+            reference_metadata = (
+                run_dir(args.results_root, EXPERIMENTS[args.experiments[0]][0], args.stream, args.model_path.name)
+                / "analysis" / "metadata.json"
+            )
+
             print(run_direct(
-                results_root=args.results_root,
+                runs=runs,
+                reference_metadata=reference_metadata,
                 stream=args.stream,
                 eval_stream=args.eval_stream,
                 model_path=args.model_path,
-                experiments=args.experiments,
                 device=args.device,
                 pair_batch=args.pair_batch,
                 calibration_histories=args.calibration_histories,

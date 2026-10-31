@@ -9,8 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from experiments.lingen.cli import EXPERIMENTS
-from utils.experiment_paths import run_dir, token_stream_path
+from utils.experiment_paths import token_stream_path
 from utils.inference import CausalLMInference
 from utils.stream_neural_svd import TokenStream, centered_unembedding, load_trained_features
 
@@ -113,20 +112,20 @@ def _table(summary, experiments):
 
 @torch.no_grad()
 def run_direct(
-    *, results_root: Path, stream: str, eval_stream: str, model_path: Path,
-    experiments: list[str], device: str, pair_batch: int, calibration_histories: int,
-    calibration_futures: int, calibration_seed: int, tau_futures: int,
-    validation_pairs: int, validation_seed: int, output_dir: Path, overwrite: bool,
+    *, runs: dict[str, tuple[Path, str]], reference_metadata: Path | None,
+    stream: str, eval_stream: str, model_path: Path, device: str, pair_batch: int,
+    calibration_histories: int, calibration_futures: int, calibration_seed: int,
+    tau_futures: int, validation_pairs: int, validation_seed: int,
+    output_dir: Path, overwrite: bool,
 ) -> str:
     started = time.monotonic()
     if tau_futures > calibration_futures:
         raise ValueError(f"tau futures {tau_futures} exceed calibration futures {calibration_futures}")
-    if len(set(experiments)) != len(experiments):
-        raise ValueError("duplicate experiments")
-    runs = {name: run_dir(results_root, EXPERIMENTS[name][0], stream, model_path.name) for name in experiments}
+    experiments = list(runs)
     for name in experiments:
+        train_dir, _ = runs[name]
         for filename in ("metadata.json", "features.pt", "probe.npz"):
-            path = runs[name] / "train" / filename
+            path = train_dir / filename
             if not path.is_file():
                 raise ValueError(f"training input does not exist: {path}")
     prepare_output_dir(output_dir, ("summary.json", "layers.png", "metadata.json"), overwrite)
@@ -134,7 +133,7 @@ def run_direct(
     metadata_by_name = {}
     probe_history_starts = probe_future_starts = None
     for name in experiments:
-        train_dir = runs[name] / "train"
+        train_dir, _ = runs[name]
         meta = json.loads((train_dir / "metadata.json").read_text(encoding="utf-8"))
         metadata_by_name[name] = meta
         with np.load(train_dir / "probe.npz") as probe:
@@ -171,9 +170,8 @@ def run_direct(
     eigenvalues, eigenvectors = eigenvalues.flip(0), eigenvectors.flip(1)
     singular_values = (eigenvalues.clamp_min(0) / (len(histories) * len(futures) * tokens.shape[0])).sqrt()
     reference_difference = None
-    analysis_path = runs[experiments[0]] / "analysis" / "metadata.json"
-    if analysis_path.is_file():
-        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    if reference_metadata is not None and reference_metadata.is_file():
+        analysis = json.loads(reference_metadata.read_text(encoding="utf-8"))
         reference = np.asarray(analysis["reference"]["singular_values"], dtype=np.float64)
         count = min(len(reference), len(singular_values))
         actual = singular_values[:count].cpu().numpy()
@@ -189,8 +187,9 @@ def run_direct(
         summary["probe"]["oracle"][str(rank)] = finalize_metrics(totals)
 
     for name in experiments:
+        train_dir, features_module = runs[name]
         train_meta, feature_inference, features = load_trained_features(
-            runs[name] / "train", importlib.import_module(EXPERIMENTS[name][1]).build_features, device,
+            train_dir, importlib.import_module(features_module).build_features, device,
         )
         rows = _feature_rows(features, histories, teacher.device, pair_batch)
         weights = _feature_weights(features, futures, teacher.device, pair_batch)
@@ -229,7 +228,7 @@ def run_direct(
                 _accumulate_batched(layer_totals[layer], state, approx, tokens, temperature=temperature if layer == "calibrated_scale_temperature" else 1.0)
         summary["probe"]["experiments"][name] = {
             "meta": {
-                "run_dir": str(runs[name]), "train_steps": train_meta["steps"],
+                "run_dir": str(train_dir.parent), "train_steps": train_meta["steps"],
                 "converged": train_meta["converged"], "rank": train_meta["rank"],
                 "features": train_meta["features"], "row_span_rank": basis.shape[1],
                 "scale": {"min": scale.min().item(), "max": scale.max().item(), "mean": scale.mean().item()},
@@ -253,7 +252,9 @@ def run_direct(
             torch.cuda.empty_cache()
 
     metadata = {
-        "results_root": str(results_root), "stream": stream, "eval_stream": eval_stream,
+        "train_dirs": {name: str(train_dir) for name, (train_dir, _) in runs.items()},
+        "reference_metadata": str(reference_metadata) if reference_metadata is not None else None,
+        "stream": stream, "eval_stream": eval_stream,
         "model_path": str(model_path), "experiments": experiments, "device": device,
         "pair_batch": pair_batch, "calibration_histories": calibration_histories,
         "calibration_futures": calibration_futures, "calibration_seed": calibration_seed,

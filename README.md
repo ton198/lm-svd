@@ -31,12 +31,14 @@ Experiments **exp1–exp3** have two subcommands, run in order: `inference` buil
 
 **exp14** fits GPT-2 Small LinGen coefficients and evaluates their generation on Small and Large; it is separate from the NeuralSVD-reconstruction `lingen` CLI. See [paper LinGen](#experiment-14-paper-style-lingen).
 
+**exp16** pins exp6, exp10 and exp11 snapshots, then refits their right functions with the left functions frozen. See [right-function refitting](#experiment-16-frozen-left-right-function-refitting).
+
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
 - [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-joint-historyfuture-log-probability-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
 - [Streaming exp6–exp10](#experiments-6-7-8-9-and-10-streaming-full-vocabulary-neuralsvd) · [Python inference API](#python-inference-api) · [NeuralSVD utility API](#neuralsvd-utility-api) · [Tests](#tests)
-- [Student exp11–exp13](#experiments-11-12-and-13-causal-student-neuralsvd) · [Paper LinGen exp14](#experiment-14-paper-style-lingen)
+- [Student exp11–exp13](#experiments-11-12-and-13-causal-student-neuralsvd) · [Paper LinGen exp14](#experiment-14-paper-style-lingen) · [Diagnostics exp15](#experiment-15-layered-lingen-diagnostics) · [Right refitting exp16](#experiment-16-frozen-left-right-function-refitting)
 
 ## Project layout
 
@@ -869,6 +871,46 @@ sbatch bluehive_run/exp15-exp14.sbatch
 Outputs are under `data/experiment_results/exp15_lingen_diagnostics/<stream>__<model>/analysis/`: `direct/` contains `summary.json`, `layers.png`, and `metadata.json`; `exp14/` contains `summary.json`, `residuals.png`, and `metadata.json`. Existing completed outputs require `--overwrite`. Direct defaults to exp6–exp12; exp14 diagnostics use exp6 only. Metadata records calibration/evaluation settings, formula definitions, and elapsed time; direct summaries record each loaded training step, while exp14 metadata records both the original fit and current snapshot steps. Running training jobs are not paused: these are the snapshots on disk at diagnostic load time, not a synchronized training-step comparison.
 
 For lower GPU inference memory, submit with `PAIR_BATCH=2048`; for a smaller exp14 anchor solve, submit with `ANCHOR_FUTURES=32`. These settings do not modify training or existing generation outputs.
+
+## Experiment 16: frozen-left right-function refitting
+
+`exp16` compares pinned exp6, exp10 and exp11 snapshots with two independently trained right functions per source, while keeping the learned left function frozen. `continue` starts from the source right architecture and weights; `wide` uses a larger right architecture (for exp11, a separate column student trunk and wider head). Evaluation reuses exp15 direct diagnostics on the shared probe and held-out pairs, comparing each source with its two refits.
+
+First prepare the source training snapshots, local models and token streams. Then pin and train each source/variant before evaluating:
+
+```bash
+uv run exp16 pin
+for s in exp6 exp10 exp11; do
+  for v in continue wide; do
+    uv run exp16 train --source "$s" --variant "$v"
+  done
+done
+uv run exp16 evaluate
+```
+
+`pin` reads the source run directories without modifying them and copies their training metadata, features and probe into exp16. It checks for changes during copying and records the source step and feature checksum in `pin.json`. Existing pins are skipped, never overwritten; to select a newer snapshot, remove the relevant exp16 pinned directory and pin it again before starting its refits. Use `--sources` to select a subset; evaluation also accepts `--variants`. All commands accept `--stream`, `--results-root` and `--model-path`, which must identify the intended source runs.
+
+Training defaults to 30,000 steps with cosine learning-rate decay from `1e-3` to `1e-5` over 30,000 steps. Without `--overwrite`, matching checkpoints resume rather than restarting; completed outputs without a checkpoint require `--overwrite` to replace. Do not run overlapping jobs for the same source and variant. Evaluation refuses to replace existing output unless `--overwrite` is supplied.
+
+The default run is `data/experiment_results/exp16_right_refit/wikitext-103-train__gpt2-small/`: pinned snapshots are in `sources/<source>/train/`, trained refits in `<source>-<variant>/train/`, and evaluation writes `analysis/direct/{summary.json,layers.png,metadata.json}`. Source experiment results and exp15 results are not modified.
+
+On BlueHive, after installing `.venv` and preparing the models, streams and source snapshots, pin on the login node and submit from the repository root:
+
+```bash
+source .venv/bin/activate
+exp16 pin
+mkdir -p bluehive_run/logs
+ids=()
+for s in exp6 exp10 exp11; do
+  for v in continue wide; do
+    j=$(SOURCE="$s" VARIANT="$v" sbatch --parsable bluehive_run/exp16-train.sbatch)
+    ids+=("${j%%;*}")
+  done
+done
+sbatch --dependency="afterok:$(IFS=:; echo "${ids[*]}")" bluehive_run/exp16-evaluate.sbatch
+```
+
+Training requires `SOURCE` and `VARIANT`, accepts `MAX_STEPS`, and runs on `preempt` with requeue and appended logs; it omits `--overwrite` so requeued jobs resume. The evaluation job runs only after all six succeed, uses `PAIR_BATCH=4096` by default (set `PAIR_BATCH=2048` for lower GPU memory), and passes `--overwrite` for its evaluation output.
 
 ## Python inference API
 
