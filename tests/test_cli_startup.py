@@ -21,6 +21,7 @@ class CLIStartupTests(unittest.TestCase):
             "experiments.exp12_stream_student_nodistill.cli",
             "experiments.exp13_stream_student_noskip.cli",
             "experiments.exp14_paper_lingen.cli",
+            "experiments.exp15_lingen_diagnostics.cli",
         ):
             with self.subTest(module=module):
                 code = f"""

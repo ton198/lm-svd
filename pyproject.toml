@@ -33,6 +33,7 @@ exp11 = "experiments.exp11_stream_student.cli:main"
 exp12 = "experiments.exp12_stream_student_nodistill.cli:main"
 exp13 = "experiments.exp13_stream_student_noskip.cli:main"
 exp14 = "experiments.exp14_paper_lingen.cli:main"
+exp15 = "experiments.exp15_lingen_diagnostics.cli:main"
 lingen = "experiments.lingen.cli:main"
 
 [build-system]

@@ -852,6 +852,24 @@ EVAL_MODEL=models/gpt2-large BASIS_CHUNK=1 sbatch bluehive_run/exp14-generate.sb
 
 Fit defaults to `PAIR_BATCH=4096` and overwrites its fit output; generation defaults to `EVAL_MODEL=models/gpt2-small` and `BASIS_CHUNK=2`, and resumes without overwriting completed variants. Do not replace fit output while dependent generation jobs are using it.
 
+## Experiment 15: layered LinGen diagnostics
+
+`exp15` diagnoses existing NeuralSVD snapshots without training or rerunning generation. `direct` compares exact rank-limited centered-logit reconstruction, learned row-span and column refits, the original model, and diagonal-scale / temperature calibration. It uses the saved shared training probe, a newly sampled calibration grid, and independent versus contiguous held-out validation pairs. The oracle minimizes squared centered-logit error, not KL; KL differences between diagnostic layers are descriptive rather than nonnegative error decompositions.
+
+`exp14` compares saved finite/single/NeuralSVD coefficients with coefficients recomputed from the current exp6 snapshot. Full teacher-logit anchors and nullspace-constrained anchors distinguish an inaccurate feature constraint from the choice of its minimum-norm solution. Evaluation uses real held-out futures at lengths 0, 1, 4 and 32; anchors use lengths 1, 4 and 32 only. Decomposition records surrogate and teacher-reconstruction error separately, without treating them as an additive partition (their cross term need not vanish).
+
+```bash
+uv run exp15 direct
+uv run exp15 exp14
+# BlueHive: existing snapshots and exp14 fit outputs must already be present.
+sbatch bluehive_run/exp15-direct.sbatch
+sbatch bluehive_run/exp15-exp14.sbatch
+```
+
+Outputs are under `data/experiment_results/exp15_lingen_diagnostics/<stream>__<model>/analysis/`: `direct/` contains `summary.json`, `layers.png`, and `metadata.json`; `exp14/` contains `summary.json`, `residuals.png`, and `metadata.json`. Existing completed outputs require `--overwrite`. Direct defaults to exp6–exp12; exp14 diagnostics use exp6 only. Metadata records calibration/evaluation settings, formula definitions, and elapsed time; direct summaries record each loaded training step, while exp14 metadata records both the original fit and current snapshot steps. Running training jobs are not paused: these are the snapshots on disk at diagnostic load time, not a synchronized training-step comparison.
+
+For lower GPU inference memory, submit with `PAIR_BATCH=2048`; for a smaller exp14 anchor solve, submit with `ANCHOR_FUTURES=32`. These settings do not modify training or existing generation outputs.
+
 ## Python inference API
 
 `CausalLMInference` loads a local model once in float32 and reuses it for token-ID inputs. It does not download files or tokenize text. CUDA is the default device; CPU is shown here for portability:

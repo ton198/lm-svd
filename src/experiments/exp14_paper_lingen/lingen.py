@@ -89,7 +89,7 @@ def regress(basis_rows: np.ndarray, target_rows: np.ndarray) -> tuple[np.ndarray
 
 
 @torch.no_grad()
-def neural_svd_coefficients(features, token_matrix, basis_ids, target_ids, gram_future_ids, *, batch: int) -> tuple[np.ndarray, np.ndarray]:
+def neural_svd_system(features, token_matrix, basis_ids, target_ids, gram_future_ids, *, batch: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = token_matrix.device
     basis_ids = torch.as_tensor(basis_ids, dtype=torch.long, device=device)
     target_ids = torch.as_tensor(target_ids, dtype=torch.long, device=device)
@@ -106,6 +106,13 @@ def neural_svd_coefficients(features, token_matrix, basis_ids, target_ids, gram_
         weights = features.column_weights(gram_future_ids[i:i + batch]).double()
         gram += torch.einsum("brd,de,bse->rs", weights, token_gram, weights)
     gram /= len(gram_future_ids)
+    return u_h, u_t, gram
+
+
+@torch.no_grad()
+def neural_svd_coefficients(features, token_matrix, basis_ids, target_ids, gram_future_ids, *, batch: int) -> tuple[np.ndarray, np.ndarray]:
+    u_h, u_t, gram = neural_svd_system(features, token_matrix, basis_ids, target_ids, gram_future_ids, batch=batch)
+    device = token_matrix.device
     eigenvalues, eigenvectors = torch.linalg.eigh(gram)
     root = (eigenvectors * eigenvalues.clamp_min(0).sqrt()) @ eigenvectors.T
     a = (root @ u_h.T).cpu().numpy()
