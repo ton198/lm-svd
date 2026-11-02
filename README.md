@@ -933,7 +933,7 @@ To continue a finished refit in a new run directory, pass `--init-from <run>` (f
 
 ```bash
 uv run exp16 train --source exp6 --variant continue --run-name exp6-continue-constant \
-  --init-from exp6-continue --lr-schedule constant --lr 1e-3 --max-steps 60000
+  --init-from exp6-continue --lr-schedule constant --lr 1e-3 --tol 1e-12 --max-steps 60000
 uv run exp16 evaluate --sources exp6 --variants continue \
   --extra-runs exp6-continue-constant --output-name continue-constant
 ```
@@ -958,10 +958,10 @@ done
 sbatch --dependency="afterok:$(IFS=:; echo "${ids[*]}")" bluehive_run/exp16-evaluate.sbatch
 ```
 
-Training requires `SOURCE` and `VARIANT`, accepts `MAX_STEPS`, `RUN_NAME`, `LR_SCHEDULE` and `INIT_FROM`, and runs on `preempt` with requeue and appended logs; it omits `--overwrite` so requeued jobs resume. The evaluation job runs only after all six succeed, uses `PAIR_BATCH=4096` by default (set `PAIR_BATCH=2048` for lower GPU memory), accepts `SOURCES`, `VARIANTS`, `EXTRA_RUNS` and `OUTPUT_NAME`, and passes `--overwrite` for its evaluation output.
+Training requires `SOURCE` and `VARIANT`, accepts `MAX_STEPS`, `RUN_NAME`, `LR_SCHEDULE`, `INIT_FROM` and `TOL`, and runs on `preempt` with requeue and appended logs; it omits `--overwrite` so requeued jobs resume. A constant schedule stops as soon as the probe spectrum is stable and then deletes its checkpoint, so pass `TOL=1e-12` when `MAX_STEPS` should be the only stop. The evaluation job runs only after all six succeed, uses `PAIR_BATCH=4096` by default (set `PAIR_BATCH=2048` for lower GPU memory), accepts `SOURCES`, `VARIANTS` and `EXTRA_RUNS` (which then require `OUTPUT_NAME`, so subsets never replace `analysis/direct`), and passes `--overwrite` for its evaluation output.
 
 ```bash
-RUN_NAME=exp6-continue-constant INIT_FROM=exp6-continue LR_SCHEDULE=constant MAX_STEPS=60000 \
+RUN_NAME=exp6-continue-constant INIT_FROM=exp6-continue LR_SCHEDULE=constant TOL=1e-12 MAX_STEPS=60000 \
   SOURCE=exp6 VARIANT=continue sbatch bluehive_run/exp16-train.sbatch
 SOURCES=exp6 VARIANTS=continue EXTRA_RUNS=exp6-continue-constant OUTPUT_NAME=continue-constant \
   sbatch bluehive_run/exp16-evaluate.sbatch

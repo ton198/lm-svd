@@ -33,6 +33,8 @@ train_args=(--source "$source" --variant "$variant" --run-name "$run_name" --dev
 # Optional: LR_SCHEDULE=constant INIT_FROM=exp6-continue starts from that run's checkpoint.
 [[ -n "${LR_SCHEDULE:-}" ]] && train_args+=(--lr-schedule "$LR_SCHEDULE")
 [[ -n "${INIT_FROM:-}" ]] && train_args+=(--init-from "$INIT_FROM")
+# Constant-lr runs stop once the probe spectrum is stable; TOL=1e-12 makes MAX_STEPS the only stop.
+[[ -n "${TOL:-}" ]] && train_args+=(--tol "$TOL")
 
 # No --overwrite: resume the latest checkpoint instead of discarding training.
 printf 'Running exp16 train for %s; log (appended): %s/exp16-%s.out\n' "$run_name" "$log_dir" "$run_name"

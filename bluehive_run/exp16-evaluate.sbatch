@@ -25,6 +25,11 @@ nvidia-smi
 source .venv/bin/activate
 
 pair_batch="${PAIR_BATCH:-4096}"
+# Subset evaluations must name their own output directory; the default analysis/direct holds the full comparison.
+if [[ -n "${SOURCES:-}${VARIANTS:-}${EXTRA_RUNS:-}" && -z "${OUTPUT_NAME:-}" ]]; then
+    printf 'Set OUTPUT_NAME when SOURCES, VARIANTS or EXTRA_RUNS is set\n' >&2
+    exit 1
+fi
 output_name="${OUTPUT_NAME:-direct}"
 eval_args=(--device cuda --pair-batch "$pair_batch" --output-name "$output_name" --overwrite)
 # Optional space-separated subsets, e.g. SOURCES=exp6 VARIANTS=continue EXTRA_RUNS=exp6-continue-constant.
