@@ -9,7 +9,11 @@ import pyarrow.parquet as pq
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from experiments.exp2_PFH.feature_logprob import build_exp2_pfh
+from experiments.exp2_PFH.feature_logprob import (
+    build_exp2_pfh,
+    parquet_inputs,
+    stream_inputs,
+)
 from utils.inference import CausalLMInference
 
 
@@ -30,10 +34,6 @@ class Exp2PFHTests(unittest.TestCase):
             eos_token_id=None,
         )
         GPT2LMHeadModel(config).save_pretrained(cls.model_path)
-        cls.no_bos_model_path = cls.root / "model-no-bos"
-        no_bos_config = GPT2Config.from_dict(config.to_dict())
-        no_bos_config.bos_token_id = None
-        GPT2LMHeadModel(no_bos_config).save_pretrained(cls.no_bos_model_path)
         cls.samples_path = cls.root / "samples.parquet"
         schema = pa.schema(
             [
@@ -48,15 +48,18 @@ class Exp2PFHTests(unittest.TestCase):
         )
         table = pa.Table.from_arrays(
             [
-                pa.array([0, 1, 2, 3], type=pa.int32()),
-                pa.array(["history", "history", "future", "future"], type=pa.string()),
-                pa.array([3, 3, 2, 2], type=pa.int32()),
-                pa.array([0, 3, 6, 8], type=pa.int64()),
+                pa.array([0, 1, 2, 3, 4], type=pa.int32()),
                 pa.array(
-                    [[1, 2, 3], [4, 5, 6], [7, 8], [9, 10]],
+                    ["history", "history", "future", "future", "future"],
+                    type=pa.string(),
+                ),
+                pa.array([3, 3, 2, 2, 1], type=pa.int32()),
+                pa.array([0, 3, 6, 8, 10], type=pa.int64()),
+                pa.array(
+                    [[1, 2, 3], [4, 5, 6], [7, 8], [9, 10], [5]],
                     type=pa.list_(pa.int32()),
                 ),
-                pa.array(["h0", "h1", "f0", "f1"], type=pa.string()),
+                pa.array(["h0", "h1", "f0", "f1", "f2"], type=pa.string()),
             ],
             schema=schema,
         )
@@ -66,62 +69,63 @@ class Exp2PFHTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._temporary_directory.cleanup()
 
-    def test_matrix_matches_brute_force_scores_and_metadata(self) -> None:
+    def test_matrix_matches_brute_force_pmi(self) -> None:
         output = self.root / "out"
         summary = build_exp2_pfh(
-            samples_path=self.samples_path,
+            inputs=parquet_inputs(self.samples_path, None, None),
             model_path=self.model_path,
             device="cpu",
-            history_count=None,
-            future_count=None,
-            batch_size=1,
+            batch_size=2,
             output_dir=output,
             overwrite=False,
         )
-        matrix = np.load(output / "feature_log_prob.npy")
+        matrix = np.load(output / "pmi.npy")
         metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(summary["rows"], 2)
-        self.assertEqual(summary["columns"], 2)
-        self.assertEqual(matrix.shape, (2, 2))
+        self.assertEqual(summary["columns"], 3)
+        self.assertEqual(matrix.shape, (2, 3))
         self.assertEqual(matrix.dtype, np.float64)
-        self.assertEqual(metadata["history_sample_ids"], [0, 1])
-        self.assertEqual(metadata["future_sample_ids"], [2, 3])
-        self.assertEqual(metadata["source_metadata"], {"fixture": True})
-        self.assertEqual(metadata["bos_token_id"], 0)
-        self.assertEqual(
-            metadata["value"],
-            "log p(history + future | BOS) = sum_t log p(history_t | BOS + history_<t) + sum_t log p(future_t | BOS + history + future_<t)",
-        )
+        self.assertEqual(metadata["source"]["history_sample_ids"], [0, 1])
+        self.assertEqual(metadata["source"]["future_sample_ids"], [2, 3, 4])
+        self.assertEqual(metadata["source"]["source_metadata"], {"fixture": True})
 
         inference = CausalLMInference(self.model_path, "cpu")
         histories = ([1, 2, 3], [4, 5, 6])
-        futures = ([7, 8], [9, 10])
+        futures = ([7, 8], [9, 10], [5])
+
+        def lp(tokens: list[int]) -> float:
+            return sum(
+                torch.log_softmax(inference.next_token_logits(tokens[:t]), dim=-1)[
+                    tokens[t]
+                ].item()
+                for t in range(1, len(tokens))
+            )
+
         for history_index, history in enumerate(histories):
             for future_index, future in enumerate(futures):
-                prefix = [0]
-                expected = 0.0
-                for token_id in [*history, *future]:
-                    logits = inference.next_token_logits(prefix)
-                    expected += torch.log_softmax(logits, dim=-1)[token_id].item()
-                    prefix.append(token_id)
+                expected = lp(history + future) - lp(history) - lp(future)
                 self.assertAlmostEqual(
                     matrix[history_index, future_index], expected, delta=1e-5
                 )
 
-    def test_model_without_bos_is_rejected(self) -> None:
-        output = self.root / "no-bos-output"
-        with self.assertRaisesRegex(ValueError, "no bos_token_id"):
-            build_exp2_pfh(
-                samples_path=self.samples_path,
-                model_path=self.no_bos_model_path,
-                device="cpu",
-                history_count=None,
-                future_count=None,
-                batch_size=1,
-                output_dir=output,
-                overwrite=False,
-            )
-        self.assertFalse((output / "feature_log_prob.npy").exists())
+    def test_stream_inputs_are_seeded_windows_at_recorded_starts(self) -> None:
+        stream_path = self.root / "stream.npy"
+        tokens = (np.arange(40) % 11).astype(np.uint16)
+        np.save(stream_path, tokens)
+        stream_path.with_suffix(".json").write_text(
+            json.dumps({"vocab_size": 11}), encoding="utf-8"
+        )
+        kwargs = dict(
+            history_count=3, future_count=2, history_tokens=4, future_tokens=3, seed=5
+        )
+        inputs = stream_inputs(stream_path, **kwargs)
+        self.assertEqual(inputs, stream_inputs(stream_path, **kwargs))
+        for history, start in zip(inputs.histories, inputs.source["history_starts"]):
+            self.assertEqual(history, tokens[start : start + 4].tolist())
+        for future, start in zip(inputs.futures, inputs.source["future_starts"]):
+            self.assertEqual(future, tokens[start : start + 3].tolist())
+        with self.assertRaisesRegex(ValueError, "seed must be non-negative"):
+            stream_inputs(stream_path, 3, 2, 4, 3, -1)
 
     def test_existing_output_requires_overwrite_before_model_load(self) -> None:
         output = self.root / "existing"
@@ -129,11 +133,9 @@ class Exp2PFHTests(unittest.TestCase):
         (output / "metadata.json").touch()
         with self.assertRaisesRegex(FileExistsError, "pass --overwrite"):
             build_exp2_pfh(
-                samples_path=self.samples_path,
+                inputs=parquet_inputs(self.samples_path, None, None),
                 model_path=self.root / "missing-model",
                 device="cpu",
-                history_count=None,
-                future_count=None,
                 batch_size=64,
                 output_dir=output,
                 overwrite=False,

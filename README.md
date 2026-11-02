@@ -7,7 +7,7 @@ Experiments use sampled history/future token sequences but construct different m
 | Experiment | Matrix entry | Matrix shape | Matrix file |
 | --- | --- | --- | --- |
 | `exp1` | Centered next-token logit for a future-specific header token | histories × (futures × top-k) | `matrix.npy` |
-| `exp2` | Joint log probability of history + future given BOS | histories × futures | `feature_log_prob.npy` |
+| `exp2` | No-BOS pointwise mutual information of history and future | histories × futures | `pmi.npy` |
 | `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
 | `exp4` | Centered next-token logit for every vocabulary token | histories × (futures × vocabulary) | Not stored; online NeuralSVD |
 | `exp5` | Same stored top-k centered-logit matrix as exp1 | histories × (futures × top-k) | Reads exp1's `matrix.npy`; NeuralSVD decomposition |
@@ -36,7 +36,7 @@ Experiments **exp1–exp3** have two subcommands, run in order: `inference` buil
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
-- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-joint-historyfuture-log-probability-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
+- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
 - [Streaming exp6–exp10](#experiments-6-7-8-9-and-10-streaming-full-vocabulary-neuralsvd) · [Python inference API](#python-inference-api) · [NeuralSVD utility API](#neuralsvd-utility-api) · [Tests](#tests)
 - [Student exp11–exp13](#experiments-11-12-and-13-causal-student-neuralsvd) · [Paper LinGen exp14](#experiment-14-paper-style-lingen) · [Diagnostics exp15](#experiment-15-layered-lingen-diagnostics) · [Right refitting exp16](#experiment-16-frozen-left-right-function-refitting)
 
@@ -148,7 +148,7 @@ This writes `data/history_future_samples/wikitext-large.parquet` with **10000 hi
 
 The pipeline processes sorted shards and rows, encodes each text row independently, concatenates token IDs without inserting separators or EOS tokens, and samples distinct non-overlapping windows. Windows may cross source-row boundaries. Output columns are `sample_id`, `group`, `token_count`, `start_token`, `token_ids`, and `text`. Experiments use **`token_ids`**, not re-encoded text. Sampling settings and source information are stored in the Parquet schema's `lm_svd` metadata.
 
-Experiments load named sample sets only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). Prepared names include `wikitext`, `wikitext-large`, and `task-single-text`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment.
+Experiments using sample sets load them only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). Prepared names include `wikitext`, `wikitext-large`, and `task-single-text`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment. exp2 can alternatively sample windows from a token stream, as described below.
 
 ### Task × document samples
 
@@ -181,7 +181,7 @@ uv run exp2 inference --device cuda --dataset "$DATASET" --results-root "$RESULT
 uv run exp3 inference --device cuda --dataset "$DATASET" --results-root "$RESULTS_ROOT"
 ```
 
-Omit sample limits to use all rows, or set `--history-count N --future-count N` for leading subsets. exp2 supports these variable-length document futures, including in the same batch. Its summed log probabilities are length-sensitive, not normalized by future length.
+Omit sample limits to use all rows, or set `--history-count N --future-count N` for leading subsets. exp2 supports these variable-length document futures, including in the same batch. Its PMI uses summed log probabilities and is not normalized by future length.
 
 ### BlueHive Slurm run
 
@@ -269,17 +269,19 @@ echo "Results: $RESULT_DIR"
 ```
 
 
-## 5. Experiment 2: joint history/future log-probability matrix
+## 5. Experiment 2: no-BOS history/future PMI matrix
 
-For each history/future pair, sum the log probabilities of the history and future tokens starting from BOS:
+For each history `h` and future `f`, exp2 stores pointwise mutual information using no BOS token:
 
 ```text
-B[history, future] = log p(history + future | BOS) = sum_t log p(history_t | BOS + history_<t) + sum_t log p(future_t | BOS + history + future_<t)
+PMI[h, f] = log P(h + f) - log P(h) - log P(f)
+log P(x) = sum_{t >= 2} log p(x_t | x_<t)
+          = 0 for a one-token sequence
 ```
 
-These are log-probability **sums**, not averages, probabilities, or centered logits. Rows correspond to histories; columns correspond to futures. Histories and futures may have different token lengths, including within a batch; both lengths affect the summed scores.
+The first token of each sequence is unscored. Causality makes the history contribution to `log P(h + f)` equal to `log P(h)`, so it cancels: exp2 computes the sum of future-token log probabilities conditioned on the history and preceding future tokens, minus `log P(f)`. It does not calculate `log P(h)` separately. In particular, a singleton future has `log P(f) = 0`, though its conditional score given the history is still included.
 
-The model configuration must provide `bos_token_id`; there is no fallback if it is missing. GPT-2 uses `<|endoftext|>` (50256) as the document-start context, even for histories sampled from the middle of documents. Inference metadata records `bos_token_id` and the score definition.
+These are differences of log-probability **sums**, not averages, probabilities, or centered logits. Rows correspond to histories; columns correspond to futures. Histories and futures may have different token lengths, including within a batch.
 
 ### Full workflow
 
@@ -301,7 +303,20 @@ uv run exp2 analysis --model-path "models/$MODEL" \
   --dataset "$DATASET" --results-root "$RESULTS_ROOT" --centering none
 ```
 
-`inference` writes `feature_log_prob.npy` and `metadata.json` under the unchanged `$RESULT_DIR/inference/` path; `exp2 analysis` reads `inference/feature_log_prob.npy`. Legacy conditional results are not migrated. Replacing existing outputs requires `--overwrite`; the metadata's score definition and `bos_token_id` distinguish joint runs from legacy runs.
+`inference` writes `pmi.npy` and `metadata.json` under `$RESULT_DIR/inference/`; `exp2 analysis` reads `inference/pmi.npy`. The metadata records the score definition and a nested `source`: Parquet sources include the sample path, selected sample IDs and parsed source metadata; token-stream sources include the stream path and metadata, window lengths, seed and sampled starts. Old `feature_log_prob.npy` files are neither migrated nor deleted, and analysis of an old run requires a new `pmi.npy`. Rerunning inference where `metadata.json` already exists requires `--overwrite`, even if `pmi.npy` does not yet exist.
+
+### Token-stream input
+
+Instead of Parquet, pass `--stream NAME` to sample windows from `data/token_streams/NAME.npy` and its sibling metadata JSON. `--stream` and `--dataset` are mutually exclusive. Stream inference requires explicit `--history-count` and `--future-count`; `--history-tokens`, `--future-tokens`, and `--seed` default to 64, 32, and 0, respectively, and apply only to streams. Starts are drawn uniformly with replacement, histories first and then futures, using the seeded generator. Use the same stream, model and results root for analysis:
+
+```bash
+STREAM=wikitext-103-train
+uv run exp2 inference --device cpu --stream "$STREAM" \
+  --history-count 3 --future-count 4 --batch-size 4
+uv run exp2 analysis --device cpu --stream "$STREAM" --centering none
+```
+
+With default model and results root, this run is stored under `data/experiment_results/exp2_PFH/wikitext-103-train__gpt2-small/`. For stream creation, see the streaming experiments section below.
 
 On CIRC BlueHive, `bluehive_run/exp2-inference.sbatch` and `bluehive_run/exp2-analysis.sbatch` both request partition `h100`, QoS `h100`, and one H100 GPU. They retain 4 CPUs and 16G memory, with 6 hours for inference and 1 hour for analysis. Submit from the repository root with matching `DATASET` values and an `afterok` dependency; analysis runs all four centering modes. Both scripts overwrite existing outputs, so cancel any older jobs for the same dataset before resubmitting.
 
@@ -497,7 +512,7 @@ Experiments exp1–exp3 each own their `analysis` workflow. It reads the matrix 
 
 Analysis computes a thin float64 SVD with PyTorch on `--device cuda` by default. CUDA uses the accurate `gesvd` driver; `--device cpu` uses PyTorch's CPU SVD. Invalid devices and unavailable CUDA produce an error rather than silently switching devices. If GPU memory is insufficient, rerun that analysis with `--device cpu`. Saved factors remain NumPy arrays, and the numerical-rank tolerance is unchanged.
 
-`<run>` is a flat, string-joined directory name: `<dataset>__<model>` for exp1/exp2 (for example, `wikitext__gpt2-small`), or `<dataset>__<model_a>__minus__<model_b>` for exp3 (for example, `wikitext__gpt2-small__minus__gpt2-medium`). Model labels are the final directory names of the model paths. The dataset is not a separate directory level. Only the requested strategy directory is created.
+`<run>` is a flat, string-joined directory name: `<dataset>__<model>` for exp1 and parquet-based exp2 (for example, `wikitext__gpt2-small`), `<stream>__<model>` for stream-based exp2, or `<dataset>__<model_a>__minus__<model_b>` for exp3 (for example, `wikitext__gpt2-small__minus__gpt2-medium`). Model labels are the final directory names of the model paths. The dataset or stream is not a separate directory level. Only the requested strategy directory is created.
 
 ### Secondary centering
 
@@ -510,7 +525,7 @@ Analysis computes a thin float64 SVD with PyTorch on `--device cuda` by default.
 | `row` | `M - mean(M, axis=1, keepdims=True)` |
 | `deflate1` | `M - S[0] * outer(U[:, 0], Vt[0, :])`, where `M = U @ diag(S) @ Vt` |
 
-Row centering subtracts each history's mean across all columns: futures × header tokens for exp1/exp3, or futures for exp2. This is **secondary** centering: it does not change the base vocabulary-mean logit subtraction in exp1/exp3, and exp2 inference still stores uncentered joint log-probability sums. Selecting only top-k header tokens can leave the stored exp1/exp3 matrix biased toward large values despite its base vocabulary centering.
+Row centering subtracts each history's mean across all columns: futures × header tokens for exp1/exp3, or futures for exp2. This is **secondary** centering: it does not change the base vocabulary-mean logit subtraction in exp1/exp3, and exp2 inference still stores uncentered no-BOS PMI values. Selecting only top-k header tokens can leave the stored exp1/exp3 matrix biased toward large values despite its base vocabulary centering.
 
 `deflate1` removes the leading singular component of `M`. It computes that component with a separate thin float64 SVD of `M` on the analysis `--device`, so this strategy runs two SVDs. The transformed matrix is then analyzed like every other strategy. Its spectrum equals the `none` spectrum without `S[0]`, followed by one rounding-level singular value for the removed direction. Rank uses the standard rule on this spectrum, so its tolerance scales with the original second singular value.
 
@@ -552,9 +567,9 @@ Rerunning analysis does not remove preexisting legacy JSON artifacts. Manually r
 
 ### Directory selection and existing results
 
-**Analysis does not infer the model or dataset from your last `inference` call.** Both subcommands default to `--dataset wikitext` and `--results-root data/experiment_results`, with `--model-path models/gpt2-small` for exp1/exp2, or `--model-a-path models/gpt2-small --model-b-path models/gpt2-medium` for exp3. Pass matching dataset, results-root, and model flags to inference and analysis for nondefault runs, as shown above.
+**Analysis does not infer the model or source from your last `inference` call.** Both subcommands default to `--dataset wikitext` and `--results-root data/experiment_results`, with `--model-path models/gpt2-small` for exp1/exp2, or `--model-a-path models/gpt2-small --model-b-path models/gpt2-medium` for exp3. Pass matching dataset (or, for exp2, stream), results-root, and model flags to inference and analysis for nondefault runs.
 
-Analysis uses only the model paths' directory names to locate the run: it does not load a model, check that the model directory exists, or require/check the sample file. It validates only the dataset name's format. Inference resolves the named sample file in the fixed samples directory. `--results-root PATH` selects the parent of the experiment directory, not the run root or its `inference/` or `analysis/` child.
+Analysis uses only the model paths' directory names to locate the run: it does not load a model, check that the model directory exists, or require/check the sample file or token stream. It validates the source name's format. Inference resolves the named sample file or exp2 token stream in its fixed directory. `--results-root PATH` selects the parent of the experiment directory, not the run root or its `inference/` or `analysis/` child.
 
 Existing WikiText results have moved to the dataset-prefixed run directories above, and prepared sample files have been renamed to the plain dataset filenames. Historical `metadata.json` files are unchanged: their original `samples_path` values remain records of the inputs used at the time, even though those files have since been renamed.
 
@@ -564,9 +579,10 @@ Other useful options:
 
 - `--dataset NAME`: select a named sample set for inference or analysis; default `wikitext`.
 - `--results-root PATH`: select the results root for inference or analysis; default `data/experiment_results`.
-- `inference --history-count N --future-count N`: use only the leading N samples of each group; omit both to use all available samples.
+- `inference --history-count N --future-count N`: use leading samples of each Parquet group; omit both to use all available samples. For exp2 streams, both counts are required and specify the numbers of sampled windows.
 - `exp1 inference --top-k K`: select K header tokens per future; default 50.
 - `exp2 inference --batch-size N`: score N futures per inference batch; default 64.
+- `exp2 --stream NAME`: select a token stream instead of a dataset for inference or analysis; inference also accepts stream-only `--history-tokens`, `--future-tokens`, and `--seed`.
 - `inference --device cpu`: use CPU instead of the default CUDA device.
 
 Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv run exp3 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>`, `uv run python -m experiments.exp2_PFH <subcommand>`, and `uv run python -m experiments.exp3_L_M_diff <subcommand>`.

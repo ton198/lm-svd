@@ -178,3 +178,41 @@ class CausalLMInference:
                     )
                 )
         return torch.cat(chunks)
+
+    def sequence_log_probs(
+        self, sequences: Sequence[Sequence[int]], batch_size: int = 64
+    ) -> torch.Tensor:
+        """Score each sequence without BOS, leaving its first token unscored."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if not sequences:
+            raise ValueError("sequences must not be empty")
+        sequence_ids = [self._validate_ids(tokens) for tokens in sequences]
+
+        chunks: list[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, len(sequence_ids), batch_size):
+                batch = sequence_ids[start : start + batch_size]
+                lengths = torch.tensor(
+                    [len(tokens) for tokens in batch], device=self.device
+                )
+                width = max(len(tokens) for tokens in batch)
+                if width == 1:
+                    chunks.append(torch.zeros(len(batch), dtype=torch.float64))
+                    continue
+                ids = torch.tensor(
+                    [tokens + [0] * (width - len(tokens)) for tokens in batch],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                logits = self.model(input_ids=ids, use_cache=False).logits[:, :-1]
+                token_log_probs = logits.log_softmax(dim=-1).gather(
+                    -1, ids[:, 1:, None]
+                ).squeeze(-1)
+                mask = torch.arange(1, width, device=self.device) < lengths[:, None]
+                chunks.append(
+                    token_log_probs.masked_fill(~mask, 0).sum(dim=1).to(
+                        device="cpu", dtype=torch.float64
+                    )
+                )
+        return torch.cat(chunks)

@@ -36,4 +36,29 @@ description: Operate the lm-svd checkout on the CIRC BlueHive cluster over SSH â
 - A dependent job whose parent fails stays pending with reason `DependencyNeverSatisfied`. Cancel it with `scancel <id>` after reporting.
 
 ## Pulling results
-- Analysis outputs: run `scripts/sync_circ_analysis.sh` locally (extra args go to rsync, e.g. `-n`). Single files: `rsync -avP circ:<repo root>/<path> <local path>`.
+Use the existing `scripts/sync_circ_analysis.sh` locally after the relevant jobs report `COMPLETED` with exit code `0:0`. Do not reimplement its rsync filters.
+
+### Scope and safety
+- The script pulls **all experiments'** `<experiment>/<run>/analysis/` trees from CIRC into local `data/experiment_results/`, preserving their directory layout. It is not restricted to the most recent jobs or exp2.
+- It downloads analysis metadata, SVD factors and plots, not `inference/` matrices, training checkpoints or Slurm logs. Request those separately only when needed.
+- Defaults: `REMOTE=circ`, `REMOTE_ROOT=/scratch/lli81/projects/ur_research/lm-svd`. Override these environment variables when targeting another checkout. The script resolves the local repo root itself.
+- Extra arguments go to rsync. The script uses `--delete`, so preview changes first. Use `--max-delete=0` when downloading to preserve local-only results; do not use `--delete-excluded` or delete unrelated local files to silence a warning.
+- `--max-delete=0` forbids deletions; rsync can exit with code 25 if deletions were skipped. Inspect the reported paths before proceeding, rather than rerunning without the guard.
+
+### Download
+```bash
+# Preview additions, updates and potential deletions.
+RSYNC_RSH='ssh -o BatchMode=yes' bash scripts/sync_circ_analysis.sh -n --itemize-changes
+
+# Download without deleting local-only files.
+RSYNC_RSH='ssh -o BatchMode=yes' bash scripts/sync_circ_analysis.sh --max-delete=0 --itemize-changes
+```
+
+Module-init noise is harmless. A `cannot delete non-empty directory` warning can arise for a local-only run whose contents are excluded from synchronization; leave that run intact and check rsync's exit status and the requested outputs.
+
+### Verify and report
+- For each requested run, check every expected centering under local `data/experiment_results/<experiment>/<run>/analysis/`. exp2 expects `none`, `global`, `row`, and `deflate1`, each containing `metadata.json`, `svd_U.npy`, `svd_S.npy`, `svd_Vt.npy`, and `svd_spectrum.png`.
+- Check `metadata.json`: `centering.strategy` matches the directory; `input.matrix_shape` matches the run. For current exp2, verify `input.inference_metadata.value` describes no-BOS PMI and `input.inference_metadata.source.kind` identifies the expected `parquet` or `token_stream` source; check its paths and sample IDs or sampled starts and settings against the requested run. The first token is unscored, and the history log probability cancels. Full wikitext and task-single-text Parquet matrices are `[512, 512]` and `[1309, 1309]`, respectively.
+- Load SVD factors with NumPy; check compatible dimensions and finite values, descending nonnegative singular values, and a readable spectrum plot. For byte-for-byte transfer verification, compare local and remote SHA-256 hashes of the downloaded files.
+- Report the local paths, datasets/centerings downloaded, verification and anything intentionally excluded. Do not claim inference matrices were downloaded by this script.
+- For a separately requested file, use `rsync -avP -e 'ssh -o BatchMode=yes' circ:<repo-root>/<path> <local-path>`.

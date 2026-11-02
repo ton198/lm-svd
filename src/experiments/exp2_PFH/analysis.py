@@ -14,7 +14,7 @@ from utils.common import save_json, save_numpy, write_atomic
 from utils.experiment_paths import ANALYSIS_DIR, INFERENCE_DIR
 
 
-MATRIX_NAME = "feature_log_prob.npy"
+MATRIX_NAME = "pmi.npy"
 FACTOR_NAMES = {"U": "svd_U.npy", "S": "svd_S.npy", "Vt": "svd_Vt.npy"}
 METADATA_NAME = "metadata.json"
 PLOT_NAME = "svd_spectrum.png"

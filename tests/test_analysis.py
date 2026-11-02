@@ -149,7 +149,7 @@ class AnalysisTests(unittest.TestCase):
                 result_dir = self.root / existing_name
                 inference = result_dir / "inference"
                 inference.mkdir(parents=True)
-                np.save(inference / "feature_log_prob.npy", self.matrix)
+                np.save(inference / "pmi.npy", self.matrix)
                 output = result_dir / "analysis" / "none"
                 output.mkdir(parents=True)
                 existing = output / existing_name
@@ -167,7 +167,7 @@ class AnalysisTests(unittest.TestCase):
         result_dir = self.root / "overwrite"
         inference = result_dir / "inference"
         inference.mkdir(parents=True)
-        matrix_path = inference / "feature_log_prob.npy"
+        matrix_path = inference / "pmi.npy"
         np.save(matrix_path, self.matrix)
         run_analysis(
             result_dir=result_dir, centering="none", device="cpu", overwrite=False
@@ -184,7 +184,7 @@ class AnalysisTests(unittest.TestCase):
 
     def test_missing_matrix_is_rejected(self) -> None:
         with self.assertRaisesRegex(
-            ValueError, r"matrix file does not exist: .*feature_log_prob\.npy"
+            ValueError, r"matrix file does not exist: .*pmi\.npy"
         ):
             run_analysis(
                 result_dir=self.root, centering="none", device="cpu", overwrite=False
@@ -207,7 +207,7 @@ class AnalysisTests(unittest.TestCase):
         result_dir = self.root / "zero-run"
         inference = result_dir / "inference"
         inference.mkdir(parents=True)
-        np.save(inference / "feature_log_prob.npy", matrix)
+        np.save(inference / "pmi.npy", matrix)
         with self.assertRaisesRegex(ValueError, "all singular values are zero"):
             run_analysis(
                 result_dir=result_dir, centering="none", device="cpu", overwrite=False
@@ -218,7 +218,7 @@ class AnalysisTests(unittest.TestCase):
         run = self.root / "exp2_PFH" / "wikitext__gpt2-small"
         inference = run / "inference"
         inference.mkdir(parents=True)
-        matrix_path = inference / "feature_log_prob.npy"
+        matrix_path = inference / "pmi.npy"
         np.save(matrix_path, self.matrix)
         (inference / "metadata.json").write_text(
             json.dumps({"fixture": True}), encoding="utf-8"
@@ -306,7 +306,7 @@ class AnalysisTests(unittest.TestCase):
     def test_each_experiment_reads_its_own_matrix(self) -> None:
         for module, matrix_name in (
             (exp1_analysis, "matrix.npy"),
-            (exp2_analysis, "feature_log_prob.npy"),
+            (exp2_analysis, "pmi.npy"),
             (exp3_analysis, "matrix.npy"),
         ):
             with self.subTest(experiment=module.__name__):

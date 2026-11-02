@@ -3,10 +3,37 @@ from pathlib import Path
 
 from data_pipline.cli import positive_int
 from utils.analysis import CENTERING_CHOICES
-from utils.experiment_paths import INFERENCE_DIR, add_run_arguments, dataset_samples_path, run_dir
+from utils.experiment_paths import (
+    DEFAULT_DATASET,
+    DEFAULT_RESULTS_ROOT,
+    INFERENCE_DIR,
+    dataset_samples_path,
+    run_dir,
+    token_stream_path,
+)
 
 
 EXPERIMENT = "exp2_PFH"
+
+
+def _add_source_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--dataset",
+        default=DEFAULT_DATASET,
+        help="Parquet sample set; loads data/history_future_samples/<dataset>.parquet",
+    )
+    group.add_argument(
+        "--stream",
+        default=None,
+        help="Token stream name; samples windows from data/token_streams/<stream>.npy",
+    )
+    parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=DEFAULT_RESULTS_ROOT,
+        help="Results root; run directory is <results-root>/<experiment>/<dataset>__<model>",
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -20,11 +47,23 @@ def main(argv: list[str] | None = None) -> None:
         help="Build the PFH matrix",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    add_run_arguments(inference_parser)
+    _add_source_arguments(inference_parser)
     inference_parser.add_argument("--model-path", type=Path, default=Path("models/gpt2-small"))
     inference_parser.add_argument("--device", default="cuda")
     inference_parser.add_argument("--history-count", type=positive_int, default=None)
     inference_parser.add_argument("--future-count", type=positive_int, default=None)
+    inference_parser.add_argument(
+        "--history-tokens", type=positive_int, default=None,
+        help="History window length with --stream (default: 64)",
+    )
+    inference_parser.add_argument(
+        "--future-tokens", type=positive_int, default=None,
+        help="Future window length with --stream (default: 32)",
+    )
+    inference_parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Sampling seed with --stream (default: 0)",
+    )
     inference_parser.add_argument(
         "--batch-size", type=positive_int, default=64, help="Inference batch size"
     )
@@ -34,7 +73,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Run SVD, rank, and visualization on the inference matrix",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    add_run_arguments(analysis_parser)
+    _add_source_arguments(analysis_parser)
     analysis_parser.add_argument(
         "--model-path", type=Path, default=Path("models/gpt2-small"),
         help="Model whose run to analyze; only its directory name is used",
@@ -46,9 +85,20 @@ def main(argv: list[str] | None = None) -> None:
     analysis_parser.add_argument("--device", default="cuda", help="Torch device for the float64 SVD")
     analysis_parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
     args = parser.parse_args(argv)
+    if args.command == "inference":
+        if args.stream is None:
+            if any(value is not None for value in (args.history_tokens, args.future_tokens, args.seed)):
+                parser.error("--history-tokens, --future-tokens and --seed require --stream")
+        elif args.history_count is None or args.future_count is None:
+            parser.error("--stream requires --history-count and --future-count")
+        else:
+            history_tokens = args.history_tokens or 64
+            future_tokens = args.future_tokens or 32
+            seed = 0 if args.seed is None else args.seed
+    label = args.stream if args.stream is not None else args.dataset
     try:
         result_dir = run_dir(
-            args.results_root, EXPERIMENT, args.dataset, args.model_path.name
+            args.results_root, EXPERIMENT, label, args.model_path.name
         )
         if args.command == "analysis":
             from .analysis import run_analysis
@@ -62,14 +112,25 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
             return
-        from .feature_logprob import build_exp2_pfh
+        from .feature_logprob import build_exp2_pfh, parquet_inputs, stream_inputs
 
+        if args.stream is not None:
+            inputs = stream_inputs(
+                token_stream_path(args.stream),
+                args.history_count,
+                args.future_count,
+                history_tokens,
+                future_tokens,
+                seed,
+            )
+        else:
+            inputs = parquet_inputs(
+                dataset_samples_path(args.dataset), args.history_count, args.future_count
+            )
         summary = build_exp2_pfh(
-            samples_path=dataset_samples_path(args.dataset),
+            inputs=inputs,
             model_path=args.model_path,
             device=args.device,
-            history_count=args.history_count,
-            future_count=args.future_count,
             batch_size=args.batch_size,
             output_dir=result_dir / INFERENCE_DIR,
             overwrite=args.overwrite,

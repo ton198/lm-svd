@@ -2,27 +2,90 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+import torch
 
 from utils.common import load_samples, save_json, save_numpy, write_atomic
 from utils.inference import CausalLMInference
+from utils.stream_neural_svd import TokenStream
+
+from .analysis import MATRIX_NAME
+
+
+PMI_VALUE = "pmi[h, f] = log p(h + f) - log p(h) - log p(f), no BOS: log p(x) = sum_{t>=2} log p(x_t | x_<t), so the first token of each sequence is unscored; log p(h) cancels, pmi = sum_t log p(f_t | h + f_<t) - sum_{t>=2} log p(f_t | f_<t)"
+
+
+@dataclass(frozen=True)
+class Exp2Inputs:
+    histories: list[list[int]]
+    futures: list[list[int]]
+    source: dict
+
+
+def parquet_inputs(
+    samples_path: Path, history_count: int | None, future_count: int | None
+) -> Exp2Inputs:
+    histories, futures = load_samples(samples_path, history_count, future_count)
+    source_metadata = pq.read_schema(samples_path).metadata or {}
+    raw_source_metadata = source_metadata.get(b"lm_svd")
+    return Exp2Inputs(
+        histories=[sample.token_ids for sample in histories],
+        futures=[sample.token_ids for sample in futures],
+        source={
+            "kind": "parquet",
+            "samples_path": str(samples_path),
+            "history_sample_ids": [sample.sample_id for sample in histories],
+            "future_sample_ids": [sample.sample_id for sample in futures],
+            "source_metadata": json.loads(raw_source_metadata) if raw_source_metadata else None,
+        },
+    )
+
+
+def stream_inputs(
+    stream_path: Path,
+    history_count: int,
+    future_count: int,
+    history_tokens: int,
+    future_tokens: int,
+    seed: int,
+) -> Exp2Inputs:
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
+    stream = TokenStream(stream_path)
+    generator = torch.Generator().manual_seed(seed)
+    history_starts = stream.sample_starts(history_count, history_tokens, generator)
+    future_starts = stream.sample_starts(future_count, future_tokens, generator)
+    return Exp2Inputs(
+        histories=stream.windows(history_starts, history_tokens).tolist(),
+        futures=stream.windows(future_starts, future_tokens).tolist(),
+        source={
+            "kind": "token_stream",
+            "stream_path": str(stream_path),
+            "stream_metadata": stream.metadata,
+            "history_tokens": history_tokens,
+            "future_tokens": future_tokens,
+            "seed": seed,
+            "sampling": "uniform window starts with replacement via TokenStream.sample_starts; histories then futures from torch.Generator().manual_seed(seed)",
+            "history_starts": history_starts.tolist(),
+            "future_starts": future_starts.tolist(),
+        },
+    )
 
 
 def build_exp2_pfh(
     *,
-    samples_path: Path,
+    inputs: Exp2Inputs,
     model_path: Path,
     device: str,
-    history_count: int | None,
-    future_count: int | None,
     batch_size: int,
     output_dir: Path,
     overwrite: bool,
 ) -> dict[str, int | str]:
-    outputs = [output_dir / "feature_log_prob.npy", output_dir / "metadata.json"]
+    outputs = [output_dir / MATRIX_NAME, output_dir / "metadata.json"]
     if not overwrite:
         for path in outputs:
             if path.exists():
@@ -30,47 +93,33 @@ def build_exp2_pfh(
                     f"output already exists: {path}; pass --overwrite to replace it"
                 )
 
-    histories, futures = load_samples(samples_path, history_count, future_count)
+    histories, futures = inputs.histories, inputs.futures
     inference = CausalLMInference(model_path, device)
-    bos = inference.bos_token_id
-    if bos is None:
-        raise ValueError(
-            "model config has no bos_token_id; exp2 joint log probability needs a sequence-start token"
-        )
     matrix = np.empty((len(histories), len(futures)), dtype=np.float64)
     started = time.perf_counter()
-    continuation_ids = [future.token_ids for future in futures]
+    future_log_probs = inference.sequence_log_probs(futures, batch_size).numpy()
     for history_index, history in enumerate(histories):
-        history_log_prob = inference.continuation_log_probs(
-            [bos], [history.token_ids], 1
-        )[0].item()
-        future_log_probs = inference.continuation_log_probs(
-            [bos, *history.token_ids], continuation_ids, batch_size
-        ).numpy()
-        matrix[history_index] = history_log_prob + future_log_probs
+        matrix[history_index] = (
+            inference.continuation_log_probs(history, futures, batch_size).numpy()
+            - future_log_probs
+        )
         print(
             f"history {history_index + 1}/{len(histories)} done, elapsed {time.perf_counter() - started:.1f}s",
             flush=True,
         )
 
-    source_metadata = pq.read_schema(samples_path).metadata or {}
-    raw_source_metadata = source_metadata.get(b"lm_svd")
     metadata = {
-        "samples_path": str(samples_path),
+        "source": inputs.source,
         "model_path": str(model_path),
         "device": device,
         "history_count": len(histories),
         "future_count": len(futures),
         "batch_size": batch_size,
-        "bos_token_id": bos,
-        "value": "log p(history + future | BOS) = sum_t log p(history_t | BOS + history_<t) + sum_t log p(future_t | BOS + history + future_<t)",
+        "value": PMI_VALUE,
         "rows": "histories",
         "columns": "futures",
         "matrix_shape": list(matrix.shape),
         "matrix_dtype": "float64",
-        "history_sample_ids": [sample.sample_id for sample in histories],
-        "future_sample_ids": [sample.sample_id for sample in futures],
-        "source_metadata": json.loads(raw_source_metadata) if raw_source_metadata else None,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     write_atomic(outputs[0], lambda tmp: save_numpy(tmp, matrix))
