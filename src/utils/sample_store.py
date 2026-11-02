@@ -153,7 +153,7 @@ def produce_blocks(*, store_dir: Path, model_path: Path, stream_path: Path, devi
 
             def save_slot(tmp: Path) -> None:
                 with tmp.open("wb") as handle:
-                    np.savez(handle, history_starts=hs.numpy(), future_starts=fs.numpy(),
+                    np.savez_compressed(handle, history_starts=hs.numpy(), future_starts=fs.numpy(),
                              states=states.to(torch.float16).cpu().numpy(),
                              sequence=np.int64(sequence), shard=np.int64(shard))
 

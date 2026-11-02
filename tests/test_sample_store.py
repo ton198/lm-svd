@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -73,6 +74,11 @@ class SampleStoreTests(unittest.TestCase):
         self.assertEqual(read_store_config(self.store_dir)["num_slots"], 3)
         self.assertEqual(read_shard_states(self.store_dir, 1)[0], {"next_sequence": 5, "filled": 3})
         for slot, sequence in enumerate((3, 4, 2)):
+            with zipfile.ZipFile(slot_path(self.store_dir, slot)) as archive:
+                self.assertTrue(all(
+                    member.compress_type == zipfile.ZIP_DEFLATED
+                    for member in archive.infolist()
+                ))
             with np.load(slot_path(self.store_dir, slot)) as data:
                 self.assertEqual(int(data["sequence"]), sequence)
                 self.assertEqual(int(data["shard"]), 0)
