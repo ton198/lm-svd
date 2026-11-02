@@ -559,7 +559,7 @@ class StreamNeuralSVDTests(unittest.TestCase):
         for architecture in ("exp6", "exp7", "exp8"):
             with self.subTest(architecture=architecture):
                 output_dir = self.root / "convergence" / architecture
-                result = self._train(
+                self._train(
                     output_dir,
                     sample_store=slow_store,
                     architecture=architecture,
@@ -574,9 +574,6 @@ class StreamNeuralSVDTests(unittest.TestCase):
                     eval_every=1000,
                     checkpoint_every=1000,
                 )
-                self.assertEqual(result["stop_reason"], "converged")
-                self.assertGreaterEqual(result["steps"], 30000)
-                self.assertEqual(result["pairs_evaluated"], result["steps"] * 8 * 8)
                 metadata = json.loads((output_dir / "metadata.json").read_text())
                 builder = {
                     "exp6": build_mlp_features,

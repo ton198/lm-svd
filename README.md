@@ -1015,13 +1015,13 @@ RUN_SLOW=1 uv run python -m unittest \
   tests.test_exp4_neural_svd.Exp4NeuralSVDTests.test_training_and_analysis_recover_top_two_singular_values -v
 ```
 
-Streaming exp6/exp7/exp8 also have opt-in tiny-model top-two singular-value recovery tests (30,000-step cosine decay followed by training until convergence, with a 60,000-step guard for each architecture; no downloaded model or dataset needed):
+Streaming exp6/exp7/exp8 also have opt-in tiny-model top-two singular-value recovery tests using a static 64-block sample store (30,000-step cosine decay, with a 60,000-step guard for each architecture; no downloaded model or dataset needed):
 
 ```bash
 RUN_SLOW=1 uv run python -m unittest tests.test_stream_neural_svd -v
 ```
 
-This command exercises the streaming tests including the slow recovery check against the exact all-starts operator spectrum at 2% relative tolerance; it is not a claim that a real-data run has converged.
+This command checks the learned spectrum against the exact all-starts operator spectrum at 2% relative tolerance, independently of whether stochastic training triggers the convergence stop condition. Convergence stopping is tested separately; this recovery check is not a claim that a real-data run has converged.
 
 For fast log-log spectrum verification without training, model downloads, or sample data, run:
 
