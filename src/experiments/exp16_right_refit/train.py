@@ -11,10 +11,10 @@ from .features import build_features
 
 
 def run_train(
-    *, result_dir: Path, source: str, variant: str, model_path: Path,
-    device: str, sample_store: Path | None, max_steps: int, lr: float, min_lr: float,
-    lr_decay_steps: int, eval_every: int, tol: float, patience: int,
-    convergence_rank: int, checkpoint_every: int, log_every: int,
+    *, result_dir: Path, source: str, variant: str, run_name: str | None, model_path: Path,
+    device: str, sample_store: Path | None, max_steps: int, lr: float, lr_schedule: str,
+    min_lr: float, lr_decay_steps: int, init_from: str | None, eval_every: int, tol: float,
+    patience: int, convergence_rank: int, checkpoint_every: int, log_every: int,
     seed: int, overwrite: bool,
 ) -> dict:
     from .cli import WIDE_RIGHT, WIDE_STUDENT
@@ -28,6 +28,9 @@ def run_train(
         raise ValueError(
             f"pinned {source} model {meta['model_path']} does not match --model-path {model_path}"
         )
+    run_name = run_name or f"{source}-{variant}"
+    if init_from == run_name:
+        raise ValueError(f"--init-from {init_from} must name another run than --run-name")
 
     source_model_path = Path(meta["model_path"])
     inference = CausalLMInference(source_model_path, device)
@@ -74,11 +77,14 @@ def run_train(
         convergence_rank=convergence_rank,
         checkpoint_every=checkpoint_every,
         lr=lr,
-        lr_schedule="cosine",
+        lr_schedule=lr_schedule,
         min_lr=min_lr,
         lr_decay_steps=lr_decay_steps,
         seed=seed,
         log_every=log_every,
-        output_dir=result_dir / f"{source}-{variant}" / TRAIN_DIR,
+        output_dir=result_dir / run_name / TRAIN_DIR,
         overwrite=overwrite,
+        init_checkpoint=(
+            None if init_from is None else result_dir / init_from / TRAIN_DIR / "checkpoint.pt"
+        ),
     )

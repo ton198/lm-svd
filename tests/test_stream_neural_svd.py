@@ -525,6 +525,39 @@ class StreamNeuralSVDTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checkpoint config mismatch.*rank"):
             self._train(output_dir, rank=3, max_steps=10)
 
+    def test_init_checkpoint_continues_another_run_with_constant_lr(self) -> None:
+        source_dir = self.root / "init_source"
+        self._train(source_dir, lr_schedule="cosine", lr_decay_steps=4, max_steps=4)
+        source_checkpoint = source_dir / "checkpoint.pt"
+        source_bytes = source_checkpoint.read_bytes()
+        source_history = np.load(source_dir / "loss_history.npy")
+
+        output_dir = self.root / "init_constant"
+        with self.assertRaisesRegex(ValueError, "requires lr_schedule constant"):
+            self._train(output_dir, lr_schedule="cosine", init_checkpoint=source_checkpoint)
+        with self.assertRaisesRegex(ValueError, "init checkpoint config mismatch.*rank"):
+            self._train(output_dir, rank=3, init_checkpoint=source_checkpoint)
+        result = self._train(
+            output_dir, lr=5e-4, max_steps=7, init_checkpoint=source_checkpoint, tol=1e-12
+        )
+        self.assertEqual(result["steps"], 7)
+        metadata = json.loads((output_dir / "metadata.json").read_text())
+        self.assertEqual(metadata["final_lr"], 5e-4)
+        self.assertEqual(metadata["init_step"], 4)
+        history = np.load(output_dir / "loss_history.npy")
+        self.assertEqual(len(history), 7)
+        np.testing.assert_array_equal(history[:4], source_history)
+        self.assertEqual(source_checkpoint.read_bytes(), source_bytes)
+
+        # The initialized run resumes from its own checkpoint, keeping its origin.
+        resumed = self._train(
+            output_dir, lr=5e-4, max_steps=9, init_checkpoint=source_checkpoint, tol=1e-12
+        )
+        self.assertEqual(resumed["steps"], 9)
+        self.assertEqual(json.loads((output_dir / "metadata.json").read_text())["init_step"], 4)
+        with self.assertRaisesRegex(ValueError, "checkpoint config mismatch.*init_checkpoint"):
+            self._train(output_dir, lr=5e-4, max_steps=11, tol=1e-12)
+
     @unittest.skipUnless(
         os.environ.get("RUN_SLOW") == "1",
         "convergence training is slow; set RUN_SLOW=1 to run it",

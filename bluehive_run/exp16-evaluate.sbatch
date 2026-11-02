@@ -25,5 +25,11 @@ nvidia-smi
 source .venv/bin/activate
 
 pair_batch="${PAIR_BATCH:-4096}"
-printf 'Running exp16 evaluate; log: %s/exp16-evaluate.out\n' "$log_dir"
-exp16 evaluate --device cuda --pair-batch "$pair_batch" --overwrite > "$log_dir/exp16-evaluate.out" 2>&1
+output_name="${OUTPUT_NAME:-direct}"
+eval_args=(--device cuda --pair-batch "$pair_batch" --output-name "$output_name" --overwrite)
+# Optional space-separated subsets, e.g. SOURCES=exp6 VARIANTS=continue EXTRA_RUNS=exp6-continue-constant.
+[[ -n "${SOURCES:-}" ]] && read -ra sources <<< "$SOURCES" && eval_args+=(--sources "${sources[@]}")
+[[ -n "${VARIANTS:-}" ]] && read -ra variants <<< "$VARIANTS" && eval_args+=(--variants "${variants[@]}")
+[[ -n "${EXTRA_RUNS:-}" ]] && read -ra extra_runs <<< "$EXTRA_RUNS" && eval_args+=(--extra-runs "${extra_runs[@]}")
+printf 'Running exp16 evaluate into analysis/%s; log: %s/exp16-evaluate.out\n' "$output_name" "$log_dir"
+exp16 evaluate "${eval_args[@]}" > "$log_dir/exp16-evaluate.out" 2>&1

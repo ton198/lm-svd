@@ -35,12 +35,15 @@ def main(argv: list[str] | None = None) -> None:
         elif command == "train":
             subparser.add_argument("--source", choices=SOURCES, required=True)
             subparser.add_argument("--variant", choices=VARIANTS, required=True)
+            subparser.add_argument("--run-name", default=None, help="Run directory name; defaults to <source>-<variant>")
             subparser.add_argument("--device", default="cuda")
             subparser.add_argument("--sample-store", type=Path, default=None, help="Teacher sample store directory; defaults to the pinned source's stream, model and token lengths")
             subparser.add_argument("--max-steps", type=positive_int, default=30000)
             subparser.add_argument("--lr", type=positive_float, default=1e-3)
+            subparser.add_argument("--lr-schedule", choices=("cosine", "constant"), default="cosine")
             subparser.add_argument("--min-lr", type=positive_float, default=1e-5)
             subparser.add_argument("--lr-decay-steps", type=positive_int, default=30000)
+            subparser.add_argument("--init-from", default=None, help="Start from another exp16 run's checkpoint (e.g. exp6-continue), keeping its step count; requires --lr-schedule constant")
             subparser.add_argument("--eval-every", type=positive_int, default=1000)
             subparser.add_argument("--tol", type=positive_float, default=1e-3)
             subparser.add_argument("--patience", type=positive_int, default=3)
@@ -53,6 +56,8 @@ def main(argv: list[str] | None = None) -> None:
             add_direct_arguments(subparser)
             subparser.add_argument("--sources", nargs="+", choices=SOURCES, default=list(SOURCES))
             subparser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
+            subparser.add_argument("--extra-runs", nargs="+", default=[], help="Additional exp16 run directory names to evaluate")
+            subparser.add_argument("--output-name", default="direct", help="Evaluation directory under analysis/")
             subparser.add_argument("--device", default="cuda")
             subparser.add_argument("--pair-batch", type=positive_int, default=4096)
             subparser.add_argument("--overwrite", action="store_true")
@@ -73,9 +78,10 @@ def main(argv: list[str] | None = None) -> None:
 
             summary = run_train(
                 result_dir=result_dir, source=args.source, variant=args.variant,
-                model_path=args.model_path, device=args.device, max_steps=args.max_steps,
-                sample_store=args.sample_store,
-                lr=args.lr, min_lr=args.min_lr, lr_decay_steps=args.lr_decay_steps,
+                run_name=args.run_name, model_path=args.model_path, device=args.device,
+                max_steps=args.max_steps, sample_store=args.sample_store,
+                lr=args.lr, lr_schedule=args.lr_schedule, min_lr=args.min_lr,
+                lr_decay_steps=args.lr_decay_steps, init_from=args.init_from,
                 eval_every=args.eval_every, tol=args.tol, patience=args.patience,
                 convergence_rank=args.convergence_rank, checkpoint_every=args.checkpoint_every,
                 log_every=args.log_every, seed=args.seed, overwrite=args.overwrite,
@@ -101,6 +107,8 @@ def main(argv: list[str] | None = None) -> None:
                         result_dir / f"{source}-{variant}" / TRAIN_DIR,
                         "experiments.exp16_right_refit.features",
                     )
+            for name in args.extra_runs:
+                runs[name] = (result_dir / name / TRAIN_DIR, "experiments.exp16_right_refit.features")
             reference_metadata = (
                 run_dir(args.results_root, EXPERIMENTS["exp6"][0], args.stream, args.model_path.name)
                 / "analysis" / "metadata.json"
@@ -119,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
                 tau_futures=args.tau_futures,
                 validation_pairs=args.validation_pairs,
                 validation_seed=args.validation_seed,
-                output_dir=result_dir / "analysis" / "direct",
+                output_dir=result_dir / "analysis" / args.output_name,
                 overwrite=args.overwrite,
             ))
     except (ValueError, FileExistsError) as error:

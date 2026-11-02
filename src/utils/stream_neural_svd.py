@@ -260,7 +260,15 @@ def train_stream_neural_svd(
     log_every: int,
     output_dir: Path,
     overwrite: bool,
+    init_checkpoint: Path | None = None,
 ) -> dict[str, int | float | str]:
+    """Train streaming NeuralSVD features, resuming ``output_dir/checkpoint.pt`` if present.
+
+    ``init_checkpoint`` starts a new run from another run's checkpoint: features, Adam
+    state, sampling generator, step count and loss history carry over, while the
+    learning-rate settings may differ and the convergence count restarts. It requires
+    the constant schedule because cosine decay is anchored at step 0.
+    """
     outputs = [
         output_dir / "features.pt",
         output_dir / "loss_history.npy",
@@ -272,6 +280,13 @@ def train_stream_neural_svd(
         raise ValueError(f"unknown lr_schedule: {lr_schedule}")
     if lr_schedule == "cosine" and min_lr >= lr:
         raise ValueError(f"min_lr {min_lr} must be smaller than lr {lr}")
+    if init_checkpoint is not None:
+        if lr_schedule != "constant":
+            raise ValueError("init_checkpoint requires lr_schedule constant")
+        if not init_checkpoint.is_file():
+            raise ValueError(f"init checkpoint does not exist: {init_checkpoint}")
+        if init_checkpoint.resolve() == checkpoint_path.resolve():
+            raise ValueError("init checkpoint must belong to another run")
     if probe_histories < rank:
         raise ValueError(
             f"probe_histories {probe_histories} must be at least rank {rank}"
@@ -352,6 +367,8 @@ def train_stream_neural_svd(
         "probe_seed": probe_seed,
         "features": features.config,
     }
+    if init_checkpoint is not None:
+        config["init_checkpoint"] = str(init_checkpoint)
     convergence_components = min(convergence_rank, rank)
     convergence_settings = {
         "eval_every": eval_every,
@@ -371,22 +388,30 @@ def train_stream_neural_svd(
     stable_evaluations = 0
     last_relative_change: float | None = None
     converged = False
-    if checkpoint_path.exists():
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        # Checkpoints written before convergence settings became resumable store them in config.
+    init_step: int | None = None
+    resuming = checkpoint_path.exists()
+    if resuming or init_checkpoint is not None:
+        load_path = checkpoint_path if resuming else init_checkpoint
+        checkpoint = torch.load(load_path, map_location="cpu", weights_only=True)
+        # Checkpoints written before convergence settings became resumable store them in config;
+        # initializing another run may also change its learning-rate settings.
+        ignored = {"eval_every", "tol", "patience"}
+        if not resuming:
+            ignored |= {"lr", "lr_schedule", "min_lr", "lr_decay_steps", "init_checkpoint"}
         saved_config = {
-            key: value
-            for key, value in checkpoint["config"].items()
-            if key not in ("eval_every", "tol", "patience")
+            key: value for key, value in checkpoint["config"].items() if key not in ignored
         }
-        if saved_config != config:
+        expected_config = {key: value for key, value in config.items() if key not in ignored}
+        if saved_config != expected_config:
             diffs = ", ".join(
-                f"{key}: {saved_config.get(key)!r} != {current!r}"
-                for key, current in config.items()
-                if saved_config.get(key) != current
+                f"{key}: {saved_config.get(key)!r} != {expected_config.get(key)!r}"
+                for key in sorted(saved_config.keys() | expected_config.keys())
+                if saved_config.get(key) != expected_config.get(key)
             )
             raise ValueError(
                 f"checkpoint config mismatch ({diffs}); pass --overwrite to start over"
+                if resuming
+                else f"init checkpoint config mismatch ({diffs})"
             )
         if "sample_store" not in checkpoint:
             print(f"checkpoint predates the sample store; continuing from {sample_store}", flush=True)
@@ -408,14 +433,19 @@ def train_stream_neural_svd(
         loss_history = checkpoint["loss_history"].tolist()
         entry_mean_square_sum = checkpoint["entry_mean_square_sum"]
         previous_singular_values = checkpoint["previous_singular_values"]
-        stable_evaluations = checkpoint["stable_evaluations"]
         last_relative_change = checkpoint["last_relative_change"]
-        converged = checkpoint["converged"]
-        print(f"resuming from step {step}", flush=True)
-        if checkpoint.get("convergence") != convergence_settings:
-            stable_evaluations = 0
-            converged = False
-            print("convergence settings changed; resetting probe stability count", flush=True)
+        if resuming:
+            init_step = checkpoint.get("init_step")
+            stable_evaluations = checkpoint["stable_evaluations"]
+            converged = checkpoint["converged"]
+            print(f"resuming from step {step}", flush=True)
+            if checkpoint.get("convergence") != convergence_settings:
+                stable_evaluations = 0
+                converged = False
+                print("convergence settings changed; resetting probe stability count", flush=True)
+        else:
+            init_step = step
+            print(f"initializing from {init_checkpoint} at step {step}", flush=True)
         del checkpoint
 
     static_metadata = {
@@ -460,6 +490,8 @@ def train_stream_neural_svd(
         "probe_histories": probe_histories,
         "probe_futures": probe_futures,
         "probe_seed": probe_seed,
+        "init_checkpoint": config.get("init_checkpoint"),
+        "init_step": init_step,
     }
 
     def save_checkpoint() -> None:
@@ -467,6 +499,7 @@ def train_stream_neural_svd(
             "config": config,
             "sample_store": reader.identity,
             "convergence": convergence_settings,
+            "init_step": init_step,
             "lr_schedule": lr_schedule_state,
             "step": step,
             "features": features.state_dict(),

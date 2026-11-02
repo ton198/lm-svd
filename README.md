@@ -927,9 +927,20 @@ uv run exp16 evaluate
 
 Pinning is a prerequisite for `exp16 train`. Its default sample store is derived from the pinned source metadata's stream, model directory name and history/future lengths, not from the current CLI run locator. Produce that matching store first or pass `--sample-store PATH` to select another compatible store.
 
-Training defaults to 30,000 steps with cosine learning-rate decay from `1e-3` to `1e-5` over 30,000 steps. Without `--overwrite`, matching checkpoints resume rather than restarting; completed outputs without a checkpoint require `--overwrite` to replace. Do not run overlapping jobs for the same source and variant. Evaluation refuses to replace existing output unless `--overwrite` is supplied.
+Training defaults to 30,000 steps with cosine learning-rate decay from `1e-3` to `1e-5` over 30,000 steps; `--lr-schedule constant` keeps `--lr` fixed. Without `--overwrite`, matching checkpoints resume rather than restarting; completed outputs without a checkpoint require `--overwrite` to replace. Do not run overlapping jobs for the same run directory. Evaluation refuses to replace existing output unless `--overwrite` is supplied.
 
-The default run is `data/experiment_results/exp16_right_refit/wikitext-103-train__gpt2-small/`: pinned snapshots are in `sources/<source>/train/`, trained refits in `<source>-<variant>/train/`, and evaluation writes `analysis/direct/{summary.json,layers.png,metadata.json}`. Source experiment results and exp15 results are not modified.
+To continue a finished refit in a new run directory, pass `--init-from <run>` (for example `exp6-continue`) with `--run-name` and `--lr-schedule constant`. The new run loads that run's `checkpoint.pt` (features, Adam state, sampling generator, step count and loss history) without modifying it; `--max-steps` counts total steps including the inherited ones, and `metadata.json` records `init_checkpoint` and `init_step`. Only the learning-rate settings may differ from the original run, and resuming the new run requires the same `--init-from`. Cosine schedules are rejected with `--init-from` because decay is anchored at step 0.
+
+```bash
+uv run exp16 train --source exp6 --variant continue --run-name exp6-continue-constant \
+  --init-from exp6-continue --lr-schedule constant --lr 1e-3 --max-steps 60000
+uv run exp16 evaluate --sources exp6 --variants continue \
+  --extra-runs exp6-continue-constant --output-name continue-constant
+```
+
+`evaluate --extra-runs` adds exp16 run directories by name, and `--output-name` selects the directory under `analysis/` (default `direct`) so subset evaluations do not replace the full comparison.
+
+The default run is `data/experiment_results/exp16_right_refit/wikitext-103-train__gpt2-small/`: pinned snapshots are in `sources/<source>/train/`, trained refits in `<source>-<variant>/train/` (or `<run-name>/train/`), and evaluation writes `analysis/<output-name>/{summary.json,layers.png,metadata.json}`. Source experiment results and exp15 results are not modified.
 
 On BlueHive, after installing `.venv` and preparing the models, streams and source snapshots, pin on the login node and submit from the repository root:
 
@@ -947,7 +958,14 @@ done
 sbatch --dependency="afterok:$(IFS=:; echo "${ids[*]}")" bluehive_run/exp16-evaluate.sbatch
 ```
 
-Training requires `SOURCE` and `VARIANT`, accepts `MAX_STEPS`, and runs on `preempt` with requeue and appended logs; it omits `--overwrite` so requeued jobs resume. The evaluation job runs only after all six succeed, uses `PAIR_BATCH=4096` by default (set `PAIR_BATCH=2048` for lower GPU memory), and passes `--overwrite` for its evaluation output.
+Training requires `SOURCE` and `VARIANT`, accepts `MAX_STEPS`, `RUN_NAME`, `LR_SCHEDULE` and `INIT_FROM`, and runs on `preempt` with requeue and appended logs; it omits `--overwrite` so requeued jobs resume. The evaluation job runs only after all six succeed, uses `PAIR_BATCH=4096` by default (set `PAIR_BATCH=2048` for lower GPU memory), accepts `SOURCES`, `VARIANTS`, `EXTRA_RUNS` and `OUTPUT_NAME`, and passes `--overwrite` for its evaluation output.
+
+```bash
+RUN_NAME=exp6-continue-constant INIT_FROM=exp6-continue LR_SCHEDULE=constant MAX_STEPS=60000 \
+  SOURCE=exp6 VARIANT=continue sbatch bluehive_run/exp16-train.sbatch
+SOURCES=exp6 VARIANTS=continue EXTRA_RUNS=exp6-continue-constant OUTPUT_NAME=continue-constant \
+  sbatch bluehive_run/exp16-evaluate.sbatch
+```
 
 ## Python inference API
 

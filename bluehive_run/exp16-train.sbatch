@@ -28,9 +28,14 @@ source .venv/bin/activate
 source="${SOURCE:?set SOURCE}"
 variant="${VARIANT:?set VARIANT}"
 max_steps="${MAX_STEPS:-30000}"
+run_name="${RUN_NAME:-${source}-${variant}}"
+train_args=(--source "$source" --variant "$variant" --run-name "$run_name" --device cuda --max-steps "$max_steps")
+# Optional: LR_SCHEDULE=constant INIT_FROM=exp6-continue starts from that run's checkpoint.
+[[ -n "${LR_SCHEDULE:-}" ]] && train_args+=(--lr-schedule "$LR_SCHEDULE")
+[[ -n "${INIT_FROM:-}" ]] && train_args+=(--init-from "$INIT_FROM")
 
 # No --overwrite: resume the latest checkpoint instead of discarding training.
-printf 'Running exp16 train for %s %s; log (appended): %s/exp16-%s-%s.out\n' "$source" "$variant" "$log_dir" "$source" "$variant"
+printf 'Running exp16 train for %s; log (appended): %s/exp16-%s.out\n' "$run_name" "$log_dir" "$run_name"
 # Near the time limit, requeue this job; the next run resumes from train/checkpoint.pt.
 requeue() {
     printf 'Time limit near; requeueing job %s\n' "$SLURM_JOB_ID"
@@ -38,5 +43,5 @@ requeue() {
 }
 trap requeue USR1
 # Append: requeues reuse the job ID and log directory.
-exp16 train --source "$source" --variant "$variant" --device cuda --max-steps "$max_steps" >> "$log_dir/exp16-${source}-${variant}.out" 2>&1 &
+exp16 train "${train_args[@]}" >> "$log_dir/exp16-${run_name}.out" 2>&1 &
 wait $!
