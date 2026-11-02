@@ -6,7 +6,7 @@ from data_pipline.cli import positive_float, positive_int
 from utils.experiment_paths import (
     ANALYSIS_DIR, DEFAULT_RESULTS_ROOT, DEFAULT_STREAM, TRAIN_DIR, run_dir, token_stream_path,
 )
-from utils.stream_cli import add_stream_analysis_arguments, add_stream_train_arguments
+from utils.stream_cli import add_stream_analysis_arguments, add_stream_train_arguments, resolve_sample_store
 
 
 EXPERIMENT = "exp11_stream_student"
@@ -148,6 +148,7 @@ def run_cli(argv: list[str] | None, *, prog: str, experiment: str, distilled: bo
             features.trunk.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
         summary = train_stream_neural_svd(
             features=features, inference=inference, stream=stream, stream_path=stream_path,
+            sample_store=resolve_sample_store(args),
             model_path=args.model_path, device=args.device, rank=args.rank, nesting=args.nesting,
             history_tokens=args.history_tokens, future_tokens=args.future_tokens,
             history_batch=args.history_batch, future_batch=args.future_batch,

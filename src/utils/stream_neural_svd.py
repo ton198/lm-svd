@@ -51,26 +51,47 @@ def centered_unembedding(inference: CausalLMInference) -> torch.Tensor:
     return embeddings - embeddings.mean(dim=0, keepdim=True)
 
 
-def centered_logit_block(
-    inference: CausalLMInference,
-    token_matrix: torch.Tensor,
-    history_ids: torch.Tensor,
-    future_ids: torch.Tensor,
+@torch.no_grad()
+def teacher_hidden_grid(
+    inference, history_ids: torch.Tensor, future_ids: torch.Tensor, *, pair_batch: int
 ) -> torch.Tensor:
+    history_ids = history_ids.to(inference.device)
+    future_ids = future_ids.to(inference.device)
     history_count, history_length = history_ids.shape
     future_count, future_length = future_ids.shape
-    # Histories are the outer axis; futures vary fastest within each history.
-    pairs = torch.cat(
-        (
-            history_ids[:, None, :].expand(-1, future_count, -1),
-            future_ids[None, :, :].expand(history_count, -1, -1),
-        ),
-        dim=-1,
-    ).reshape(history_count * future_count, history_length + future_length)
-    states = inference.final_hidden_states(pairs)[:, -1]
-    return (states @ token_matrix.T).view(
-        history_count, future_count * token_matrix.shape[0]
+    hidden_size = inference.model.get_output_embeddings().weight.shape[1]
+    if future_length == 0:
+        result = torch.empty((1, history_count, hidden_size), dtype=torch.float32, device=inference.device)
+        for start in range(0, history_count, pair_batch):
+            result[0, start : start + pair_batch] = inference.final_hidden_states(
+                history_ids[start : start + pair_batch]
+            )[:, -1]
+        return result
+
+    result = torch.empty(
+        (future_count, history_count, hidden_size), dtype=torch.float32, device=inference.device
     )
+    future_batch = max(1, pair_batch // history_count)
+    for start in range(0, future_count, future_batch):
+        futures = future_ids[start : start + future_batch]
+        count = len(futures)
+        pairs = torch.cat(
+            (
+                history_ids[None, :, :].expand(count, -1, -1),
+                futures[:, None, :].expand(-1, history_count, -1),
+            ),
+            dim=-1,
+        ).reshape(count * history_count, history_length + future_length)
+        result[start : start + count] = inference.final_hidden_states(pairs)[:, -1].reshape(
+            count, history_count, hidden_size
+        )
+    return result
+
+
+def centered_logit_block(states: torch.Tensor, token_matrix: torch.Tensor) -> torch.Tensor:
+    # states: (histories, futures, hidden); columns are future first, vocabulary second.
+    histories, futures, _ = states.shape
+    return (states @ token_matrix.T).reshape(histories, futures * token_matrix.shape[0])
 
 
 def column_features(weights: torch.Tensor, token_matrix: torch.Tensor) -> torch.Tensor:
@@ -213,6 +234,7 @@ def train_stream_neural_svd(
     inference: CausalLMInference,
     stream: TokenStream,
     stream_path: Path,
+    sample_store: Path,
     model_path: Path,
     device: str,
     rank: int,
@@ -273,6 +295,21 @@ def train_stream_neural_svd(
             raise ValueError(
                 f"token stream contains id {min_token} outside vocabulary {inference.vocab_size}"
             )
+
+    from utils.sample_store import SampleStoreReader
+
+    reader = SampleStoreReader(
+        sample_store,
+        model_path=model_path,
+        stream_path=stream_path,
+        stream=stream,
+        hidden_size=inference.model.get_output_embeddings().weight.shape[1],
+        vocab_size=inference.vocab_size,
+        history_tokens=history_tokens,
+        future_tokens=future_tokens,
+        history_batch=history_batch,
+        future_batch=future_batch,
+    )
 
     if overwrite:
         for path in [*outputs, checkpoint_path]:
@@ -351,6 +388,19 @@ def train_stream_neural_svd(
             raise ValueError(
                 f"checkpoint config mismatch ({diffs}); pass --overwrite to start over"
             )
+        if "sample_store" not in checkpoint:
+            print(f"checkpoint predates the sample store; continuing from {sample_store}", flush=True)
+        elif checkpoint["sample_store"] != reader.identity:
+            saved_store = checkpoint["sample_store"]
+            current_store = reader.identity
+            diffs = ", ".join(
+                f"{key}: {saved_store.get(key)!r} != {current_store.get(key)!r}"
+                for key in sorted(saved_store.keys() | current_store.keys())
+                if saved_store.get(key) != current_store.get(key)
+            )
+            raise ValueError(
+                f"checkpoint sample store mismatch ({diffs}); pass --overwrite to start over"
+            )
         features.load_state_dict(checkpoint["features"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         generator.set_state(checkpoint["generator"])
@@ -371,6 +421,7 @@ def train_stream_neural_svd(
     static_metadata = {
         "stream_path": str(stream_path),
         "model_path": str(model_path),
+        "sample_store": reader.identity,
         "device": device,
         "stream_tokens": len(stream),
         "stream_metadata": stream.metadata,
@@ -414,6 +465,7 @@ def train_stream_neural_svd(
     def save_checkpoint() -> None:
         payload = {
             "config": config,
+            "sample_store": reader.identity,
             "convergence": convergence_settings,
             "lr_schedule": lr_schedule_state,
             "step": step,
@@ -461,6 +513,7 @@ def train_stream_neural_svd(
     convergence_start = lr_decay_steps if lr_schedule == "cosine" else 0
     current_lr = optimizer.param_groups[0]["lr"]
     started = time.perf_counter()
+    reader.wait_until_ready()
     while (
         not (converged and step >= convergence_start)
         and (max_steps is None or step < max_steps)
@@ -479,13 +532,10 @@ def train_stream_neural_svd(
         )
         for group in optimizer.param_groups:
             group["lr"] = current_lr
-        batch_history_starts = stream.sample_starts(
-            history_batch, history_tokens, generator
-        )
-        batch_future_starts = stream.sample_starts(future_batch, future_tokens, generator)
+        batch_history_starts, batch_future_starts, states = reader.sample(generator)
         history_ids = stream.windows(batch_history_starts, history_tokens).to(device)
         future_ids = stream.windows(batch_future_starts, future_tokens).to(device)
-        block = centered_logit_block(inference, token_matrix, history_ids, future_ids)
+        block = centered_logit_block(states.to(device=device, dtype=torch.float32), token_matrix)
         loss = loss_fn(
             features.row_features(history_ids),
             column_features(features.column_weights(future_ids), token_matrix),

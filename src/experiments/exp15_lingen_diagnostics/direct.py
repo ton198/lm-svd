@@ -11,7 +11,7 @@ import torch
 
 from utils.experiment_paths import token_stream_path
 from utils.inference import CausalLMInference
-from utils.stream_neural_svd import TokenStream, centered_unembedding, load_trained_features
+from utils.stream_neural_svd import TokenStream, centered_unembedding, load_trained_features, teacher_hidden_grid
 
 from .diagnostics import (
     accumulate_metrics,
@@ -23,7 +23,6 @@ from .diagnostics import (
     optimal_left,
     orthonormal_basis,
     prepare_output_dir,
-    teacher_hidden_grid,
     write_outputs,
 )
 

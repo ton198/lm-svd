@@ -573,7 +573,7 @@ Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv
 
 ## Experiments 6, 7, 8, 9, and 10: streaming full-vocabulary NeuralSVD
 
-These independent experiments replace exp4's per-sample lookup tables with functions of token content. Each step independently draws fresh history and future window starts **uniformly with replacement** from the token stream (duplicates are allowed). Histories and futures are not required to be adjacent in the original text. Every sampled future contributes **all vocabulary tokens** (50,257 for GPT-2); there is no top-k selection, secondary centering, or first-component removal.
+These independent experiments replace exp4's per-sample lookup tables with functions of token content. A shared teacher sample store supplies each training step with a randomly selected block and randomly selected history/future subsets. Producers draw window starts uniformly with replacement from the token stream (duplicates are allowed); blocks may be reused until overwritten. Histories and futures need not be adjacent in the original text. Every sampled future contributes **all vocabulary tokens** (50,257 for GPT-2); there is no top-k selection, secondary centering, or first-component removal.
 
 ```text
 A[h, (f, z)] = logit(z | h + f) - mean_vocabulary(logits | h + f)
@@ -581,14 +581,24 @@ A[h, (f, z)] = logit(z | h + f) - mean_vocabulary(logits | h + f)
 (T v)(h) = E_{f,z}[A[h, (f, z)] v(f, z)]
 ```
 
-Here `h` and `f` have independent uniform-start window distributions, `z` is uniform over the vocabulary, and `s` is GPT-2's final hidden state. The bias-free centered-unembedding identity computes the exact full-vocabulary block without storing the infinite table. The teacher model is frozen; NestedLoRA with Adam trains the feature functions.
+Here `h` and `f` have independent uniform-start window distributions, `z` is uniform over the vocabulary, and `s` is GPT-2's final hidden state. The centered-unembedding identity projects stored hidden states into a full-vocabulary block without storing the infinite table; float16 storage makes these training targets approximate. The teacher model is frozen; NestedLoRA with Adam trains the feature functions.
 
 ### Prepare a token stream and run
 
-Download the local model and WikiText source as above, then tokenize the entire split once:
+Download the local model and WikiText source as above, then tokenize the entire split once. Start a producer in a separate terminal and leave it running while training; inspect its progress with `status`:
 
 ```bash
 uv run data-pipline build-token-stream
+uv run sample-store produce --device cuda
+```
+
+```bash
+uv run sample-store status
+```
+
+Once the store exists, run training and analysis:
+
+```bash
 uv run exp6 train
 uv run exp6 analysis
 uv run exp7 train
@@ -602,6 +612,16 @@ uv run exp10 analysis
 ```
 
 The builder defaults to `--dataset-dir data/original/wikitext --config wikitext-103-raw-v1 --split train --tokenizer-path models/gpt2-small --output data/token_streams/wikitext-103-train.npy`. It writes a 1-D integer `.npy` token stream and sibling `.json` with tokenizer, vocabulary, split, dtype, and token-count metadata. Use `--overwrite` to replace them. Training memory-maps the array; it does not use the Parquet history/future sample tables. For another stream, write `data/token_streams/NAME.npy` and its JSON, and pass `--stream NAME`. Use a tokenizer matching the teacher model.
+
+### Shared teacher sample store
+
+Streaming `train` for exp6–exp13 and exp16 uses the same store when model, stream and window lengths match. Producers run GPT-2 in float32 and store final-position hidden states in float16, together with history and future starts, in a rolling ring of blocks (default 64 histories × 64 futures). Consumers reconstruct windows from their token stream and project sampled states with the centered unembedding. Only target-grid teacher inference is removed from these training steps: exp6 still runs frozen GPT-2 forwards to encode its individual history and future windows.
+
+The default capacity is 64 GiB of sample payload (slot-file overhead is additional); set `sample-store produce --max-gib` to change it at creation. The default directory is `data/sample_stores/<stream>__<model-directory-name>__h<history-tokens>-f<future-tokens>`; with the defaults it is `data/sample_stores/wikitext-103-train__gpt2-small__h64-f32`. Use `--store-dir PATH` for producer/status commands and `--sample-store PATH` for training to select another directory. Producer and consumer model, stream and window settings must match, and training batches must fit the block dimensions.
+
+Training waits until the store contains at least 64 blocks, or its entire capacity if smaller; it may then reuse blocks while producers replace old ones. Start a producer before training: a missing store is an error, while an existing underfilled store causes training to wait. The shard count is fixed when the store is created. To change it or another store configuration, stop **all** producers before using `sample-store produce --overwrite` to recreate the store; never overwrite a store while producers are active.
+
+Fixed probes and their exact-reference analysis, exp11 distillation, exp15, LinGen evaluation, and the finite-sample exp1–exp5/exp14 workflows remain outside this store and retain their existing teacher behavior.
 
 All five experiments default to `--stream wikitext-103-train`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; `--device cpu` is supported. Shared training defaults, except exp10's fixed joint nesting:
 
@@ -618,9 +638,9 @@ All five experiments default to `--stream wikitext-103-train`, `--model-path mod
 
 `--probe-histories` must be at least the rank, and the concatenated history/future must fit the teacher's context.
 
-- **exp6** (`exp6_stream_gpt2_mlp`): frozen GPT-2 encodes each window; concatenate the final-token hidden state and mean hidden state. Separate left/right MLPs use non-affine LayerNorm, two GELU hidden layers, and output heads. `--mlp-width 1024` controls both hidden layers. GPT-2 weights are neither optimized nor saved in the feature state.
-- **exp7** (`exp7_stream_transformer`): separate history/future Transformers train from scratch on token IDs, with learned token/position embeddings, pre-norm layers, GELU, no dropout, and unmasked attention within each window. Concatenated final-token/mean pooling feeds left/right linear heads. Defaults are `--model-dim 256 --layers 4 --heads 4`; model dimension must be divisible by heads. GPT-2 only supplies the target blocks and centered token embeddings.
-- **exp8** (`exp8_stream_token_mlp`): independent history/future token embeddings and MLPs train from scratch. Each window's embeddings are concatenated in position order into `window_tokens * embedding_dim` features, preserving order without additional positional encoding. Defaults are `--embedding-dim 256 --mlp-width 1024`. Each MLP uses non-affine LayerNorm, two `Linear → GELU` hidden layers, and a left rank-output or right rank-times-teacher-hidden-size output head, matching exp6's MLP structure. GPT-2 does not compute the input features: it only supplies target blocks, centered token embeddings, and their vocabulary/hidden-size and token-RMS information.
+- **exp6** (`exp6_stream_gpt2_mlp`): frozen GPT-2 encodes each window; concatenate the final-token hidden state and mean hidden state. These encoder forwards remain in training, although the target grid comes from the store. Separate left/right MLPs use non-affine LayerNorm, two GELU hidden layers, and output heads. `--mlp-width 1024` controls both hidden layers. GPT-2 weights are neither optimized nor saved in the feature state.
+- **exp7** (`exp7_stream_transformer`): separate history/future Transformers train from scratch on token IDs, with learned token/position embeddings, pre-norm layers, GELU, no dropout, and unmasked attention within each window. Concatenated final-token/mean pooling feeds left/right linear heads. Defaults are `--model-dim 256 --layers 4 --heads 4`; model dimension must be divisible by heads. GPT-2 supplies the stored targets and centered token embeddings.
+- **exp8** (`exp8_stream_token_mlp`): independent history/future token embeddings and MLPs train from scratch. Each window's embeddings are concatenated in position order into `window_tokens * embedding_dim` features, preserving order without additional positional encoding. Defaults are `--embedding-dim 256 --mlp-width 1024`. Each MLP uses non-affine LayerNorm, two `Linear → GELU` hidden layers, and a left rank-output or right rank-times-teacher-hidden-size output head, matching exp6's MLP structure. GPT-2 does not compute the input features: it supplies stored targets, centered token embeddings, and their vocabulary/hidden-size and token-RMS information.
 - **exp9** (`exp9_stream_sentence_mlp`): decode each entire GPT-2 history/future window to text, then encode it with frozen `sentence-transformers/all-MiniLM-L6-v2`, attention-mask mean pooling, and L2 normalization into one 384-dimensional vector. Windows may cross sentence boundaries or start inside words; no splitting or repair is applied. Defaults are `--encoder-path models/all-MiniLM-L6-v2 --max-seq-length 256 --mlp-width 1024`. MiniLM retokenization truncates at this sequence limit. One shared float32 encoder stays in eval mode, outside feature parameters, state dicts, and module counts; independent left/right MLPs use exp6's structure with 384-dimensional inputs. Both the local GPT-2 tokenizer and MiniLM model/tokenizer are required. Encoder path and architecture are saved in `features` metadata, so analysis needs no encoder flags.
 - **exp10** (`exp10_stream_sentence_mlp_joint`): exp9's control with identical frozen MiniLM features, trainable MLPs, and training defaults, except NestedLoRA nesting is fixed to `joint` (equal weights on all prefixes, `step=1`). `exp10 train --nesting sequential` is rejected before creating outputs; use exp9 for sequential nesting. The CLI and analysis feature builder are reused from exp9, not copied.
 
@@ -668,6 +688,8 @@ uv run exp9 train --rank 4 --history-batch 4 --future-batch 4 \
 
 The capped runs report `stop_reason: max_steps`; continuation prints `resuming from step 20`. This is a feasibility smoke, not a convergence claim. Training automatically restores feature weights, Adam moments, sampling RNG, loss history, and probe-stability state from `train/checkpoint.pt`.
 
+Checkpoint metadata records the sample store identity; a checkpoint with a different store is rejected. A legacy checkpoint without store identity can resume from the selected compatible store.
+
 BlueHive sentence-MLP templates are `bluehive_run/exp9-{train,analysis}.sbatch` and `bluehive_run/exp10-{train,analysis}.sbatch`. Submit from the repository root after provisioning the local models and stream. Training intentionally omits `--overwrite` to resume checkpoints; analysis reads the encoder path from training metadata.
 
 Cosine decay starts at step 0 without warmup, reaches `--min-lr` after `--lr-decay-steps` (30,000 by default), and holds that rate until convergence. It does not stop before the decay endpoint even if the probe stabilizes earlier; resuming does not restart or extend the decay. `--lr-schedule constant` stops on convergence without a decay wait. The optional `--max-steps` caps either schedule. Probe stability means the maximum relative change among the leading `--convergence-rank` singular values in learned order stays below `--tol` for `--patience` evaluations. The convergence rank defaults to 32 and is capped at `--rank`; this stability check is not an exact-reference accuracy criterion.
@@ -710,7 +732,18 @@ Run exp6, exp7, exp8, and exp9 with the same stream, rank, history/future window
 
 ### BlueHive
 
-Prepare `.venv`, the local GPT-2 model, the MiniLM encoder for exp9/exp10, and token-stream `.npy`/`.json` on the cluster, then submit from the repository root:
+Prepare `.venv`, the local GPT-2 model, the MiniLM encoder for exp9/exp10, and token-stream `.npy`/`.json` on the cluster. Start the two producer shards from the repository root, then check status before submitting training:
+
+```bash
+mkdir -p bluehive_run/logs
+for k in 0 1; do SHARDS=2 SHARD=$k sbatch --parsable bluehive_run/sample-store-produce.sbatch; done
+source .venv/bin/activate
+sample-store status
+```
+
+Both producers share the default 64 GiB store, each owns a distinct shard, and requeues resume production. The script requests an A100 on `preempt`; override the GPU at submission if needed. Wait for at least 64 total blocks before training, or submit earlier and let the consumers wait. Keep `SHARDS=2` for this store; stop all producers before any recreation with `--overwrite`.
+
+Submit training and analysis from the repository root:
 
 ```bash
 mkdir -p bluehive_run/logs
@@ -783,7 +816,7 @@ These experiments learn the streaming full-vocabulary operator above using one s
 
 Thus exp11 versus exp12 is the distillation ablation, and exp11 versus exp13 is the skip ablation. Defaults are rank 64, `--model-dim 256 --layers 4 --heads 4 --max-positions 96`, and `--column-dim 256`. At these defaults with GPT-2 Small, trainable parameter counts are 12,080,960 for exp11/exp12 and 12,212,800 for exp13, excluding the frozen unembedding and teacher. History and future windows must each fit within `--max-positions`.
 
-Prepare the local GPT-2 model and token stream as for exp6–exp10, then run:
+Prepare the local GPT-2 model, token stream and shared sample store as for exp6–exp10, then run:
 
 ```bash
 uv run exp11 distill
@@ -803,7 +836,7 @@ Both exp11 and exp13 default to that same exp11 `distill/student.pt`. Their trai
 
 Each experiment writes its streaming snapshot under its own `<results-root>/<experiment>/<stream>__<model-directory-name>/train/`, including `features.pt`, loss history, probe, metadata and resumable checkpoint as described for exp6–exp10. Training metadata records the student configuration, skip, initialization and checkpoint provenance, plus trainable parameter counts. A training resume restores its saved features and requires compatible configuration; `--overwrite` restarts instead. Each experiment also supports `analysis`; use matching run-location flags and see `uv run exp11 --help` or `uv run expN train --help` for options.
 
-On BlueHive, submit from the repository root after provisioning `.venv`, GPT-2 and the token stream. exp11 and exp13 must wait for successful distillation; exp12 can train independently:
+On BlueHive, submit from the repository root after provisioning `.venv`, GPT-2, the token stream and the shared store producers above. exp11 and exp13 must wait for successful distillation; exp12 can train independently:
 
 ```bash
 mkdir -p bluehive_run/logs
@@ -889,6 +922,8 @@ uv run exp16 evaluate
 ```
 
 `pin` reads the source run directories without modifying them and copies their training metadata, features and probe into exp16. It checks for changes during copying and records the source step and feature checksum in `pin.json`. Existing pins are skipped, never overwritten; to select a newer snapshot, remove the relevant exp16 pinned directory and pin it again before starting its refits. Use `--sources` to select a subset; evaluation also accepts `--variants`. All commands accept `--stream`, `--results-root` and `--model-path`, which must identify the intended source runs.
+
+Pinning is a prerequisite for `exp16 train`. Its default sample store is derived from the pinned source metadata's stream, model directory name and history/future lengths, not from the current CLI run locator. Produce that matching store first or pass `--sample-store PATH` to select another compatible store.
 
 Training defaults to 30,000 steps with cosine learning-rate decay from `1e-3` to `1e-5` over 30,000 steps. Without `--overwrite`, matching checkpoints resume rather than restarting; completed outputs without a checkpoint require `--overwrite` to replace. Do not run overlapping jobs for the same source and variant. Evaluation refuses to replace existing output unless `--overwrite` is supplied.
 

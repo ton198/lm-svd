@@ -15,43 +15,6 @@ from utils.lingen import compare_distributions
 TOPK_KEYS = ("1", "5", "10", "50")
 
 
-@torch.no_grad()
-def teacher_hidden_grid(
-    inference, history_ids: torch.Tensor, future_ids: torch.Tensor, *, pair_batch: int
-) -> torch.Tensor:
-    history_ids = history_ids.to(inference.device)
-    future_ids = future_ids.to(inference.device)
-    history_count, history_length = history_ids.shape
-    future_count, future_length = future_ids.shape
-    hidden_size = inference.model.get_output_embeddings().weight.shape[1]
-    if future_length == 0:
-        result = torch.empty((1, history_count, hidden_size), dtype=torch.float32, device=inference.device)
-        for start in range(0, history_count, pair_batch):
-            result[0, start : start + pair_batch] = inference.final_hidden_states(
-                history_ids[start : start + pair_batch]
-            )[:, -1]
-        return result
-
-    result = torch.empty(
-        (future_count, history_count, hidden_size), dtype=torch.float32, device=inference.device
-    )
-    future_batch = max(1, pair_batch // history_count)
-    for start in range(0, future_count, future_batch):
-        futures = future_ids[start : start + future_batch]
-        count = len(futures)
-        pairs = torch.cat(
-            (
-                history_ids[None, :, :].expand(count, -1, -1),
-                futures[:, None, :].expand(-1, history_count, -1),
-            ),
-            dim=-1,
-        ).reshape(count * history_count, history_length + future_length)
-        result[start : start + count] = inference.final_hidden_states(pairs)[:, -1].reshape(
-            count, history_count, hidden_size
-        )
-    return result
-
-
 def history_gram(states: torch.Tensor, token_gram: torch.Tensor) -> torch.Tensor:
     gram = torch.zeros((states.shape[1], states.shape[1]), dtype=torch.float64, device=states.device)
     token_gram = token_gram.double()

@@ -12,11 +12,10 @@ from experiments.exp15_lingen_diagnostics.diagnostics import (
     fit_temperature,
     history_gram,
     optimal_left,
-    teacher_hidden_grid,
 )
 from experiments.exp15_lingen_diagnostics.surrogate import anchored_constrained_solve
 from utils.inference import CausalLMInference
-from utils.stream_neural_svd import centered_logit_block, centered_unembedding
+from utils.stream_neural_svd import centered_logit_block, centered_unembedding, teacher_hidden_grid
 
 
 class _TableFeatures(nn.Module):
@@ -62,7 +61,7 @@ class LinGenDiagnosticsTests(unittest.TestCase):
         self.assertEqual(states.dtype, torch.float32)
         self.assertEqual(states.device, self.inference.device)
         logits = (states @ self.token_matrix.T).permute(1, 0, 2).reshape(5, -1)
-        block = centered_logit_block(self.inference, self.token_matrix, self.histories, self.futures)
+        block = centered_logit_block(states.permute(1, 0, 2), self.token_matrix)
         torch.testing.assert_close(logits, block, atol=1e-5, rtol=0)
 
         gram = history_gram(states, self.token_gram)

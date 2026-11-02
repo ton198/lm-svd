@@ -36,6 +36,7 @@ exp14 = "experiments.exp14_paper_lingen.cli:main"
 exp15 = "experiments.exp15_lingen_diagnostics.cli:main"
 exp16 = "experiments.exp16_right_refit.cli:main"
 lingen = "experiments.lingen.cli:main"
+sample-store = "utils.sample_store_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]

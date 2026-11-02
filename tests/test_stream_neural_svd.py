@@ -1,9 +1,11 @@
 import json
 import math
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -18,6 +20,7 @@ from experiments.exp8_stream_token_mlp.features import (
     build_features as build_token_mlp_features,
 )
 from utils.inference import CausalLMInference
+from utils.sample_store import produce_blocks, slot_bytes
 from utils.stream_neural_svd import (
     TokenStream,
     centered_logit_block,
@@ -26,6 +29,7 @@ from utils.stream_neural_svd import (
     learned_probe_spectrum,
     leading_relative_change,
     probe_reference,
+    teacher_hidden_grid,
     train_stream_neural_svd,
 )
 
@@ -86,6 +90,25 @@ class StreamNeuralSVDTests(unittest.TestCase):
         cls.stream = TokenStream(cls.stream_path)
         cls.inference = CausalLMInference(cls.model_path, "cpu")
         cls.token_matrix = centered_unembedding(cls.inference)
+        cls.store_dir = cls.root / "store"
+        produce_blocks(
+            store_dir=cls.store_dir,
+            model_path=cls.model_path,
+            stream_path=cls.stream_path,
+            device="cpu",
+            history_tokens=3,
+            future_tokens=2,
+            block_histories=4,
+            block_futures=3,
+            max_bytes=6 * slot_bytes(4, 3, 8),
+            shards=1,
+            shard=0,
+            seed=0,
+            pair_batch=12,
+            max_blocks=6,
+            log_every=100,
+            overwrite=False,
+        )
 
     def _train(
         self,
@@ -143,6 +166,7 @@ class StreamNeuralSVDTests(unittest.TestCase):
             inference=self.inference,
             stream=self.stream,
             stream_path=self.stream_path,
+            sample_store=self.store_dir,
             model_path=self.model_path,
             device="cpu",
             rank=rank,
@@ -224,7 +248,8 @@ class StreamNeuralSVDTests(unittest.TestCase):
         histories = self.stream.windows(torch.tensor([0, 3, 6, 9]), 3)
         futures = self.stream.windows(torch.tensor([0, 4, 10]), 2)
         block = centered_logit_block(
-            self.inference, self.token_matrix, histories, futures
+            teacher_hidden_grid(self.inference, histories, futures, pair_batch=64).permute(1, 0, 2),
+            self.token_matrix,
         )
         self.assertEqual(block.shape, (4, 3 * 11))
         for h, history in enumerate(histories):
@@ -473,6 +498,27 @@ class StreamNeuralSVDTests(unittest.TestCase):
                         np.testing.assert_array_equal(left[name], right[name])
                         self.assertEqual(left[name].dtype, np.int64)
 
+    def test_resume_accepts_pre_store_checkpoint_and_rejects_other_store(self) -> None:
+        output_dir = self.root / "store_resume"
+        self._train(output_dir, max_steps=4)
+        checkpoint_path = output_dir / "checkpoint.pt"
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        del checkpoint["sample_store"]
+        torch.save(checkpoint, checkpoint_path)
+        result = self._train(output_dir, max_steps=6)
+        self.assertEqual(result["steps"], 6)
+        other_store = self.root / "other_store"
+        shutil.copytree(self.store_dir, other_store)
+        with self.assertRaisesRegex(ValueError, "checkpoint sample store mismatch.*store_dir"):
+            self._train(output_dir, max_steps=8, sample_store=other_store)
+
+    def test_exp8_training_does_not_run_teacher_for_targets(self) -> None:
+        with patch.object(
+            self.inference, "final_hidden_states", side_effect=AssertionError("teacher called")
+        ):
+            result = self._train(self.root / "exp8_store_only", architecture="exp8", max_steps=2)
+        self.assertEqual(result["steps"], 2)
+
     def test_resume_rejects_changed_rank(self) -> None:
         output_dir = self.root / "rank_mismatch"
         self._train(output_dir, max_steps=4)
@@ -484,6 +530,25 @@ class StreamNeuralSVDTests(unittest.TestCase):
         "convergence training is slow; set RUN_SLOW=1 to run it",
     )
     def test_both_architectures_recover_all_starts_operator_top_two(self) -> None:
+        slow_store = self.root / "slow_store"
+        produce_blocks(
+            store_dir=slow_store,
+            model_path=self.model_path,
+            stream_path=self.stream_path,
+            device="cpu",
+            history_tokens=3,
+            future_tokens=2,
+            block_histories=8,
+            block_futures=8,
+            max_bytes=64 * slot_bytes(8, 8, 8),
+            shards=1,
+            shard=0,
+            seed=0,
+            pair_batch=64,
+            max_blocks=64,
+            log_every=100,
+            overwrite=False,
+        )
         histories = self.stream.windows(torch.arange(10), 3)
         futures = self.stream.windows(torch.arange(11), 2)
         dense = self._dense_probe(histories, futures)
@@ -496,6 +561,7 @@ class StreamNeuralSVDTests(unittest.TestCase):
                 output_dir = self.root / "convergence" / architecture
                 result = self._train(
                     output_dir,
+                    sample_store=slow_store,
                     architecture=architecture,
                     mlp_width=64,
                     history_batch=8,

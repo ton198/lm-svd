@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 
 from data_pipline.cli import positive_float, positive_int
-from utils.experiment_paths import DEFAULT_RESULTS_ROOT, DEFAULT_STREAM
+from utils.experiment_paths import DEFAULT_RESULTS_ROOT, DEFAULT_STREAM, sample_store_dir
 
 
 def add_stream_train_arguments(parser: argparse.ArgumentParser) -> None:
@@ -32,6 +32,13 @@ def add_stream_train_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=0, help="Training random seed")
     parser.add_argument("--log-every", type=positive_int, default=100, help="Steps between training log lines")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs and start over")
+    parser.add_argument("--sample-store", type=Path, default=None, help="Teacher sample store directory; default data/sample_stores/<stream>__<model>__h<H>-f<F>")
+
+
+def resolve_sample_store(args: argparse.Namespace) -> Path:
+    if args.sample_store is not None:
+        return args.sample_store
+    return sample_store_dir(args.stream, args.model_path.name, args.history_tokens, args.future_tokens)
 
 
 def add_stream_analysis_arguments(parser: argparse.ArgumentParser) -> None:

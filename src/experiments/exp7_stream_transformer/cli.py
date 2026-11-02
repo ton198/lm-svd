@@ -2,7 +2,7 @@ import argparse
 
 from data_pipline.cli import positive_int
 from utils.experiment_paths import ANALYSIS_DIR, TRAIN_DIR, run_dir, token_stream_path
-from utils.stream_cli import add_stream_analysis_arguments, add_stream_train_arguments
+from utils.stream_cli import add_stream_analysis_arguments, add_stream_train_arguments, resolve_sample_store
 
 
 EXPERIMENT = "exp7_stream_transformer"
@@ -76,6 +76,7 @@ def main(argv: list[str] | None = None) -> None:
             inference=inference,
             stream=stream,
             stream_path=stream_path,
+            sample_store=resolve_sample_store(args),
             model_path=args.model_path,
             device=args.device,
             rank=args.rank,

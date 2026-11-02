@@ -36,6 +36,7 @@ def main(argv: list[str] | None = None) -> None:
             subparser.add_argument("--source", choices=SOURCES, required=True)
             subparser.add_argument("--variant", choices=VARIANTS, required=True)
             subparser.add_argument("--device", default="cuda")
+            subparser.add_argument("--sample-store", type=Path, default=None, help="Teacher sample store directory; defaults to the pinned source's stream, model and token lengths")
             subparser.add_argument("--max-steps", type=positive_int, default=30000)
             subparser.add_argument("--lr", type=positive_float, default=1e-3)
             subparser.add_argument("--min-lr", type=positive_float, default=1e-5)
@@ -73,6 +74,7 @@ def main(argv: list[str] | None = None) -> None:
             summary = run_train(
                 result_dir=result_dir, source=args.source, variant=args.variant,
                 model_path=args.model_path, device=args.device, max_steps=args.max_steps,
+                sample_store=args.sample_store,
                 lr=args.lr, min_lr=args.min_lr, lr_decay_steps=args.lr_decay_steps,
                 eval_every=args.eval_every, tol=args.tol, patience=args.patience,
                 convergence_rank=args.convergence_rank, checkpoint_every=args.checkpoint_every,

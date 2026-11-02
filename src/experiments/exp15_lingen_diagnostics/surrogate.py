@@ -10,14 +10,13 @@ import torch
 
 from experiments.exp14_paper_lingen.lingen import neural_svd_coefficients, neural_svd_system
 from experiments.exp6_stream_gpt2_mlp.features import build_features
-from utils.stream_neural_svd import centered_unembedding, load_trained_features
+from utils.stream_neural_svd import centered_unembedding, load_trained_features, teacher_hidden_grid
 
 from .diagnostics import (
     accumulate_metrics,
     finalize_metrics,
     new_metric_totals,
     prepare_output_dir,
-    teacher_hidden_grid,
     write_outputs,
 )
 

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from utils.experiment_paths import TRAIN_DIR
+from utils.experiment_paths import TRAIN_DIR, sample_store_dir
 from utils.inference import CausalLMInference
 from utils.stream_neural_svd import TokenStream, train_stream_neural_svd
 
@@ -12,7 +12,7 @@ from .features import build_features
 
 def run_train(
     *, result_dir: Path, source: str, variant: str, model_path: Path,
-    device: str, max_steps: int, lr: float, min_lr: float,
+    device: str, sample_store: Path | None, max_steps: int, lr: float, min_lr: float,
     lr_decay_steps: int, eval_every: int, tol: float, patience: int,
     convergence_rank: int, checkpoint_every: int, log_every: int,
     seed: int, overwrite: bool,
@@ -32,6 +32,10 @@ def run_train(
     source_model_path = Path(meta["model_path"])
     inference = CausalLMInference(source_model_path, device)
     stream_path = Path(meta["stream_path"])
+    if sample_store is None:
+        sample_store = sample_store_dir(
+            stream_path.stem, source_model_path.name, meta["history_tokens"], meta["future_tokens"]
+        )
     stream = TokenStream(stream_path)
     torch.manual_seed(seed)
     right = {} if variant == "continue" else (WIDE_STUDENT if source == "exp11" else WIDE_RIGHT)
@@ -51,6 +55,7 @@ def run_train(
         inference=inference,
         stream=stream,
         stream_path=stream_path,
+        sample_store=sample_store,
         model_path=source_model_path,
         device=device,
         rank=meta["rank"],
