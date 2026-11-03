@@ -20,6 +20,30 @@ METADATA_NAME = "metadata.json"
 PLOT_NAME = "svd_spectrum.png"
 
 
+def pairing_diagnostics(matrix: np.ndarray) -> dict:
+    n = matrix.shape[0]
+    diagonal = np.diag(matrix)
+    off = matrix[~np.eye(n, dtype=bool)]
+    row_rank = 1 + (matrix > diagonal[:, None]).sum(axis=1)
+    column_rank = 1 + (matrix > diagonal[None, :]).sum(axis=0)
+    diagonal_mean = float(np.mean(diagonal))
+    off_mean = float(np.mean(off)) if n >= 2 else None
+    return {
+        "diagonal": "matched pairs: future i is the continuation of history i",
+        "matrix": "stored uncentered PMI matrix; identical for every --centering",
+        "diagonal_mean": diagonal_mean,
+        "diagonal_std": float(np.std(diagonal)),
+        "off_diagonal_mean": off_mean,
+        "off_diagonal_std": float(np.std(off)) if n >= 2 else None,
+        "mean_gap": diagonal_mean - off_mean if off_mean is not None else None,
+        "row_top1": float(np.mean(row_rank == 1)),
+        "column_top1": float(np.mean(column_rank == 1)),
+        "row_mean_rank": float(np.mean(row_rank)),
+        "column_mean_rank": float(np.mean(column_rank)),
+        "rank_rule": "rank = 1 + number of entries in the row (column) strictly greater than the diagonal entry",
+    }
+
+
 def run_analysis(*, result_dir: Path, centering: str, device: str, overwrite: bool) -> str:
     inference_dir = result_dir / INFERENCE_DIR
     matrix_path = inference_dir / MATRIX_NAME
@@ -43,6 +67,13 @@ def run_analysis(*, result_dir: Path, centering: str, device: str, overwrite: bo
     )
     matrix = np.load(matrix_path)
     m, n = matrix.shape
+    source = (inference_metadata or {}).get("source") or {}
+    if source.get("pairing") == "adjacent":
+        if m != n:
+            raise ValueError(f"adjacent pairing requires a square matrix, got {m} x {n}")
+        pairing = pairing_diagnostics(matrix)
+    else:
+        pairing = None
     svd, svd_summary = compute_svd(matrix, centering=centering, device=device)
     spectrum, loglog_fit = visualize_svd(
         svd.S, rank_tolerance=svd.rank_tolerance, matrix_shape=(m, n), plot_path=plot_path
@@ -66,6 +97,17 @@ def run_analysis(*, result_dir: Path, centering: str, device: str, overwrite: bo
         "spectrum": spectrum,
         "loglog_fit": loglog_fit,
     }
+    pairing_line = ""
+    if pairing is not None:
+        metadata["pairing_diagnostics"] = pairing
+        d, o, g = (
+            f"{value:.4g}" if value is not None else "n/a"
+            for value in (pairing["diagonal_mean"], pairing["off_diagonal_mean"], pairing["mean_gap"])
+        )
+        pairing_line = (
+            f"pairing: diagonal mean {d}, off-diagonal mean {o}, gap {g}; "
+            f"top-1 row {pairing['row_top1']:.3f}, column {pairing['column_top1']:.3f}\n"
+        )
     write_atomic(metadata_path, lambda tmp: save_json(tmp, metadata))
     return (
         f"output_dir: {output_dir}\n"
@@ -76,6 +118,7 @@ def run_analysis(*, result_dir: Path, centering: str, device: str, overwrite: bo
         f"reconstruction relative error {svd_summary['reconstruction_relative_error']:.3e}\n"
         f"rank: {svd.rank} (tolerance {svd.rank_tolerance:.6g})\n"
         f"loglog fit: {format_log_log_fit(loglog_fit)}\n"
+        f"{pairing_line}"
         f"metadata: {metadata_path}\n"
         f"plot: {plot_path}"
     )

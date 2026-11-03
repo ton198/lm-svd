@@ -30,6 +30,10 @@ def _add_source_arguments(parser: argparse.ArgumentParser) -> None:
         help="Token stream name; selects windows from its shared sample store",
     )
     parser.add_argument(
+        "--pairing", choices=("independent", "adjacent"), default="independent",
+        help="With --stream: 'independent' uses the store's future starts; 'adjacent' uses the tokens right after each history as its future, so diagonal entries are matched pairs",
+    )
+    parser.add_argument(
         "--results-root",
         type=Path,
         default=DEFAULT_RESULTS_ROOT,
@@ -90,6 +94,8 @@ def main(argv: list[str] | None = None) -> None:
     analysis_parser.add_argument("--device", default="cuda", help="Torch device for the float64 SVD")
     analysis_parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
     args = parser.parse_args(argv)
+    if args.stream is None and args.pairing == "adjacent":
+        parser.error("--pairing adjacent requires --stream")
     if args.command == "inference":
         if args.stream is None:
             if args.sample_store is not None:
@@ -99,10 +105,14 @@ def main(argv: list[str] | None = None) -> None:
         elif args.history_count is None or args.future_count is None:
             parser.error("--stream requires --history-count and --future-count")
         else:
+            if args.pairing == "adjacent" and args.history_count != args.future_count:
+                parser.error("--pairing adjacent requires --history-count equal to --future-count")
             history_tokens = args.history_tokens or 64
             future_tokens = args.future_tokens or 32
             seed = 0 if args.seed is None else args.seed
     label = args.stream if args.stream is not None else args.dataset
+    if args.pairing == "adjacent":
+        label = f"{label}-adjacent"
     try:
         result_dir = run_dir(
             args.results_root, EXPERIMENT, label, args.model_path.name
@@ -137,6 +147,7 @@ def main(argv: list[str] | None = None) -> None:
                 history_tokens=history_tokens,
                 future_tokens=future_tokens,
                 seed=seed,
+                pairing=args.pairing,
             )
         else:
             inputs = parquet_inputs(

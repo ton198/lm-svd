@@ -126,6 +126,7 @@ class Exp2PFHTests(unittest.TestCase):
         kwargs = dict(
             store_dir=store_dir, stream_path=stream_path, model_path=self.model_path,
             history_count=5, future_count=3, history_tokens=4, future_tokens=3, seed=5,
+            pairing="independent",
         )
         inputs = sample_store_inputs(**kwargs)
         self.assertEqual(inputs, sample_store_inputs(**kwargs))
@@ -166,6 +167,72 @@ class Exp2PFHTests(unittest.TestCase):
                                           for start in future_starts])
         with self.assertRaisesRegex(ValueError, "seed must be non-negative"):
             sample_store_inputs(**{**kwargs, "seed": -1})
+
+    def test_adjacent_pairing_uses_store_history_continuations(self) -> None:
+        stream_path = self.root / "adjacent-stream.npy"
+        store_dir = self.root / "adjacent-store"
+        tokens = (np.arange(40) % 11).astype(np.uint16)
+        np.save(stream_path, tokens)
+        stream_path.with_suffix(".json").write_text(
+            json.dumps({"vocab_size": 11}), encoding="utf-8"
+        )
+        produce_blocks(
+            store_dir=store_dir, model_path=self.model_path, stream_path=stream_path,
+            device="cpu", history_tokens=4, future_tokens=3, block_histories=2,
+            block_futures=2, max_bytes=2 * slot_bytes(2, 2, 8), shards=1, shard=0,
+            seed=11, pair_batch=4, max_blocks=2, log_every=100, overwrite=False,
+        )
+        kwargs = dict(
+            store_dir=store_dir, stream_path=stream_path, model_path=self.model_path,
+            history_count=3, future_count=3, history_tokens=4, future_tokens=3,
+            seed=5, pairing="adjacent",
+        )
+        inputs = sample_store_inputs(**kwargs)
+        self.assertEqual(inputs, sample_store_inputs(**kwargs))
+        source = inputs.source
+        self.assertEqual(source["pairing"], "adjacent")
+        generator = torch.Generator().manual_seed(5)
+        starts = []
+        for block in source["blocks"]:
+            slot = int(torch.randint(2, (1,), generator=generator))
+            rows = torch.randperm(2, generator=generator).tolist()[:3 - len(starts)]
+            torch.randperm(2, generator=generator)
+            begin = len(starts)
+            with np.load(slot_path(store_dir, slot)) as data:
+                self.assertEqual(block["slot"], slot)
+                self.assertEqual(block["history_indices"], rows)
+                starts.extend(data["history_starts"][rows].tolist())
+            self.assertEqual(block["future_indices"], [])
+            self.assertEqual(block["history_range"], [begin, len(starts)])
+            self.assertEqual(block["future_range"], block["history_range"])
+        self.assertEqual(source["history_starts"], starts)
+        self.assertEqual(source["future_starts"], [start + 4 for start in starts])
+        self.assertEqual(inputs.histories, [tokens[start:start + 4].tolist() for start in starts])
+        self.assertEqual(inputs.futures, [tokens[start + 4:start + 7].tolist() for start in starts])
+        with self.assertRaisesRegex(ValueError, "adjacent pairing requires history_count == future_count"):
+            sample_store_inputs(**{**kwargs, "future_count": 2})
+        with self.assertRaisesRegex(ValueError, "unknown pairing: bogus"):
+            sample_store_inputs(**{**kwargs, "pairing": "bogus"})
+
+    def test_adjacent_pairing_rejects_history_without_continuation(self) -> None:
+        stream_path = self.root / "short-adjacent-stream.npy"
+        store_dir = self.root / "short-adjacent-store"
+        np.save(stream_path, (np.arange(11) % 11).astype(np.uint16))
+        stream_path.with_suffix(".json").write_text(
+            json.dumps({"vocab_size": 11}), encoding="utf-8"
+        )
+        produce_blocks(
+            store_dir=store_dir, model_path=self.model_path, stream_path=stream_path,
+            device="cpu", history_tokens=4, future_tokens=8, block_histories=2,
+            block_futures=2, max_bytes=slot_bytes(2, 2, 8), shards=1, shard=0,
+            seed=11, pair_batch=4, max_blocks=1, log_every=100, overwrite=False,
+        )
+        with self.assertRaisesRegex(ValueError, "has no 8-token continuation"):
+            sample_store_inputs(
+                store_dir=store_dir, stream_path=stream_path, model_path=self.model_path,
+                history_count=1, future_count=1, history_tokens=4, future_tokens=8,
+                seed=0, pairing="adjacent",
+            )
 
     def test_existing_output_requires_overwrite_before_model_load(self) -> None:
         output = self.root / "existing"

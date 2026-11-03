@@ -258,6 +258,7 @@ class AnalysisTests(unittest.TestCase):
                     reconstructed, expected[centering], atol=1e-5
                 )
                 metadata = json.loads((output / "metadata.json").read_text())
+                self.assertNotIn("pairing_diagnostics", metadata)
                 self.assertEqual(
                     list(metadata),
                     ["input", "centering", "svd", "rank", "spectrum", "loglog_fit"],
@@ -302,6 +303,45 @@ class AnalysisTests(unittest.TestCase):
             ])
         with self.assertRaisesRegex(ValueError, "unknown centering"):
             compute_svd(self.matrix, centering="bogus", device="cpu")
+
+    def test_exp2_adjacent_analysis_reports_pairing_diagnostics(self) -> None:
+        run = self.root / "adjacent"
+        inference = run / "inference"
+        inference.mkdir(parents=True)
+        matrix = np.array([[5, 1, 0], [2, 4, 6], [0, 3, -1]], dtype=np.float64)
+        np.save(inference / "pmi.npy", matrix)
+        (inference / "metadata.json").write_text(
+            json.dumps({"source": {"pairing": "adjacent"}}), encoding="utf-8"
+        )
+        summary = run_analysis(result_dir=run, centering="none", device="cpu", overwrite=False)
+        metadata = json.loads((run / "analysis" / "none" / "metadata.json").read_text())
+        pairing = metadata["pairing_diagnostics"]
+        expected = {
+            "diagonal_mean": 8 / 3,
+            "diagonal_std": np.std([5, 4, -1]),
+            "off_diagonal_mean": 2.0,
+            "off_diagonal_std": np.std([1, 0, 2, 6, 0, 3]),
+            "mean_gap": 2 / 3,
+            "row_top1": 1 / 3,
+            "column_top1": 2 / 3,
+            "row_mean_rank": 2.0,
+            "column_mean_rank": 5 / 3,
+        }
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertAlmostEqual(pairing[key], value)
+        self.assertIn("pairing: diagonal mean", summary)
+
+        nonsquare = self.root / "adjacent-nonsquare"
+        nonsquare_inference = nonsquare / "inference"
+        nonsquare_inference.mkdir(parents=True)
+        np.save(nonsquare_inference / "pmi.npy", np.ones((2, 3)))
+        (nonsquare_inference / "metadata.json").write_text(
+            json.dumps({"source": {"pairing": "adjacent"}}), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValueError, "adjacent pairing requires a square matrix, got 2 x 3"):
+            run_analysis(result_dir=nonsquare, centering="none", device="cpu", overwrite=False)
+        self.assertFalse((nonsquare / "analysis").exists())
 
     def test_each_experiment_reads_its_own_matrix(self) -> None:
         for module, matrix_name in (

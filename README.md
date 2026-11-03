@@ -321,6 +321,18 @@ uv run exp2 analysis --device cpu --stream "$STREAM" --centering none
 
 `--sample-store` is optional; by default the directory is derived from stream, model directory name and window lengths, here `data/sample_stores/wikitext-103-train__gpt2-small__h64-f32`. Produce a compatible store first using `sample-store produce` (see the shared store section below). With default model and results root, this run is stored under `data/experiment_results/exp2_PFH/wikitext-103-train__gpt2-small/`. Analysis uses the same stream, model and results root to locate the run; it does not consume the store.
 
+`--pairing independent` is the default: histories and futures use the store's separately persisted starts. With `--pairing adjacent`, histories still use persisted history starts, but future `i` is the `future_tokens` tokens immediately after history `i` (`future_starts = history_starts + history_tokens`). Adjacent inference requires `--stream` and equal history/future counts. It still scores the full matrix: diagonal entries are matched continuations and off-diagonal entries are mismatched. A selected history without enough continuation tokens raises an error; choose another `--seed`.
+
+Pass `--pairing adjacent` to both inference and analysis. Adjacent runs use `<results-root>/exp2_PFH/<stream>-adjacent__<model-directory-name>/`, leaving independent runs untouched:
+
+```bash
+uv run exp2 inference --device cpu --stream "$STREAM" --pairing adjacent \
+  --sample-store "$STORE" --history-count 6 --future-count 6 --batch-size 3 --seed 5
+uv run exp2 analysis --device cpu --stream "$STREAM" --pairing adjacent --centering none
+```
+
+Adjacent analysis adds `pairing_diagnostics` to metadata and a `pairing:` summary line: diagonal/off-diagonal means and population standard deviations, mean gap, row/column top-1 fractions, and mean ranks. Ranks count entries strictly greater than the diagonal entry, so ties share the best rank. These diagnostics describe the stored uncentered PMI matrix and are identical across centerings; independent and Parquet runs omit them.
+
 On CIRC BlueHive, `bluehive_run/exp2-inference.sbatch` and `bluehive_run/exp2-analysis.sbatch` both request partition `h100`, QoS `h100`, and one H100 GPU. They retain 4 CPUs and 16G memory, with 6 hours for inference and 1 hour for analysis. Submit from the repository root with matching `DATASET` values and an `afterok` dependency; analysis runs all four centering modes. Both scripts overwrite existing outputs, so cancel any older jobs for the same dataset before resubmitting.
 
 ### Small CPU smoke run
@@ -586,6 +598,7 @@ Other useful options:
 - `exp1 inference --top-k K`: select K header tokens per future; default 50.
 - `exp2 inference --batch-size N`: score N futures per inference batch; default 64.
 - `exp2 --stream NAME`: select a shared-store stream instead of a dataset for inference or analysis. Inference accepts `--sample-store PATH` (optional store override), `--history-tokens`, `--future-tokens`, and consumer selection `--seed`.
+- `exp2 --pairing {independent,adjacent}`: select stream pairing for inference and analysis; default `independent`. Adjacent inference requires equal counts and analysis uses the separate adjacent run directory.
 - `inference --device cpu`: use CPU instead of the default CUDA device.
 
 Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv run exp3 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>`, `uv run python -m experiments.exp2_PFH <subcommand>`, and `uv run python -m experiments.exp3_L_M_diff <subcommand>`.

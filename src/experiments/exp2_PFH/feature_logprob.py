@@ -56,7 +56,12 @@ def sample_store_inputs(
     history_tokens: int,
     future_tokens: int,
     seed: int,
+    pairing: str,
 ) -> Exp2Inputs:
+    if pairing not in ("independent", "adjacent"):
+        raise ValueError(f"unknown pairing: {pairing}")
+    if pairing == "adjacent" and history_count != future_count:
+        raise ValueError("adjacent pairing requires history_count == future_count")
     if seed < 0:
         raise ValueError("seed must be non-negative")
     if history_count <= 0 or future_count <= 0:
@@ -64,8 +69,8 @@ def sample_store_inputs(
     stream = TokenStream(stream_path)
     config = read_store_config(store_dir)
     history_batch = min(history_count, config["block_histories"])
-    future_batch = min(future_count, config["block_futures"])
-    if history_batch <= 0 or future_batch <= 0:
+    future_batch = min(future_count, config["block_futures"]) if pairing == "independent" else 0
+    if history_batch <= 0 or config["block_futures"] <= 0:
         raise ValueError("sample store block dimensions must be positive")
     reader = SampleStoreReader(
         store_dir, model_path=model_path, stream_path=stream_path, stream=stream,
@@ -79,21 +84,42 @@ def sample_store_inputs(
     future_parts = []
     blocks = []
     histories_read = futures_read = 0
-    while histories_read < history_count or futures_read < future_count:
-        hs, fs, block = reader.sample_starts(generator)
-        hs = hs[:history_count - histories_read]
-        fs = fs[:future_count - futures_read]
-        block["history_indices"] = block["history_indices"][:len(hs)]
-        block["future_indices"] = block["future_indices"][:len(fs)]
-        block["history_range"] = [histories_read, histories_read + len(hs)]
-        block["future_range"] = [futures_read, futures_read + len(fs)]
-        history_parts.append(hs)
-        future_parts.append(fs)
-        histories_read += len(hs)
-        futures_read += len(fs)
-        blocks.append(block)
-    history_starts = torch.cat(history_parts)
-    future_starts = torch.cat(future_parts)
+    if pairing == "independent":
+        while histories_read < history_count or futures_read < future_count:
+            hs, fs, block = reader.sample_starts(generator)
+            hs = hs[:history_count - histories_read]
+            fs = fs[:future_count - futures_read]
+            block["history_indices"] = block["history_indices"][:len(hs)]
+            block["future_indices"] = block["future_indices"][:len(fs)]
+            block["history_range"] = [histories_read, histories_read + len(hs)]
+            block["future_range"] = [futures_read, futures_read + len(fs)]
+            history_parts.append(hs)
+            future_parts.append(fs)
+            histories_read += len(hs)
+            futures_read += len(fs)
+            blocks.append(block)
+        history_starts = torch.cat(history_parts)
+        future_starts = torch.cat(future_parts)
+    else:
+        limit = len(stream) - history_tokens - future_tokens
+        while histories_read < history_count:
+            hs, _, block = reader.sample_starts(generator)
+            hs = hs[:history_count - histories_read]
+            block["history_indices"] = block["history_indices"][:len(hs)]
+            invalid = hs[hs > limit]
+            if len(invalid):
+                start = int(invalid[0])
+                raise ValueError(
+                    f"history start {start} has no {future_tokens}-token continuation in the stream; choose another --seed"
+                )
+            block["future_indices"] = []
+            block["history_range"] = [histories_read, histories_read + len(hs)]
+            block["future_range"] = [histories_read, histories_read + len(hs)]
+            history_parts.append(hs)
+            blocks.append(block)
+            histories_read += len(hs)
+        history_starts = torch.cat(history_parts)
+        future_starts = history_starts + history_tokens
     return Exp2Inputs(
         histories=stream.windows(history_starts, history_tokens).tolist(),
         futures=stream.windows(future_starts, future_tokens).tolist(),
@@ -106,7 +132,12 @@ def sample_store_inputs(
             "history_tokens": history_tokens,
             "future_tokens": future_tokens,
             "seed": seed,
-            "sampling": "uniform blocks with replacement and independent row and column permutations via torch.Generator().manual_seed(seed)",
+            "pairing": pairing,
+            "sampling": (
+                "uniform blocks with replacement and independent row and column permutations via torch.Generator().manual_seed(seed)"
+                if pairing == "independent" else
+                "uniform blocks with replacement and history row permutations via torch.Generator().manual_seed(seed); future i is the future_tokens stream tokens immediately after history i (future_starts = history_starts + history_tokens), so diagonal entries are matched pairs"
+            ),
             "history_starts": history_starts.tolist(),
             "future_starts": future_starts.tolist(),
             "blocks": blocks,
