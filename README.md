@@ -12,33 +12,18 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp4` | Centered next-token logit for every vocabulary token | histories × (futures × vocabulary) | Not stored; online NeuralSVD |
 | `exp5` | Same stored top-k centered-logit matrix as exp1 | histories × (futures × top-k) | Reads exp1's `matrix.npy`; NeuralSVD decomposition |
 | `exp6` | Full-vocabulary centered logit on iid stream windows; frozen GPT-2 + trainable MLP features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
-| `exp7` | Same streaming operator; trainable small Transformer features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
-| `exp8` | Same streaming operator; trainable token embeddings + MLP features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
-| `exp9` | Same streaming operator; frozen MiniLM sentence embeddings + trainable MLP features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
-| `exp10` | Same operator and frozen MiniLM + MLP features as exp9; joint NestedLoRA nesting | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
-| `exp11` | Same streaming operator; distilled causal student with a constant-first-component skip | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
-| `exp12` | Same as exp11, with randomly initialized student | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
-| `exp13` | Same as exp11, without the skip component | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
-| `exp14` | Paper-style LinGen coefficient fitting and generation | Finite top-k table and full-vocabulary NeuralSVD surrogate | Finite matrices and fitted coefficients |
 
 Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead uses `train` → `analysis`, defaults to the larger `wikitext-large` dataset, and analyzes learned features on CPU without loading a model or materializing the matrix.
 
 **exp5** has only `analysis`: it learns singular components from exp1's stored matrix and always compares them with exp1's exact SVD for the selected centering. It performs no inference and loads no language model.
 
-**exp6/exp7/exp8/exp9/exp10** use `train` → `analysis` on a token stream rather than a fixed sample table. Both stages load the local language model; analysis compares learned features against an exact fixed-probe reference.
-
-**exp11/exp12/exp13** use the same streaming operator with a causal student; exp11 distillation precedes training for exp11 and exp13. See [student experiments](#experiments-11-12-and-13-causal-student-neuralsvd).
-
-**exp14** fits GPT-2 Small LinGen coefficients and evaluates their generation on Small and Large; it is separate from the NeuralSVD-reconstruction `lingen` CLI. See [paper LinGen](#experiment-14-paper-style-lingen).
-
-**exp16** pins exp6, exp10 and exp11 snapshots, then refits their right functions with the left functions frozen. See [right-function refitting](#experiment-16-frozen-left-right-function-refitting).
+**exp6** uses `train` → `analysis` on a token stream rather than a fixed sample table. Both stages load the local language model; analysis compares learned features against an exact fixed-probe reference.
 
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
 - [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
-- [Streaming exp6–exp10](#experiments-6-7-8-9-and-10-streaming-full-vocabulary-neuralsvd) · [Python inference API](#python-inference-api) · [NeuralSVD utility API](#neuralsvd-utility-api) · [Tests](#tests)
-- [Student exp11–exp13](#experiments-11-12-and-13-causal-student-neuralsvd) · [Paper LinGen exp14](#experiment-14-paper-style-lingen) · [Diagnostics exp15](#experiment-15-layered-lingen-diagnostics) · [Right refitting exp16](#experiment-16-frozen-left-right-function-refitting)
+- [Streaming exp6](#experiment-6-streaming-full-vocabulary-neuralsvd) · [Python inference API](#python-inference-api) · [NeuralSVD utility API](#neuralsvd-utility-api) · [Tests](#tests)
 
 ## Project layout
 
@@ -66,27 +51,26 @@ Matrix generation defaults to CUDA and uses float32 model weights. Use `--device
 ## 2. Download models for offline inference
 
 ```bash
-# Download or reuse inference files for GPT-2 Small, Medium, Large, and MiniLM.
+# Download or reuse inference files for GPT-2 Small, Medium, and Large.
 uv run python scripts/download_models.py
 
 # Optional: download just one model.
 uv run python scripts/download_models.py --models medium
 ```
 
-The script downloads **complete inference files**, not every file in the upstream repositories. Each GPT-2 directory contains `model.safetensors`, `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, and `merges.txt`. MiniLM contains `config.json`, `model.safetensors`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, and `vocab.txt`. These include the full model weights, not just tokenizers. Duplicate PyTorch, TensorFlow, Flax, Rust, and ONNX weight formats are not downloaded.
+The script downloads **complete inference files**, not every file in the upstream repositories. Each GPT-2 directory contains `model.safetensors`, `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, and `merges.txt`. These include the full model weights, not just tokenizers. Duplicate PyTorch, TensorFlow, Flax, Rust, and ONNX weight formats are not downloaded.
 
 | Local directory | Hugging Face repository | Pinned revision |
 | --- | --- | --- |
 | `models/gpt2-small` | [openai-community/gpt2](https://huggingface.co/openai-community/gpt2) | `607a30d783dfa663caf39e06633721c8d4cfcd7e` |
 | `models/gpt2-medium` | [openai-community/gpt2-medium](https://huggingface.co/openai-community/gpt2-medium) | `6dcaa7a952f72f9298047fd5137cd6e4f05f41da` |
 | `models/gpt2-large` | [openai-community/gpt2-large](https://huggingface.co/openai-community/gpt2-large) | `32b71b12589c2f8d625668d2335a01cac3249519` |
-| `models/all-MiniLM-L6-v2` | [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) | `1110a243fdf4706b3f48f1d95db1a4f5529b4d41` |
 
-Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of all four model directories; by default it is the repository's `models/` directory. Use `--models minilm` to download only the exp9/exp10 encoder, or `--models large` for GPT-2 Large. Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
+Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of all three model directories; by default it is the repository's `models/` directory. Use `--models large` for GPT-2 Large. Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
 
 After downloading the required models and source data, all tokenization and model inference can run offline.
 
-GPT-2 Small and Medium have been verified with local-only tokenizer loading and CPU inference, including next-token logits and conditional continuation log probabilities. MiniLM has been verified with local-only sentence encoding and an exp9 CUDA train/analysis/resume smoke.
+GPT-2 Small and Medium have been verified with local-only tokenizer loading and CPU inference, including next-token logits and conditional continuation log probabilities.
 
 ## 3. Prepare shared history/future samples
 
@@ -161,7 +145,7 @@ uv run python scripts/download_task_sources.py
 uv run data-pipline build-task-inputs --tokenizer-path models/gpt2-small
 ```
 
-The downloader reuses existing files under `data/original/`; `--output-dir` changes that source root. Its Natural Instructions (SNI), FLAN and tasksource-instruct files are used only as references by the `synthesize-single-text-tasks` project skill, not by the builder. The skill generates instructions one at a time with smol subagents, rejects near-duplicates using embedding recall and review, and appends accepted instructions to the frozen catalog. The builder itself does not generate instructions.
+The downloader reuses existing files under `data/original/`; `--output-dir` changes that source root. The builder does not use the downloaded Natural Instructions (SNI), FLAN or tasksource-instruct files and does not generate instructions.
 
 Each nonblank catalog line contains `id`, `source`, `category` and `instruction`; IDs must be unique. The frozen catalog contains 1309 histories: 213 SNI, 88 tasksource, 8 FLAN and 1000 synthetic instructions. The builder writes only `data/history_future_samples/task-single-text.parquet`, pairing these histories with 1309 C4 document futures by default for a 1309 × 1309 matrix. Every catalog task must pass deterministic deduplication and token-length checks; rejected catalog tasks cause an error rather than being silently dropped. The C4 revision and catalog's SHA-256 digest are recorded in the output's `lm_svd` Parquet metadata, together with selection settings and passage rejection counts.
 
@@ -607,9 +591,9 @@ Other useful options:
 
 Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv run exp3 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>`, `uv run python -m experiments.exp2_PFH <subcommand>`, and `uv run python -m experiments.exp3_L_M_diff <subcommand>`.
 
-## Experiments 6, 7, 8, 9, and 10: streaming full-vocabulary NeuralSVD
+## Experiment 6: streaming full-vocabulary NeuralSVD
 
-These independent experiments replace exp4's per-sample lookup tables with functions of token content. A shared teacher sample store supplies each training step with a randomly selected block and randomly selected history/future subsets. Producers draw window starts uniformly with replacement from the token stream (duplicates are allowed); blocks may be reused until overwritten. Histories and futures need not be adjacent in the original text. Every sampled future contributes **all vocabulary tokens** (50,257 for GPT-2); there is no top-k selection, secondary centering, or first-component removal.
+This experiment replaces exp4's per-sample lookup tables with functions of token content. A shared teacher sample store supplies each training step with a randomly selected block and randomly selected history/future subsets. Producers draw window starts uniformly with replacement from the token stream (duplicates are allowed); blocks may be reused until overwritten. Histories and futures need not be adjacent in the original text. Every sampled future contributes **all vocabulary tokens** (50,257 for GPT-2); there is no top-k selection, secondary centering, or first-component removal.
 
 ```text
 A[h, (f, z)] = logit(z | h + f) - mean_vocabulary(logits | h + f)
@@ -637,21 +621,13 @@ Once the store exists, run training and analysis:
 ```bash
 uv run exp6 train
 uv run exp6 analysis
-uv run exp7 train
-uv run exp7 analysis
-uv run exp8 train
-uv run exp8 analysis
-uv run exp9 train
-uv run exp9 analysis
-uv run exp10 train
-uv run exp10 analysis
 ```
 
 The builder defaults to `--dataset-dir data/original/wikitext --config wikitext-103-raw-v1 --split train --tokenizer-path models/gpt2-small --output data/token_streams/wikitext-103-train.npy`. It writes a 1-D integer `.npy` token stream and sibling `.json` with tokenizer, vocabulary, split, dtype, and token-count metadata. Use `--overwrite` to replace them. Training memory-maps the array; it does not use the Parquet history/future sample tables. For another stream, write `data/token_streams/NAME.npy` and its JSON, and pass `--stream NAME`. Use a tokenizer matching the teacher model.
 
 ### Shared teacher sample store
 
-Streaming `train` for exp6–exp13 and exp16 uses the same store when model, stream and window lengths match. Producers run GPT-2 in float32 and store final-position hidden states in float16, together with history and future starts, in a rolling ring of blocks (default 64 histories × 64 futures). Consumers reconstruct windows from their token stream and project sampled states with the centered unembedding. Only target-grid teacher inference is removed from these training steps: exp6 still runs frozen GPT-2 forwards to encode its individual history and future windows.
+Streaming `train` for exp6 uses the sample store. Producers run GPT-2 in float32 and store final-position hidden states in float16, together with history and future starts, in a rolling ring of blocks (default 64 histories × 64 futures). Consumers reconstruct windows from their token stream and project sampled states with the centered unembedding. Only target-grid teacher inference is removed from these training steps: exp6 still runs frozen GPT-2 forwards to encode its individual history and future windows.
 
 Each slot is a losslessly compressed NumPy `.npz` archive written with `np.savez_compressed` (ZIP Deflate). Compression preserves all stored fp16 values, start indices, shapes and dtypes; `np.load` reads both compressed and older uncompressed slots. Producers atomically replace individual slot files. To recompress existing slots offline, stop all producers and hold their shard locks; verify array contents before atomically replacing each archive, leaving `store.json` and shard progress unchanged.
 
@@ -659,13 +635,13 @@ The default capacity is 64 GiB of **uncompressed** sample payload; set `sample-s
 
 Training waits until the store contains at least 64 blocks, or its entire capacity if smaller; it may then reuse blocks while producers replace old ones. Start a producer before training: a missing store is an error, while an existing underfilled store causes training to wait. The shard count is fixed when the store is created. To change it or another store configuration, stop **all** producers before using `sample-store produce --overwrite` to recreate the store; never overwrite a store while producers are active.
 
-Fixed probes and their exact-reference analysis, exp11 distillation, exp15, LinGen evaluation, and exp1, exp3–exp5 and exp14 finite-sample workflows remain outside this store and retain their existing teacher behavior. exp2 uses it only when `--stream` is selected; its Parquet input remains supported.
+Fixed probes and their exact-reference analysis, LinGen evaluation, and exp1 and exp3–exp5 finite-sample workflows remain outside this store and retain their existing teacher behavior. exp2 uses it only when `--stream` is selected; its Parquet input remains supported.
 
-All five experiments default to `--stream wikitext-103-train`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; `--device cpu` is supported. Shared training defaults, except exp10's fixed joint nesting:
+exp6 defaults to `--stream wikitext-103-train`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; `--device cpu` is supported. Training defaults:
 
 | Flags | Defaults |
 | --- | --- |
-| `--rank`, `--nesting` | `256`, `sequential` for exp6–exp9 (`joint` also supported); exp10 requires `joint` |
+| `--rank`, `--nesting` | `256`, `sequential` (`joint` also supported) |
 | `--history-tokens`, `--future-tokens` | `64`, `32` |
 | `--history-batch`, `--future-batch` | `64`, `64` |
 | `--probe-histories`, `--probe-futures`, `--probe-seed` | `1024`, `1024`, `1` |
@@ -677,58 +653,30 @@ All five experiments default to `--stream wikitext-103-train`, `--model-path mod
 `--probe-histories` must be at least the rank, and the concatenated history/future must fit the teacher's context.
 
 - **exp6** (`exp6_stream_gpt2_mlp`): frozen GPT-2 encodes each window; concatenate the final-token hidden state and mean hidden state. These encoder forwards remain in training, although the target grid comes from the store. Separate left/right MLPs use non-affine LayerNorm, two GELU hidden layers, and output heads. `--mlp-width 1024` controls both hidden layers. GPT-2 weights are neither optimized nor saved in the feature state.
-- **exp7** (`exp7_stream_transformer`): separate history/future Transformers train from scratch on token IDs, with learned token/position embeddings, pre-norm layers, GELU, no dropout, and unmasked attention within each window. Concatenated final-token/mean pooling feeds left/right linear heads. Defaults are `--model-dim 256 --layers 4 --heads 4`; model dimension must be divisible by heads. GPT-2 supplies the stored targets and centered token embeddings.
-- **exp8** (`exp8_stream_token_mlp`): independent history/future token embeddings and MLPs train from scratch. Each window's embeddings are concatenated in position order into `window_tokens * embedding_dim` features, preserving order without additional positional encoding. Defaults are `--embedding-dim 256 --mlp-width 1024`. Each MLP uses non-affine LayerNorm, two `Linear → GELU` hidden layers, and a left rank-output or right rank-times-teacher-hidden-size output head, matching exp6's MLP structure. GPT-2 does not compute the input features: it supplies stored targets, centered token embeddings, and their vocabulary/hidden-size and token-RMS information.
-- **exp9** (`exp9_stream_sentence_mlp`): decode each entire GPT-2 history/future window to text, then encode it with frozen `sentence-transformers/all-MiniLM-L6-v2`, attention-mask mean pooling, and L2 normalization into one 384-dimensional vector. Windows may cross sentence boundaries or start inside words; no splitting or repair is applied. Defaults are `--encoder-path models/all-MiniLM-L6-v2 --max-seq-length 256 --mlp-width 1024`. MiniLM retokenization truncates at this sequence limit. One shared float32 encoder stays in eval mode, outside feature parameters, state dicts, and module counts; independent left/right MLPs use exp6's structure with 384-dimensional inputs. Both the local GPT-2 tokenizer and MiniLM model/tokenizer are required. Encoder path and architecture are saved in `features` metadata, so analysis needs no encoder flags.
-- **exp10** (`exp10_stream_sentence_mlp_joint`): exp9's control with identical frozen MiniLM features, trainable MLPs, and training defaults, except NestedLoRA nesting is fixed to `joint` (equal weights on all prefixes, `step=1`). `exp10 train --nesting sequential` is rejected before creating outputs; use exp9 for sequential nesting. The CLI and analysis feature builder are reused from exp9, not copied.
 
-All five right heads produce `(future_batch, rank, teacher_hidden_size)` weights, contracted with the centered unembedding for vocabulary features, with a fixed initialization scale based on hidden size and token RMS.
-
-With GPT-2's vocabulary/hidden size, default windows 64/32, rank 256, embedding dimension 256, and MLP width 1024, exp8's trainable parameters are:
-
-| Component | Parameters |
-| --- | ---: |
-| Two token embeddings | 25,731,584 |
-| History MLP, including left output layer | 18,090,240 |
-| Future MLP, excluding right output layer | 9,439,232 |
-| Right output layer `Linear(1024, 196608)` | 201,523,200 |
-| **Total** | **254,784,256** |
-
-The total is confirmed by `sum(p.numel() for p in features.parameters())` for the default architecture; the large right output head dominates.
-
-For exp9 and exp10 with GPT-2 Small, rank 256, and MLP width 1024, measured trainable counts exclude both frozen models:
-
-| Component | Parameters |
-| --- | ---: |
-| Left MLP | 1,706,240 |
-| Right MLP | 202,967,040 |
-| **Total** | **204,673,280** |
+The right head produces `(future_batch, rank, teacher_hidden_size)` weights, contracted with the centered unembedding for vocabulary features, with a fixed initialization scale based on hidden size and token RMS.
 
 ### Smoke, resume, and schedules
 
-For a short capped CUDA run of each architecture, using a separate result root:
+For a short capped CUDA run using a separate result root:
 
 ```bash
-for e in exp6 exp7 exp8 exp9 exp10; do
-  uv run "$e" train --rank 4 --history-batch 4 --future-batch 4 \
-    --probe-histories 32 --probe-futures 8 --max-steps 20 \
-    --eval-every 10 --checkpoint-every 10 --log-every 5 \
-    --results-root /tmp/stream-smoke
-  uv run "$e" analysis --results-root /tmp/stream-smoke --reference-future-batch 2
-done
+uv run exp6 train --rank 4 --history-batch 4 --future-batch 4 \
+  --probe-histories 32 --probe-futures 8 --max-steps 20 \
+  --eval-every 10 --checkpoint-every 10 --log-every 5 \
+  --results-root /tmp/stream-smoke
+uv run exp6 analysis --results-root /tmp/stream-smoke --reference-future-batch 2
 
-# Continue the exp9 smoke from step 20; retain its configuration.
-uv run exp9 train --rank 4 --history-batch 4 --future-batch 4 \
+# Continue the exp6 smoke from step 20; retain its configuration.
+uv run exp6 train --rank 4 --history-batch 4 --future-batch 4 \
   --probe-histories 32 --probe-futures 8 --max-steps 30 \
   --eval-every 10 --checkpoint-every 10 --log-every 5 \
   --results-root /tmp/stream-smoke
 ```
 
-The capped runs report `stop_reason: max_steps`; continuation prints `resuming from step 20`. This is a feasibility smoke, not a convergence claim. Training automatically restores feature weights, Adam moments, sampling RNG, loss history, and probe-stability state from `train/checkpoint.pt`.
+The capped run reports `stop_reason: max_steps`; continuation prints `resuming from step 20`. This is a feasibility smoke, not a convergence claim. Training automatically restores feature weights, Adam moments, sampling RNG, loss history, and probe-stability state from `train/checkpoint.pt`.
 
 Checkpoint metadata records the sample store identity; a checkpoint with a different store is rejected. A legacy checkpoint without store identity can resume from the selected compatible store.
-
-BlueHive sentence-MLP templates are `bluehive_run/exp9-{train,analysis}.sbatch` and `bluehive_run/exp10-{train,analysis}.sbatch`. Submit from the repository root after provisioning the local models and stream. Training intentionally omits `--overwrite` to resume checkpoints; analysis reads the encoder path from training metadata.
 
 Cosine decay starts at step 0 without warmup, reaches `--min-lr` after `--lr-decay-steps` (30,000 by default), and holds that rate until convergence. It does not stop before the decay endpoint even if the probe stabilizes earlier; resuming does not restart or extend the decay. `--lr-schedule constant` stops on convergence without a decay wait. The optional `--max-steps` caps either schedule. Probe stability means the maximum relative change among the leading `--convergence-rank` singular values in learned order stays below `--tol` for `--patience` evaluations. The convergence rank defaults to 32 and is capped at `--rank`; this stability check is not an exact-reference accuracy criterion.
 
@@ -736,18 +684,16 @@ Resume configuration must match, including architecture, rank, windows, batches,
 
 ### Paths, outputs, and probe interpretation
 
-Run directories are `<results-root>/<experiment>/<stream>__<model-directory-name>/`, where `<experiment>` is `exp6_stream_gpt2_mlp`, `exp7_stream_transformer`, `exp8_stream_token_mlp`, `exp9_stream_sentence_mlp`, or `exp10_stream_sentence_mlp_joint`. Rank and architecture flags are not encoded in the directory name. Pass matching stream, results-root, and model-path flags to locate a nondefault run for analysis.
+Run directories are `<results-root>/exp6_stream_gpt2_mlp/<stream>__<model-directory-name>/`. Rank and architecture flags are not encoded in the directory name. Pass matching stream, results-root, and model-path flags to locate a nondefault run for analysis.
 
 - `train/features.pt`: trainable feature state and buffers.
 - `train/loss_history.npy`: one loss per completed step.
 - `train/probe.npz`: fixed history/future start indices, sampled once using the probe seed.
-- `train/metadata.json`: configuration, stream metadata, steps, loss/entry-energy estimates, convergence state, and latest probe spectrum (null before the first evaluation); written last. Shared `parameter_counts` records `trainable_total` and `modules` (trainable counts by top-level child module) for exp6–exp10. These counts are metadata only, not part of the resume configuration, so adding them does not invalidate existing checkpoints. Frozen teacher and sentence-encoder parameters are excluded.
+- `train/metadata.json`: configuration, stream metadata, steps, loss/entry-energy estimates, convergence state, and latest probe spectrum (null before the first evaluation); written last. `parameter_counts` records `trainable_total` and `modules` (trainable counts by top-level child module). These counts are metadata only, not part of the resume configuration, so adding them does not invalidate existing checkpoints. Frozen teacher parameters are excluded.
 - `train/checkpoint.pt`: resumable state, saved with a refreshed snapshot every checkpoint interval and at the step cap. Convergence removes the checkpoint.
 - `analysis/`: six files: `singular_values.npy`, `reference_singular_values.npy`, `left_singular_vectors.npy`, `reference_left_singular_vectors.npy`, `neural_svd_spectrum.png`, and `metadata.json` (written last). Vector arrays are probe-histories × rank, with unit-norm columns. The plot compares learned/reference spectra and cumulative energy alongside training loss.
 
 Unlike exp4 analysis, **analysis reloads both the token stream and the local teacher model from paths saved in training metadata** to reconstruct the probe and exact reference. Analysis `--model-path` only names the run directory; it does not override the saved teacher path. Keep those inputs available. `--reference-future-batch 4` controls futures per reference forward: with `Hp` probe histories, each forward contains `q * Hp` concatenated sequences. Lower `q` to reduce peak memory (at the cost of more forwards); the reference still evaluates every probe history/future pair.
-
-For exp9 and exp10, analysis also reloads the local sentence encoder using the path and sequence limit saved in training `features` metadata. Keep that directory and the teacher tokenizer available alongside the stream and teacher weights.
 
 Singular values are in **operator units**, with no finite-matrix `sqrt(m*n)` multiplier. For a probe with `Hp` histories, `Fp` futures and vocabulary `V`, the exact reference is the SVD of the dense probe table divided by `sqrt(Hp * Fp * V)`. Analysis obtains it through the history Gram matrix and token Gram matrix rather than materializing the vocabulary-wide table. Its values are sorted descending; learned values retain **learned order**. These units differ from exp4's finite-table matrix singular values.
 
@@ -760,17 +706,9 @@ The fixed probe is an empirical sub-table, not an exact SVD of the full stream o
 
 Stable probe norms, low loss, or a completed learning-rate schedule alone do not guarantee convergence, correct ordering, orthogonality, or full-stream generalization. Use the exact-reference errors, alignments, overlap, and energy together.
 
-### Comparing architectures fairly
-
-Run exp6, exp7, exp8, and exp9 with the same stream, rank, history/future windows and batches, learning-rate schedule, training steps, and probe seed. Compare singular-value relative errors, left-vector alignment, prefix subspace overlap, captured energy, trainable parameter counts, time per step, and peak GPU memory. Keep the teacher and probe sizes fixed as well so the target operator and exact-reference comparison are shared.
-
-**exp8 versus exp6 asks whether frozen GPT-2 input representations help** when using the same MLP structure. exp8 versus exp7 compares complete architectures, not parameter-matched MLP and Transformer backbones. A parameter-matched capacity comparison requires a separate width adjustment while keeping the output heads fixed.
-
-**exp10 versus exp9 isolates joint versus sequential nesting.** Compare at matched training steps with the same stream, teacher, rank, architecture, batches, schedule, seeds, and fixed probe; exp10 starts independently rather than restarting exp9.
-
 ### BlueHive
 
-Prepare `.venv`, the local GPT-2 model, the MiniLM encoder for exp9/exp10, and token-stream `.npy`/`.json` on the cluster. Start the two producer shards from the repository root, then check status before submitting training:
+Prepare `.venv`, the local GPT-2 model, and token-stream `.npy`/`.json` on the cluster. Start the two producer shards from the repository root, then check status before submitting training:
 
 ```bash
 mkdir -p bluehive_run/logs
@@ -786,41 +724,31 @@ Submit training and analysis from the repository root:
 ```bash
 mkdir -p bluehive_run/logs
 sbatch bluehive_run/exp6-train.sbatch
-sbatch bluehive_run/exp7-train.sbatch
-sbatch bluehive_run/exp8-train.sbatch
-sbatch bluehive_run/exp9-train.sbatch
-sbatch bluehive_run/exp10-train.sbatch
 # Submit analysis separately after a snapshot is available.
 sbatch bluehive_run/exp6-analysis.sbatch
-sbatch bluehive_run/exp7-analysis.sbatch
-sbatch bluehive_run/exp8-analysis.sbatch
-sbatch bluehive_run/exp9-analysis.sbatch
-sbatch bluehive_run/exp10-analysis.sbatch
 
 # Optional training overrides; use the same STREAM for analysis.
 STREAM=wikitext-103-train RANK=128 sbatch bluehive_run/exp6-train.sbatch
 STREAM=wikitext-103-train sbatch bluehive_run/exp6-analysis.sbatch
-STREAM=wikitext-103-train RANK=128 sbatch bluehive_run/exp8-train.sbatch
-STREAM=wikitext-103-train sbatch bluehive_run/exp8-analysis.sbatch
 ```
 
-Training scripts default to `STREAM=wikitext-103-train`, `RANK=256`; all five accept these overrides. They request one H100 on `preempt`, 4 CPUs, 64 GiB host memory, and two days. Slurm sends `USR1` 600 seconds before the time limit, triggering automatic requeue and resume from the latest checkpoint; both training stage and Slurm logs are appended across requeues. Training errors fail the job without requeueing. Use `scancel <job-id>` to stop repeated requeues. The scripts do not pass `--overwrite`. If rank 256 exhausts H100 memory, use `RANK=128` for any experiment in a fresh run (or explicitly restart incompatible existing outputs); code defaults stay unchanged. Analysis scripts use the same `STREAM` override, read the saved rank rather than `RANK`, and run with `--overwrite`. They request one GPU on `gpu`, 4 CPUs, 32 GiB host memory, and **four hours** for the exact probe reference.
+The training script defaults to `STREAM=wikitext-103-train`, `RANK=256` and accepts these overrides. It requests one H100 on `preempt`, 4 CPUs, 64 GiB host memory, and two days. Slurm sends `USR1` 600 seconds before the time limit, triggering automatic requeue and resume from the latest checkpoint; both training stage and Slurm logs are appended across requeues. Training errors fail the job without requeueing. Use `scancel <job-id>` to stop repeated requeues. The script does not pass `--overwrite`. If rank 256 exhausts H100 memory, use `RANK=128` in a fresh run (or explicitly restart incompatible existing outputs); code defaults stay unchanged. The analysis script uses the same `STREAM` override, reads the saved rank rather than `RANK`, and runs with `--overwrite`. It requests one GPU on `gpu`, 4 CPUs, 32 GiB host memory, and **four hours** for the exact probe reference.
 
-Slurm logs are `bluehive_run/logs/slurm-lm-svd-exp{6,7,8,9,10}-{train,analysis}-<job-id>.{out,err}`; stage logs live under the corresponding `slurm-<job-name>-<job-id>/` directory as `exp{6,7,8,9,10}-{train,analysis}.out` (for example, `exp10-train.out` or `exp10-analysis.out`). Use `uv run expN <subcommand> --help` for all flags (`N` is 6–10); module entry points are `experiments.exp6_stream_gpt2_mlp`, `experiments.exp7_stream_transformer`, `experiments.exp8_stream_token_mlp`, `experiments.exp9_stream_sentence_mlp`, and `experiments.exp10_stream_sentence_mlp_joint`.
+Slurm logs are `bluehive_run/logs/slurm-lm-svd-exp6-{train,analysis}-<job-id>.{out,err}`; stage logs live under the corresponding `slurm-<job-name>-<job-id>/` directory as `exp6-{train,analysis}.out`. Use `uv run exp6 <subcommand> --help` for all flags; the module entry point is `experiments.exp6_stream_gpt2_mlp`.
 
 ### lingen: next-token distribution evaluation
 
-`lingen` evaluates an exp6–exp10 training snapshot against the teacher on a training or held-out token stream. Build the validation stream once, then choose the experiment and evaluation mode:
+`lingen` evaluates an exp6 training snapshot against the teacher on a training or held-out token stream. Build the validation stream once, then choose the evaluation mode:
 
 ```bash
 uv run data-pipline build-token-stream --split validation \
   --output data/token_streams/wikitext-103-validation.npy
-uv run lingen onestep --experiment exp8
-uv run lingen onestep --experiment exp8 --eval-stream wikitext-103-validation
-uv run lingen autoregressive --experiment exp8 --eval-stream wikitext-103-validation
+uv run lingen onestep --experiment exp6
+uv run lingen onestep --experiment exp6 --eval-stream wikitext-103-validation
+uv run lingen autoregressive --experiment exp6 --eval-stream wikitext-103-validation
 ```
 
-The stream builder requires the local WikiText validation data and GPT-2 tokenizer. `--stream` (default `wikitext-103-train`) and the directory name of `--model-path` (default `models/gpt2-small`) locate the training run under `--results-root` (default `data/experiment_results`); the teacher is loaded from the path saved in training metadata, not from the CLI model path. `--eval-stream` defaults to `--stream` and selects `data/token_streams/<name>.npy` and its metadata. exp9 and exp10 also require the local MiniLM encoder at the path saved in training metadata, and autoregressive decoding requires the saved teacher's tokenizer.
+The stream builder requires the local WikiText validation data and GPT-2 tokenizer. `--stream` (default `wikitext-103-train`) and the directory name of `--model-path` (default `models/gpt2-small`) locate the training run under `--results-root` (default `data/experiment_results`); the teacher is loaded from the path saved in training metadata, not from the CLI model path. `--eval-stream` defaults to `--stream` and selects `data/token_streams/<name>.npy` and its metadata. Autoregressive decoding requires the saved teacher's tokenizer.
 
 For history `h` and future `f`, lingen reconstructs centered logits as `(sum_k u_k(h) W_k(f)) Etilde^T`, where `u` is the learned row feature, `W` the learned future weights, and `Etilde` the vocabulary-centered unembedding. The features already absorb the singular values: **do not multiply by sigma again**. The learned distribution `q` is the softmax of these logits; the teacher distribution `p` is the softmax of GPT-2 logits at the last position of `h+f`.
 
@@ -835,173 +763,12 @@ On BlueHive, submit from the repository root after installing `.venv`, preparing
 ```bash
 mkdir -p bluehive_run/logs
 sbatch bluehive_run/lingen.sbatch
-# Example: evaluate a subset against validation only.
-EXPERIMENTS="exp8 exp9" EVAL_STREAMS="wikitext-103-validation" \
+# Example: evaluate against validation only.
+EXPERIMENTS="exp6" EVAL_STREAMS="wikitext-103-validation" \
   STREAM=wikitext-103-train sbatch bluehive_run/lingen.sbatch
 ```
 
-The job requests one GPU on `gpu`, 4 CPUs, 32 GiB and four hours. Defaults are `EXPERIMENTS="exp6 exp7 exp8 exp9 exp10"`, `EVAL_STREAMS="wikitext-103-train wikitext-103-validation"`, and `STREAM=wikitext-103-train`. It builds the validation stream if its `.npy` is missing, then runs both modes for every selected experiment and evaluation stream with `--overwrite`; a failed command stops the job. Slurm stdout/stderr are `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>.{out,err}`; per-mode logs and `build-validation-stream.out` (when built) are under `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>/`. Use the guarded [sync commands](#sync-analysis-and-lingen-results-from-bluehive) to preview and download the results.
-
-## Experiments 11, 12, and 13: causal student NeuralSVD
-
-These experiments learn the streaming full-vocabulary operator above using one shared causal student for history and future windows. The student has its own Transformer; it contains no GPT-2 Transformer layers. GPT-2 supplies the teacher signal and frozen vocabulary-centered unembedding, which the student uses for token inputs and output logits. The frozen unembedding is not included in `features.pt`.
-
-| Experiment | Student initialization | First component |
-| --- | --- | --- |
-| `exp11` (`exp11_stream_student`) | Distilled | Constant left function × student future logits (skip) |
-| `exp12` (`exp12_stream_student_nodistill`) | Random | Same skip |
-| `exp13` (`exp13_stream_student_noskip`) | Distilled, from the same exp11 checkpoint | Ordinary learned component |
-
-Thus exp11 versus exp12 is the distillation ablation, and exp11 versus exp13 is the skip ablation. Defaults are rank 64, `--model-dim 256 --layers 4 --heads 4 --max-positions 96`, and `--column-dim 256`. At these defaults with GPT-2 Small, trainable parameter counts are 12,080,960 for exp11/exp12 and 12,212,800 for exp13, excluding the frozen unembedding and teacher. History and future windows must each fit within `--max-positions`.
-
-Prepare the local GPT-2 model, token stream and shared sample store as for exp6–exp10, then run:
-
-```bash
-uv run exp11 distill
-uv run exp11 train
-uv run exp12 train
-uv run exp13 train
-
-# Evaluate training snapshots with onestep only.
-for e in exp11 exp12 exp13; do
-  uv run lingen onestep --experiment "$e"
-done
-```
-
-Distillation matches the teacher's next-token distribution at every position in sampled windows. It defaults to 20,000 steps and writes `distill/student.pt`, `loss_history.npy`, and `metadata.json` under `<results-root>/exp11_stream_student/<stream>__<model-directory-name>/`. Metadata, written last, records completion, student configuration, loss and fixed-probe KL history (`probe_kl_all` and `probe_kl_last`). Periodic snapshots have `complete: false` and a resumable `checkpoint.pt`; completion writes `complete: true` and removes the checkpoint. A matching interrupted run resumes automatically; incompatible checkpoint configuration is rejected. Existing outputs without a checkpoint require `--overwrite`, which discards them and starts over.
-
-Both exp11 and exp13 default to that same exp11 `distill/student.pt`. Their training requires the checkpoint and its sibling `metadata.json` to exist, metadata to say `complete: true`, and the student configuration (`model_dim`, `layers`, `heads`, `max_positions`) to match the requested training flags. Use `--student-checkpoint PATH` to select another completed compatible distillation; exp12 needs no distillation checkpoint. Keep stream, model and results-root flags consistent when using the default path.
-
-Each experiment writes its streaming snapshot under its own `<results-root>/<experiment>/<stream>__<model-directory-name>/train/`, including `features.pt`, loss history, probe, metadata and resumable checkpoint as described for exp6–exp10. Training metadata records the student configuration, skip, initialization and checkpoint provenance, plus trainable parameter counts. A training resume restores its saved features and requires compatible configuration; `--overwrite` restarts instead. Each experiment also supports `analysis`; use matching run-location flags and see `uv run exp11 --help` or `uv run expN train --help` for options.
-
-On BlueHive, submit from the repository root after provisioning `.venv`, GPT-2, the token stream and the shared store producers above. exp11 and exp13 must wait for successful distillation; exp12 can train independently:
-
-```bash
-mkdir -p bluehive_run/logs
-d=$(sbatch --parsable bluehive_run/exp11-distill.sbatch); d=${d%%;*}
-sbatch --dependency=afterok:$d bluehive_run/exp11-train.sbatch
-sbatch --dependency=afterok:$d bluehive_run/exp13-train.sbatch
-sbatch bluehive_run/exp12-train.sbatch
-```
-
-The training scripts default to rank 64 and a 30,000-step cap; `RANK`, `MAX_STEPS`, and `STREAM` can be set when submitting. They omit `--overwrite` so matching checkpoints resume. After training completes, evaluate only onestep:
-
-```bash
-EXPERIMENTS="exp11 exp12 exp13" MODES=onestep sbatch bluehive_run/lingen.sbatch
-```
-
-The lingen script otherwise defaults to both modes and both training and validation evaluation streams. Set `EVAL_STREAMS` to select streams; onestep outputs are `lingen/<eval-stream>/onestep/metrics.npz` and `metadata.json` within each experiment run.
-
-## Experiment 14: paper-style LinGen
-
-`exp14` implements the LinGen coefficient-fitting and generation procedure of [Golowich, Liu and Shetty](https://arxiv.org/abs/2510.24966), separately from the `lingen` CLI's NeuralSVD logit reconstruction. Coefficients are always fitted with GPT-2 Small. For each target, finite coefficients regress its centered logits against basis histories on a future-specific top-50 token table; NeuralSVD coefficients regress in exp6 feature space using an estimated full-vocabulary Gram matrix; and the single-token baseline regresses on full-vocabulary next-token logits without futures. Each method has a real-set option (`opt1`) and a nonsense option (`opt2`), in which tokens are permuted among the basis histories and among the futures; targets remain real.
-
-Algorithm 1 applies the fitted coefficients to **the evaluation model's own** centered-logit basis rows at each generated prefix. Thus Small evaluates within-model, while Large tests transfer of the same Small-fitted coefficients. The seventh variant is a five-token short-context model. Each variant samples its own trajectories at temperature 1; at each position the evaluation model's full-target distribution `p` and the variant distribution `q` are compared on that same trajectory. The primary metric is KL(p‖q), with total equal to the sum of per-position means; reverse KL, top-k overlap, and logit error are also recorded.
-
-The default dataset uses fixed 64-token histories and 32-token futures, with 2,048 basis histories, 1,024 finite-table futures, 50 targets, five generations per target and 15 generated tokens. The paper instead uses variable 8–30-token windows, 40,000 basis histories and 10,000 futures. The NeuralSVD Gram estimate averages over all 10,000 dataset stream futures and the full vocabulary; it is a learned surrogate estimated from those futures, **not** the exact infinite-table teacher objective. Fit metadata records the exp6 snapshot training step used.
-
-Prepare `wikitext-large`, the Small and Large models, and an exp6 GPT-2 Small training snapshot first. The default snapshot is `data/experiment_results/exp6_stream_gpt2_mlp/wikitext-103-train__gpt2-small/train`; select another with `--nsvd-train-dir`.
-
-```bash
-uv run exp14 fit
-uv run exp14 generate --eval-model-path models/gpt2-small
-uv run exp14 generate --eval-model-path models/gpt2-large
-uv run exp14 report
-```
-
-The default run directory is `data/experiment_results/exp14_paper_lingen/wikitext-large__gpt2-small/`. `fit/` contains sets, coefficients, finite matrices, headers and metadata with residual diagnostics. Each `lingen/<eval-model>/` contains one `.npz` per variant, decoded `samples.jsonl` and summary `metadata.json`; `analysis/` contains `summary.json` and `kl_by_position.png`, and report prints a per-model, per-variant table. Generation resumes completed variants only when their saved configuration matches; mismatched settings require `--overwrite`. Generation `--overwrite` removes existing variant outputs and regenerates them; fit and report also require `--overwrite` to replace existing outputs. The existing BlueHive sync script copies `lingen/` and `analysis/`, but not `fit/`.
-
-On BlueHive, after preparing the data, models and snapshot, submit fit before both generation jobs:
-
-```bash
-mkdir -p bluehive_run/logs
-f=$(sbatch --parsable bluehive_run/exp14-fit.sbatch); f=${f%%;*}
-sbatch --dependency=afterok:$f bluehive_run/exp14-generate.sbatch
-EVAL_MODEL=models/gpt2-large sbatch --dependency=afterok:$f bluehive_run/exp14-generate.sbatch
-# Lower memory use if needed:
-PAIR_BATCH=2048 sbatch bluehive_run/exp14-fit.sbatch
-EVAL_MODEL=models/gpt2-large BASIS_CHUNK=1 sbatch bluehive_run/exp14-generate.sbatch
-```
-
-Fit defaults to `PAIR_BATCH=4096` and overwrites its fit output; generation defaults to `EVAL_MODEL=models/gpt2-small` and `BASIS_CHUNK=2`, and resumes without overwriting completed variants. Do not replace fit output while dependent generation jobs are using it.
-
-## Experiment 15: layered LinGen diagnostics
-
-`exp15` diagnoses existing NeuralSVD snapshots without training or rerunning generation. `direct` compares exact rank-limited centered-logit reconstruction, learned row-span and column refits, the original model, and diagonal-scale / temperature calibration. It uses the saved shared training probe, a newly sampled calibration grid, and independent versus contiguous held-out validation pairs. The oracle minimizes squared centered-logit error, not KL; KL differences between diagnostic layers are descriptive rather than nonnegative error decompositions.
-
-`exp14` compares saved finite/single/NeuralSVD coefficients with coefficients recomputed from the current exp6 snapshot. Full teacher-logit anchors and nullspace-constrained anchors distinguish an inaccurate feature constraint from the choice of its minimum-norm solution. Evaluation uses real held-out futures at lengths 0, 1, 4 and 32; anchors use lengths 1, 4 and 32 only. Decomposition records surrogate and teacher-reconstruction error separately, without treating them as an additive partition (their cross term need not vanish).
-
-```bash
-uv run exp15 direct
-uv run exp15 exp14
-# BlueHive: existing snapshots and exp14 fit outputs must already be present.
-sbatch bluehive_run/exp15-direct.sbatch
-sbatch bluehive_run/exp15-exp14.sbatch
-```
-
-Outputs are under `data/experiment_results/exp15_lingen_diagnostics/<stream>__<model>/analysis/`: `direct/` contains `summary.json`, `layers.png`, and `metadata.json`; `exp14/` contains `summary.json`, `residuals.png`, and `metadata.json`. Existing completed outputs require `--overwrite`. Direct defaults to exp6–exp12; exp14 diagnostics use exp6 only. Metadata records calibration/evaluation settings, formula definitions, and elapsed time; direct summaries record each loaded training step, while exp14 metadata records both the original fit and current snapshot steps. Running training jobs are not paused: these are the snapshots on disk at diagnostic load time, not a synchronized training-step comparison.
-
-For lower GPU inference memory, submit with `PAIR_BATCH=2048`; for a smaller exp14 anchor solve, submit with `ANCHOR_FUTURES=32`. These settings do not modify training or existing generation outputs.
-
-## Experiment 16: frozen-left right-function refitting
-
-`exp16` compares pinned exp6, exp10 and exp11 snapshots with two independently trained right functions per source, while keeping the learned left function frozen. `continue` starts from the source right architecture and weights; `wide` uses a larger right architecture (for exp11, a separate column student trunk and wider head). Evaluation reuses exp15 direct diagnostics on the shared probe and held-out pairs, comparing each source with its two refits.
-
-First prepare the source training snapshots, local models and token streams. Then pin and train each source/variant before evaluating:
-
-```bash
-uv run exp16 pin
-for s in exp6 exp10 exp11; do
-  for v in continue wide; do
-    uv run exp16 train --source "$s" --variant "$v"
-  done
-done
-uv run exp16 evaluate
-```
-
-`pin` reads the source run directories without modifying them and copies their training metadata, features and probe into exp16. It checks for changes during copying and records the source step and feature checksum in `pin.json`. Existing pins are skipped, never overwritten; to select a newer snapshot, remove the relevant exp16 pinned directory and pin it again before starting its refits. Use `--sources` to select a subset; evaluation also accepts `--variants`. All commands accept `--stream`, `--results-root` and `--model-path`, which must identify the intended source runs.
-
-Pinning is a prerequisite for `exp16 train`. Its default sample store is derived from the pinned source metadata's stream, model directory name and history/future lengths, not from the current CLI run locator. Produce that matching store first or pass `--sample-store PATH` to select another compatible store.
-
-Training defaults to 30,000 steps with cosine learning-rate decay from `1e-3` to `1e-5` over 30,000 steps; `--lr-schedule constant` keeps `--lr` fixed. Without `--overwrite`, matching checkpoints resume rather than restarting; completed outputs without a checkpoint require `--overwrite` to replace. Do not run overlapping jobs for the same run directory. Evaluation refuses to replace existing output unless `--overwrite` is supplied.
-
-To continue a finished refit in a new run directory, pass `--init-from <run>` (for example `exp6-continue`) with `--run-name` and `--lr-schedule constant`. The new run loads that run's `checkpoint.pt` (features, Adam state, sampling generator, step count and loss history) without modifying it; `--max-steps` counts total steps including the inherited ones, and `metadata.json` records `init_checkpoint` and `init_step`. Only the learning-rate settings may differ from the original run, and resuming the new run requires the same `--init-from`. Cosine schedules are rejected with `--init-from` because decay is anchored at step 0.
-
-```bash
-uv run exp16 train --source exp6 --variant continue --run-name exp6-continue-constant \
-  --init-from exp6-continue --lr-schedule constant --lr 1e-3 --tol 1e-12 --max-steps 60000
-uv run exp16 evaluate --sources exp6 --variants continue \
-  --extra-runs exp6-continue-constant --output-name continue-constant
-```
-
-`evaluate --extra-runs` adds exp16 run directories by name, and `--output-name` selects the directory under `analysis/` (default `direct`) so subset evaluations do not replace the full comparison.
-
-The default run is `data/experiment_results/exp16_right_refit/wikitext-103-train__gpt2-small/`: pinned snapshots are in `sources/<source>/train/`, trained refits in `<source>-<variant>/train/` (or `<run-name>/train/`), and evaluation writes `analysis/<output-name>/{summary.json,layers.png,metadata.json}`. Source experiment results and exp15 results are not modified.
-
-On BlueHive, after installing `.venv` and preparing the models, streams and source snapshots, pin on the login node and submit from the repository root:
-
-```bash
-source .venv/bin/activate
-exp16 pin
-mkdir -p bluehive_run/logs
-ids=()
-for s in exp6 exp10 exp11; do
-  for v in continue wide; do
-    j=$(SOURCE="$s" VARIANT="$v" sbatch --parsable bluehive_run/exp16-train.sbatch)
-    ids+=("${j%%;*}")
-  done
-done
-sbatch --dependency="afterok:$(IFS=:; echo "${ids[*]}")" bluehive_run/exp16-evaluate.sbatch
-```
-
-Training requires `SOURCE` and `VARIANT`, accepts `MAX_STEPS`, `RUN_NAME`, `LR_SCHEDULE`, `INIT_FROM` and `TOL`, and runs on `preempt` with requeue and appended logs; it omits `--overwrite` so requeued jobs resume. A constant schedule stops as soon as the probe spectrum is stable and then deletes its checkpoint, so pass `TOL=1e-12` when `MAX_STEPS` should be the only stop. The evaluation job runs only after all six succeed, uses `PAIR_BATCH=4096` by default (set `PAIR_BATCH=2048` for lower GPU memory), accepts `SOURCES`, `VARIANTS` and `EXTRA_RUNS` (which then require `OUTPUT_NAME`, so subsets never replace `analysis/direct`), and passes `--overwrite` for its evaluation output.
-
-```bash
-RUN_NAME=exp6-continue-constant INIT_FROM=exp6-continue LR_SCHEDULE=constant TOL=1e-12 MAX_STEPS=60000 \
-  SOURCE=exp6 VARIANT=continue sbatch bluehive_run/exp16-train.sbatch
-SOURCES=exp6 VARIANTS=continue EXTRA_RUNS=exp6-continue-constant OUTPUT_NAME=continue-constant \
-  sbatch bluehive_run/exp16-evaluate.sbatch
-```
+The job requests one GPU on `gpu`, 4 CPUs, 32 GiB and four hours. Defaults are `EXPERIMENTS="exp6"`, `EVAL_STREAMS="wikitext-103-train wikitext-103-validation"`, and `STREAM=wikitext-103-train`. It builds the validation stream if its `.npy` is missing, then runs both modes for every selected experiment and evaluation stream with `--overwrite`; a failed command stops the job. Slurm stdout/stderr are `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>.{out,err}`; per-mode logs and `build-validation-stream.out` (when built) are under `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>/`. Use the guarded [sync commands](#sync-analysis-and-lingen-results-from-bluehive) to preview and download the results.
 
 ## Python inference API
 
@@ -1071,7 +838,7 @@ RUN_SLOW=1 uv run python -m unittest \
   tests.test_exp4_neural_svd.Exp4NeuralSVDTests.test_training_and_analysis_recover_top_two_singular_values -v
 ```
 
-Streaming exp6/exp7/exp8 also have opt-in tiny-model top-two singular-value recovery tests using a static 64-block sample store (30,000-step cosine decay, with a 60,000-step guard for each architecture; no downloaded model or dataset needed):
+Streaming exp6 also has an opt-in tiny-model top-two singular-value recovery test using a static 64-block sample store (30,000-step cosine decay, with a 60,000-step guard; no downloaded model or dataset needed):
 
 ```bash
 RUN_SLOW=1 uv run python -m unittest tests.test_stream_neural_svd -v

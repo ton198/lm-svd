@@ -5,7 +5,6 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -13,12 +12,6 @@ from torch import nn
 from transformers import GPT2Config, GPT2LMHeadModel
 
 from experiments.exp6_stream_gpt2_mlp.features import build_features as build_mlp_features
-from experiments.exp7_stream_transformer.features import (
-    build_features as build_transformer_features,
-)
-from experiments.exp8_stream_token_mlp.features import (
-    build_features as build_token_mlp_features,
-)
 from utils.inference import CausalLMInference
 from utils.sample_store import produce_blocks, slot_bytes
 from utils.stream_neural_svd import (
@@ -115,52 +108,19 @@ class StreamNeuralSVDTests(unittest.TestCase):
         output_dir: Path,
         *,
         rank: int = 2,
-        architecture: str = "exp6",
         mlp_width: int = 16,
         **overrides,
     ) -> dict:
         torch.manual_seed(0)
-        if architecture == "exp6":
-            features = build_mlp_features(
-                {
-                    "kind": "frozen_gpt2_mlp",
-                    "mlp_width": mlp_width,
-                    "hidden_size": 8,
-                    "rank": rank,
-                },
-                self.inference,
-            )
-        elif architecture == "exp7":
-            features = build_transformer_features(
-                {
-                    "kind": "small_transformer",
-                    "model_dim": 16,
-                    "layers": 1,
-                    "heads": 2,
-                    "history_tokens": 3,
-                    "future_tokens": 2,
-                    "vocab_size": 11,
-                    "hidden_size": 8,
-                    "rank": rank,
-                },
-                self.inference,
-            )
-        elif architecture == "exp8":
-            features = build_token_mlp_features(
-                {
-                    "kind": "token_mlp",
-                    "embedding_dim": 8,
-                    "mlp_width": mlp_width,
-                    "history_tokens": 3,
-                    "future_tokens": 2,
-                    "vocab_size": 11,
-                    "hidden_size": 8,
-                    "rank": rank,
-                },
-                self.inference,
-            )
-        else:
-            raise ValueError(f"unknown test architecture: {architecture}")
+        features = build_mlp_features(
+            {
+                "kind": "frozen_gpt2_mlp",
+                "mlp_width": mlp_width,
+                "hidden_size": 8,
+                "rank": rank,
+            },
+            self.inference,
+        )
         kwargs = dict(
             features=features,
             inference=self.inference,
@@ -512,57 +472,17 @@ class StreamNeuralSVDTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checkpoint sample store mismatch.*store_dir"):
             self._train(output_dir, max_steps=8, sample_store=other_store)
 
-    def test_exp8_training_does_not_run_teacher_for_targets(self) -> None:
-        with patch.object(
-            self.inference, "final_hidden_states", side_effect=AssertionError("teacher called")
-        ):
-            result = self._train(self.root / "exp8_store_only", architecture="exp8", max_steps=2)
-        self.assertEqual(result["steps"], 2)
-
     def test_resume_rejects_changed_rank(self) -> None:
         output_dir = self.root / "rank_mismatch"
         self._train(output_dir, max_steps=4)
         with self.assertRaisesRegex(ValueError, "checkpoint config mismatch.*rank"):
             self._train(output_dir, rank=3, max_steps=10)
 
-    def test_init_checkpoint_continues_another_run_with_constant_lr(self) -> None:
-        source_dir = self.root / "init_source"
-        self._train(source_dir, lr_schedule="cosine", lr_decay_steps=4, max_steps=4)
-        source_checkpoint = source_dir / "checkpoint.pt"
-        source_bytes = source_checkpoint.read_bytes()
-        source_history = np.load(source_dir / "loss_history.npy")
-
-        output_dir = self.root / "init_constant"
-        with self.assertRaisesRegex(ValueError, "requires lr_schedule constant"):
-            self._train(output_dir, lr_schedule="cosine", init_checkpoint=source_checkpoint)
-        with self.assertRaisesRegex(ValueError, "init checkpoint config mismatch.*rank"):
-            self._train(output_dir, rank=3, init_checkpoint=source_checkpoint)
-        result = self._train(
-            output_dir, lr=5e-4, max_steps=7, init_checkpoint=source_checkpoint, tol=1e-12
-        )
-        self.assertEqual(result["steps"], 7)
-        metadata = json.loads((output_dir / "metadata.json").read_text())
-        self.assertEqual(metadata["final_lr"], 5e-4)
-        self.assertEqual(metadata["init_step"], 4)
-        history = np.load(output_dir / "loss_history.npy")
-        self.assertEqual(len(history), 7)
-        np.testing.assert_array_equal(history[:4], source_history)
-        self.assertEqual(source_checkpoint.read_bytes(), source_bytes)
-
-        # The initialized run resumes from its own checkpoint, keeping its origin.
-        resumed = self._train(
-            output_dir, lr=5e-4, max_steps=9, init_checkpoint=source_checkpoint, tol=1e-12
-        )
-        self.assertEqual(resumed["steps"], 9)
-        self.assertEqual(json.loads((output_dir / "metadata.json").read_text())["init_step"], 4)
-        with self.assertRaisesRegex(ValueError, "checkpoint config mismatch.*init_checkpoint"):
-            self._train(output_dir, lr=5e-4, max_steps=11, tol=1e-12)
-
     @unittest.skipUnless(
         os.environ.get("RUN_SLOW") == "1",
         "convergence training is slow; set RUN_SLOW=1 to run it",
     )
-    def test_both_architectures_recover_all_starts_operator_top_two(self) -> None:
+    def test_exp6_recovers_all_starts_operator_top_two(self) -> None:
         slow_store = self.root / "slow_store"
         produce_blocks(
             store_dir=slow_store,
@@ -589,40 +509,32 @@ class StreamNeuralSVDTests(unittest.TestCase):
             dense / np.sqrt(10 * 11 * 11), compute_uv=False
         )[:2]
         gram = self.token_matrix.double().T @ self.token_matrix.double()
-        for architecture in ("exp6", "exp7", "exp8"):
-            with self.subTest(architecture=architecture):
-                output_dir = self.root / "convergence" / architecture
-                self._train(
-                    output_dir,
-                    sample_store=slow_store,
-                    architecture=architecture,
-                    mlp_width=64,
-                    history_batch=8,
-                    future_batch=8,
-                    lr=3e-3,
-                    lr_schedule="cosine",
-                    lr_decay_steps=30000,
-                    min_lr=1e-5,
-                    max_steps=60000,
-                    eval_every=1000,
-                    checkpoint_every=1000,
-                )
-                metadata = json.loads((output_dir / "metadata.json").read_text())
-                builder = {
-                    "exp6": build_mlp_features,
-                    "exp7": build_transformer_features,
-                    "exp8": build_token_mlp_features,
-                }[architecture]
-                features = builder(metadata["features"], self.inference)
-                features.load_state_dict(
-                    torch.load(output_dir / "features.pt", map_location="cpu", weights_only=True)
-                )
-                spectrum = learned_probe_spectrum(
-                    features, histories, futures, gram, vocab_size=11,
-                )
-                np.testing.assert_allclose(
-                    spectrum.singular_values, expected, rtol=2e-2, atol=0
-                )
+        output_dir = self.root / "convergence" / "exp6"
+        self._train(
+            output_dir,
+            sample_store=slow_store,
+            mlp_width=64,
+            history_batch=8,
+            future_batch=8,
+            lr=3e-3,
+            lr_schedule="cosine",
+            lr_decay_steps=30000,
+            min_lr=1e-5,
+            max_steps=60000,
+            eval_every=1000,
+            checkpoint_every=1000,
+        )
+        metadata = json.loads((output_dir / "metadata.json").read_text())
+        features = build_mlp_features(metadata["features"], self.inference)
+        features.load_state_dict(
+            torch.load(output_dir / "features.pt", map_location="cpu", weights_only=True)
+        )
+        spectrum = learned_probe_spectrum(
+            features, histories, futures, gram, vocab_size=11,
+        )
+        np.testing.assert_allclose(
+            spectrum.singular_values, expected, rtol=2e-2, atol=0
+        )
 
 
 if __name__ == "__main__":

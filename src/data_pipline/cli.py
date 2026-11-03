@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     token_stream = subparsers.add_parser(
         "build-token-stream",
-        help="Tokenize a full split into one token stream for exp6/exp7",
+        help="Tokenize a full split into one token stream for exp6",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     token_stream.add_argument(

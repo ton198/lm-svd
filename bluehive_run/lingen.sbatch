@@ -23,7 +23,7 @@ nvidia-smi
 source .venv/bin/activate
 
 train_stream="${STREAM:-wikitext-103-train}"
-experiments="${EXPERIMENTS:-exp6 exp7 exp8 exp9 exp10}"
+experiments="${EXPERIMENTS:-exp6}"
 eval_streams="${EVAL_STREAMS:-wikitext-103-train wikitext-103-validation}"
 modes="${MODES:-onestep autoregressive}"
 if [[ ! -f data/token_streams/wikitext-103-validation.npy ]]; then

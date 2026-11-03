@@ -13,16 +13,6 @@ class CLIStartupTests(unittest.TestCase):
             "experiments.exp4_neural_svd.cli",
             "experiments.exp5_L_M_neural_svd.cli",
             "experiments.exp6_stream_gpt2_mlp.cli",
-            "experiments.exp7_stream_transformer.cli",
-            "experiments.exp8_stream_token_mlp.cli",
-            "experiments.exp9_stream_sentence_mlp.cli",
-            "experiments.exp10_stream_sentence_mlp_joint.cli",
-            "experiments.exp11_stream_student.cli",
-            "experiments.exp12_stream_student_nodistill.cli",
-            "experiments.exp13_stream_student_noskip.cli",
-            "experiments.exp14_paper_lingen.cli",
-            "experiments.exp15_lingen_diagnostics.cli",
-            "experiments.exp16_right_refit.cli",
             "utils.sample_store_cli",
         ):
             with self.subTest(module=module):

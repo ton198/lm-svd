@@ -238,7 +238,7 @@ Step-1 future 0:
 
 - 1309 JSON lines, each with `id`, `source`, `category`, `instruction`;
 - by source: 213 `sni` (Super-NaturalInstructions), 88 `tasksource`, 8 `flan`, 1000 `synthetic`;
-- the catalog is frozen and its SHA-256 is recorded in the output metadata. It was produced beforehand: source tasks were filtered with heuristics for "one arbitrary prose document" inputs, and synthetic instructions were added one at a time with the `synthesize-single-text-tasks` skill. The builder does not modify it.
+- the catalog is frozen and its SHA-256 is recorded in the output metadata. It was produced beforehand: source tasks were filtered with heuristics for "one arbitrary prose document" inputs, and synthetic instructions were added one at a time. The builder does not modify it.
 
 **C4 documents** `data/original/c4/en/c4-validation.00000-of-00008.json.gz`:
 

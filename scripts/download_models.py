@@ -15,14 +15,6 @@ GPT2_FILES = (
     "vocab.json",
     "merges.txt",
 )
-MINILM_FILES = (
-    "config.json",
-    "model.safetensors",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "vocab.txt",
-)
 MODELS = {
     "small": (
         "openai-community/gpt2",
@@ -41,12 +33,6 @@ MODELS = {
         "32b71b12589c2f8d625668d2335a01cac3249519",
         "gpt2-large",
         GPT2_FILES,
-    ),
-    "minilm": (
-        "sentence-transformers/all-MiniLM-L6-v2",
-        "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
-        "all-MiniLM-L6-v2",
-        MINILM_FILES,
     ),
 }
 
