@@ -389,6 +389,46 @@ class AnalysisTests(unittest.TestCase):
             run_analysis(result_dir=run, centering="none", device="cpu", overwrite=False)
         run_analysis(result_dir=run, centering="none", device="cpu", overwrite=True)
 
+    def test_exp2_stream_seed_selects_run_directory(self) -> None:
+        base = self.root / "exp2_PFH"
+        seeded_run = base / "wikitext-103-train-adjacent-seed1__gpt2-small"
+        unseeded_run = base / "wikitext-103-train-adjacent__gpt2-small"
+        inference = seeded_run / "inference"
+        inference.mkdir(parents=True)
+        np.save(inference / "pmi.npy", np.array([[5., 1., 0.], [2., 4., 6.], [0., 3., -1.]]))
+        (inference / "metadata.json").write_text(
+            json.dumps({"source": {"pairing": "adjacent", "seed": 1}}), encoding="utf-8"
+        )
+        command = [
+            "analysis", "--stream", "wikitext-103-train", "--pairing", "adjacent",
+            "--seed", "1", "--results-root", str(self.root), "--centering", "none",
+            "--device", "cpu",
+        ]
+        with redirect_stdout(StringIO()):
+            exp2_main(command)
+        self.assertTrue((seeded_run / "analysis" / "none" / "metadata.json").exists())
+        self.assertFalse(unseeded_run.exists())
+
+        seed_index = command.index("--seed") + 1
+        command[seed_index] = "0"
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            exp2_main(command)
+        self.assertIn(
+            "wikitext-103-train-adjacent__gpt2-small/inference/pmi.npy", stderr.getvalue()
+        )
+
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            exp2_main(["analysis", "--seed", "1", "--results-root", str(self.root), "--device", "cpu"])
+        self.assertIn("--seed requires --stream", stderr.getvalue())
+
+        command[seed_index] = "-1"
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            exp2_main(command)
+        self.assertIn("--seed must be non-negative", stderr.getvalue())
+
     def test_each_experiment_reads_its_own_matrix(self) -> None:
         for module, matrix_name in (
             (exp1_analysis, "matrix.npy"),

@@ -307,7 +307,9 @@ uv run exp2 analysis --model-path "models/$MODEL" \
 
 ### Shared sample-store input
 
-Instead of Parquet, `--stream NAME` selects a compatible public sample store and its token stream `data/token_streams/NAME.npy` and sibling metadata JSON. `--stream` and `--dataset` are mutually exclusive. Stream inference requires explicit matrix dimensions `--history-count` and `--future-count`; `--history-tokens` and `--future-tokens` default to 64 and 32. `--seed` defaults to 0 and controls consumer block and row/column selection, not the producer's sampling seed. These options and `--sample-store` apply only to stream inference.
+Instead of Parquet, `--stream NAME` selects a compatible public sample store and its token stream `data/token_streams/NAME.npy` and sibling metadata JSON. `--stream` and `--dataset` are mutually exclusive. Stream inference requires explicit matrix dimensions `--history-count` and `--future-count`; `--history-tokens` and `--future-tokens` default to 64 and 32. `--seed` defaults to 0 and controls consumer block and row/column selection, not the producer's sampling seed. These window options and `--sample-store` apply only to stream inference.
+
+Pass the same `--seed` to inference and analysis: nonzero stream seeds append `-seed<N>` to the run name (after `-adjacent` if used), while seed 0 leaves it unchanged.
 
 The producer draws and persists window starts; exp2 selects stored blocks and concatenates selected starts until both requested counts are met, then reconstructs the windows from the token stream. This is not independent raw-stream sampling by exp2. The cached final hidden states cannot provide the tokenwise probabilities needed for PMI, so exp2 still runs language-model forwards. The store is a live rolling ring: blocks can be overwritten, so the same consumer seed alone is not a durable snapshot. Retain the recorded exact starts and observed block shard/sequence for reproducibility.
 
@@ -328,7 +330,7 @@ Pass `--pairing adjacent` to both inference and analysis. Adjacent runs use `<re
 ```bash
 uv run exp2 inference --device cpu --stream "$STREAM" --pairing adjacent \
   --sample-store "$STORE" --history-count 6 --future-count 6 --batch-size 3 --seed 5
-uv run exp2 analysis --device cpu --stream "$STREAM" --pairing adjacent --centering none
+uv run exp2 analysis --device cpu --stream "$STREAM" --pairing adjacent --seed 5 --centering none
 ```
 
 Adjacent analysis adds `pairing_diagnostics` to metadata and a `pairing:` summary line: diagonal/off-diagonal means and population standard deviations, mean gap, row/column top-1 fractions, and mean ranks. Ranks count entries strictly greater than the diagonal entry, so ties share the best rank. These diagnostics describe the stored uncentered PMI matrix and are identical across centerings; independent and Parquet runs omit them.
@@ -599,7 +601,7 @@ Other useful options:
 - `inference --history-count N --future-count N`: use leading samples of each Parquet group; omit both to use all available samples. For exp2 streams, both counts are required and specify the matrix dimensions assembled from sampled store blocks.
 - `exp1 inference --top-k K`: select K header tokens per future; default 50.
 - `exp2 inference --batch-size N`: score N futures per inference batch; default 64.
-- `exp2 --stream NAME`: select a shared-store stream instead of a dataset for inference or analysis. Inference accepts `--sample-store PATH` (optional store override), `--history-tokens`, `--future-tokens`, and consumer selection `--seed`.
+- `exp2 --stream NAME`: select a shared-store stream instead of a dataset for inference or analysis. Both stages accept consumer selection `--seed`; inference also accepts `--sample-store PATH` (optional store override), `--history-tokens`, and `--future-tokens`.
 - `exp2 --pairing {independent,adjacent}`: select stream pairing for inference and analysis; default `independent`. Adjacent inference requires equal counts and analysis uses the separate adjacent run directory.
 - `inference --device cpu`: use CPU instead of the default CUDA device.
 

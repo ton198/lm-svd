@@ -34,6 +34,10 @@ def _add_source_arguments(parser: argparse.ArgumentParser) -> None:
         help="With --stream: 'independent' uses the store's future starts; 'adjacent' uses the tokens right after each history as its future, so diagonal entries are matched pairs",
     )
     parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Store-selection seed with --stream (default: 0); a nonzero seed adds -seed<N> to the run directory name",
+    )
+    parser.add_argument(
         "--results-root",
         type=Path,
         default=DEFAULT_RESULTS_ROOT,
@@ -70,10 +74,6 @@ def main(argv: list[str] | None = None) -> None:
         help="Future window length with --stream (default: 32)",
     )
     inference_parser.add_argument(
-        "--seed", type=int, default=None,
-        help="Store-selection seed with --stream (default: 0)",
-    )
-    inference_parser.add_argument(
         "--batch-size", type=positive_int, default=64, help="Inference batch size"
     )
     inference_parser.add_argument("--overwrite", action="store_true")
@@ -96,12 +96,16 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.stream is None and args.pairing == "adjacent":
         parser.error("--pairing adjacent requires --stream")
+    if args.stream is None and args.seed is not None:
+        parser.error("--seed requires --stream")
+    if args.seed is not None and args.seed < 0:
+        parser.error("--seed must be non-negative")
     if args.command == "inference":
         if args.stream is None:
             if args.sample_store is not None:
                 parser.error("--sample-store requires --stream")
-            if any(value is not None for value in (args.history_tokens, args.future_tokens, args.seed)):
-                parser.error("--history-tokens, --future-tokens and --seed require --stream")
+            if any(value is not None for value in (args.history_tokens, args.future_tokens)):
+                parser.error("--history-tokens and --future-tokens require --stream")
         elif args.history_count is None or args.future_count is None:
             parser.error("--stream requires --history-count and --future-count")
         else:
@@ -113,6 +117,8 @@ def main(argv: list[str] | None = None) -> None:
     label = args.stream if args.stream is not None else args.dataset
     if args.pairing == "adjacent":
         label = f"{label}-adjacent"
+    if args.seed:
+        label = f"{label}-seed{args.seed}"
     try:
         result_dir = run_dir(
             args.results_root, EXPERIMENT, label, args.model_path.name
