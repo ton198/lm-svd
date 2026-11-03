@@ -11,6 +11,7 @@ import torch
 
 from utils.common import load_samples, save_json, save_numpy, write_atomic
 from utils.inference import CausalLMInference
+from utils.sample_store import SampleStoreReader, read_store_config
 from utils.stream_neural_svd import TokenStream
 
 from .analysis import MATRIX_NAME
@@ -45,8 +46,11 @@ def parquet_inputs(
     )
 
 
-def stream_inputs(
+def sample_store_inputs(
+    *,
+    store_dir: Path,
     stream_path: Path,
+    model_path: Path,
     history_count: int,
     future_count: int,
     history_tokens: int,
@@ -55,23 +59,57 @@ def stream_inputs(
 ) -> Exp2Inputs:
     if seed < 0:
         raise ValueError("seed must be non-negative")
+    if history_count <= 0 or future_count <= 0:
+        raise ValueError("history_count and future_count must be positive")
     stream = TokenStream(stream_path)
+    config = read_store_config(store_dir)
+    history_batch = min(history_count, config["block_histories"])
+    future_batch = min(future_count, config["block_futures"])
+    if history_batch <= 0 or future_batch <= 0:
+        raise ValueError("sample store block dimensions must be positive")
+    reader = SampleStoreReader(
+        store_dir, model_path=model_path, stream_path=stream_path, stream=stream,
+        hidden_size=config["hidden_size"], vocab_size=config["vocab_size"],
+        history_tokens=history_tokens, future_tokens=future_tokens,
+        history_batch=history_batch, future_batch=future_batch,
+    )
+    reader.wait_until_ready()
     generator = torch.Generator().manual_seed(seed)
-    history_starts = stream.sample_starts(history_count, history_tokens, generator)
-    future_starts = stream.sample_starts(future_count, future_tokens, generator)
+    history_parts = []
+    future_parts = []
+    blocks = []
+    histories_read = futures_read = 0
+    while histories_read < history_count or futures_read < future_count:
+        hs, fs, block = reader.sample_starts(generator)
+        hs = hs[:history_count - histories_read]
+        fs = fs[:future_count - futures_read]
+        block["history_indices"] = block["history_indices"][:len(hs)]
+        block["future_indices"] = block["future_indices"][:len(fs)]
+        block["history_range"] = [histories_read, histories_read + len(hs)]
+        block["future_range"] = [futures_read, futures_read + len(fs)]
+        history_parts.append(hs)
+        future_parts.append(fs)
+        histories_read += len(hs)
+        futures_read += len(fs)
+        blocks.append(block)
+    history_starts = torch.cat(history_parts)
+    future_starts = torch.cat(future_parts)
     return Exp2Inputs(
         histories=stream.windows(history_starts, history_tokens).tolist(),
         futures=stream.windows(future_starts, future_tokens).tolist(),
         source={
-            "kind": "token_stream",
+            "kind": "sample_store",
+            "store_dir": str(store_dir),
+            "store_config": reader.config,
             "stream_path": str(stream_path),
             "stream_metadata": stream.metadata,
             "history_tokens": history_tokens,
             "future_tokens": future_tokens,
             "seed": seed,
-            "sampling": "uniform window starts with replacement via TokenStream.sample_starts; histories then futures from torch.Generator().manual_seed(seed)",
+            "sampling": "uniform blocks with replacement and independent row and column permutations via torch.Generator().manual_seed(seed)",
             "history_starts": history_starts.tolist(),
             "future_starts": future_starts.tolist(),
+            "blocks": blocks,
         },
     )
 

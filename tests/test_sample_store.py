@@ -135,6 +135,33 @@ class SampleStoreTests(unittest.TestCase):
             hs, _, _ = reader.sample(gen)
             self.assertIn(sorted(hs.tolist()), all_histories)
 
+    def test_sample_starts_matches_sample_subgrid_and_identity(self) -> None:
+        params = dict(shards=2, max_bytes=2 * slot_bytes(4, 3, 8))
+        self.produce(**params, shard=0)
+        self.produce(**params, shard=1)
+        reader = self.reader(history_batch=2, future_batch=2)
+        reader.wait_until_ready()
+        sample_gen = torch.Generator().manual_seed(17)
+        starts_gen = torch.Generator().manual_seed(17)
+        expected_gen = torch.Generator().manual_seed(17)
+        for _ in range(20):
+            hs, fs, states = reader.sample(sample_gen)
+            starts_hs, starts_fs, metadata = reader.sample_starts(starts_gen)
+            slot = int(torch.randint(2, (1,), generator=expected_gen))
+            rows = torch.randperm(4, generator=expected_gen)[:2].tolist()
+            cols = torch.randperm(3, generator=expected_gen)[:2].tolist()
+            self.assertTrue(torch.equal(hs, starts_hs))
+            self.assertTrue(torch.equal(fs, starts_fs))
+            with np.load(slot_path(self.store_dir, slot)) as data:
+                self.assertEqual(metadata, {
+                    "slot": slot, "sequence": int(data["sequence"]),
+                    "shard": int(data["shard"]), "history_indices": rows,
+                    "future_indices": cols,
+                })
+                np.testing.assert_array_equal(hs.numpy(), data["history_starts"][rows])
+                np.testing.assert_array_equal(fs.numpy(), data["future_starts"][cols])
+                np.testing.assert_array_equal(states.numpy(), data["states"][rows][:, cols])
+
     def test_reader_subgrid_and_validation(self) -> None:
         self.produce()
         reader = self.reader(history_batch=2, future_batch=2)

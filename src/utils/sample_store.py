@@ -215,7 +215,7 @@ class SampleStoreReader:
             print(f"waiting for sample store {self.store_dir}: {total}/{ready} blocks", flush=True)
             time.sleep(WAIT_SECONDS)
 
-    def sample(self, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _sample_indices(self, generator: torch.Generator) -> tuple[int, torch.Tensor, torch.Tensor]:
         if sum(self._filled) < self.config["num_slots"]:
             self._filled = [state["filled"] for state in read_shard_states(self.store_dir, self.config["shards"])]
         local = int(torch.randint(sum(self._filled), (1,), generator=generator))
@@ -224,10 +224,30 @@ class SampleStoreReader:
                 break
             local -= filled
         slot = local * self.config["shards"] + shard
+        rows = torch.randperm(self.config["block_histories"], generator=generator)[:self.history_batch]
+        cols = torch.randperm(self.config["block_futures"], generator=generator)[:self.future_batch]
+        return slot, rows, cols
+
+    def sample(self, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        slot, rows, cols = self._sample_indices(generator)
         with np.load(slot_path(self.store_dir, slot)) as data:
             hs = torch.from_numpy(data["history_starts"])
             fs = torch.from_numpy(data["future_starts"])
             states = torch.from_numpy(data["states"])
-        rows = torch.randperm(self.config["block_histories"], generator=generator)[:self.history_batch]
-        cols = torch.randperm(self.config["block_futures"], generator=generator)[:self.future_batch]
         return hs[rows], fs[cols], states[rows][:, cols]
+
+    def sample_starts(self, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        slot, rows, cols = self._sample_indices(generator)
+        # A single open archive remains a consistent snapshot if the slot is replaced.
+        with np.load(slot_path(self.store_dir, slot)) as data:
+            hs = torch.from_numpy(data["history_starts"])[rows]
+            fs = torch.from_numpy(data["future_starts"])[cols]
+            sequence = int(data["sequence"])
+            shard = int(data["shard"])
+        return hs, fs, {
+            "slot": slot,
+            "sequence": sequence,
+            "shard": shard,
+            "history_indices": rows.tolist(),
+            "future_indices": cols.tolist(),
+        }

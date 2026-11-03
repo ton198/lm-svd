@@ -9,6 +9,7 @@ from utils.experiment_paths import (
     INFERENCE_DIR,
     dataset_samples_path,
     run_dir,
+    sample_store_dir,
     token_stream_path,
 )
 
@@ -26,7 +27,7 @@ def _add_source_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--stream",
         default=None,
-        help="Token stream name; samples windows from data/token_streams/<stream>.npy",
+        help="Token stream name; selects windows from its shared sample store",
     )
     parser.add_argument(
         "--results-root",
@@ -53,6 +54,10 @@ def main(argv: list[str] | None = None) -> None:
     inference_parser.add_argument("--history-count", type=positive_int, default=None)
     inference_parser.add_argument("--future-count", type=positive_int, default=None)
     inference_parser.add_argument(
+        "--sample-store", type=Path, default=None,
+        help="Shared sample store directory with --stream (default: derived from stream, model and window lengths)",
+    )
+    inference_parser.add_argument(
         "--history-tokens", type=positive_int, default=None,
         help="History window length with --stream (default: 64)",
     )
@@ -62,7 +67,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     inference_parser.add_argument(
         "--seed", type=int, default=None,
-        help="Sampling seed with --stream (default: 0)",
+        help="Store-selection seed with --stream (default: 0)",
     )
     inference_parser.add_argument(
         "--batch-size", type=positive_int, default=64, help="Inference batch size"
@@ -87,6 +92,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command == "inference":
         if args.stream is None:
+            if args.sample_store is not None:
+                parser.error("--sample-store requires --stream")
             if any(value is not None for value in (args.history_tokens, args.future_tokens, args.seed)):
                 parser.error("--history-tokens, --future-tokens and --seed require --stream")
         elif args.history_count is None or args.future_count is None:
@@ -112,16 +119,24 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
             return
-        from .feature_logprob import build_exp2_pfh, parquet_inputs, stream_inputs
+        from .feature_logprob import build_exp2_pfh, parquet_inputs, sample_store_inputs
 
         if args.stream is not None:
-            inputs = stream_inputs(
-                token_stream_path(args.stream),
-                args.history_count,
-                args.future_count,
-                history_tokens,
-                future_tokens,
-                seed,
+            inputs = sample_store_inputs(
+                store_dir=(
+                    args.sample_store
+                    if args.sample_store is not None
+                    else sample_store_dir(
+                        args.stream, args.model_path.name, history_tokens, future_tokens
+                    )
+                ),
+                stream_path=token_stream_path(args.stream),
+                model_path=args.model_path,
+                history_count=args.history_count,
+                future_count=args.future_count,
+                history_tokens=history_tokens,
+                future_tokens=future_tokens,
+                seed=seed,
             )
         else:
             inputs = parquet_inputs(

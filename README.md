@@ -148,7 +148,7 @@ This writes `data/history_future_samples/wikitext-large.parquet` with **10000 hi
 
 The pipeline processes sorted shards and rows, encodes each text row independently, concatenates token IDs without inserting separators or EOS tokens, and samples distinct non-overlapping windows. Windows may cross source-row boundaries. Output columns are `sample_id`, `group`, `token_count`, `start_token`, `token_ids`, and `text`. Experiments use **`token_ids`**, not re-encoded text. Sampling settings and source information are stored in the Parquet schema's `lm_svd` metadata.
 
-Experiments using sample sets load them only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). Prepared names include `wikitext`, `wikitext-large`, and `task-single-text`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment. exp2 can alternatively sample windows from a token stream, as described below.
+Experiments using sample sets load them only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). Prepared names include `wikitext`, `wikitext-large`, and `task-single-text`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment. exp2 can alternatively consume a shared sample store, as described below.
 
 ### Task × document samples
 
@@ -303,20 +303,23 @@ uv run exp2 analysis --model-path "models/$MODEL" \
   --dataset "$DATASET" --results-root "$RESULTS_ROOT" --centering none
 ```
 
-`inference` writes `pmi.npy` and `metadata.json` under `$RESULT_DIR/inference/`; `exp2 analysis` reads `inference/pmi.npy`. The metadata records the score definition and a nested `source`: Parquet sources include the sample path, selected sample IDs and parsed source metadata; token-stream sources include the stream path and metadata, window lengths, seed and sampled starts. Old `feature_log_prob.npy` files are neither migrated nor deleted, and analysis of an old run requires a new `pmi.npy`. Rerunning inference where `metadata.json` already exists requires `--overwrite`, even if `pmi.npy` does not yet exist.
+`inference` writes `pmi.npy` and `metadata.json` under `$RESULT_DIR/inference/`; `exp2 analysis` reads `inference/pmi.npy`. The metadata records the score definition and a nested `source`: Parquet sources include the sample path, selected sample IDs and parsed source metadata. Sample-store sources record `kind: "sample_store"`, the store directory and configuration, stream path and metadata, window lengths, consumer seed, exact starts, and selected blocks with their observed shard, sequence, row/column indices and output ranges. Old `feature_log_prob.npy` files are neither migrated nor deleted, and analysis of an old run requires a new `pmi.npy`. Rerunning inference where `metadata.json` already exists requires `--overwrite`, even if `pmi.npy` does not yet exist.
 
-### Token-stream input
+### Shared sample-store input
 
-Instead of Parquet, pass `--stream NAME` to sample windows from `data/token_streams/NAME.npy` and its sibling metadata JSON. `--stream` and `--dataset` are mutually exclusive. Stream inference requires explicit `--history-count` and `--future-count`; `--history-tokens`, `--future-tokens`, and `--seed` default to 64, 32, and 0, respectively, and apply only to streams. Starts are drawn uniformly with replacement, histories first and then futures, using the seeded generator. Use the same stream, model and results root for analysis:
+Instead of Parquet, `--stream NAME` selects a compatible public sample store and its token stream `data/token_streams/NAME.npy` and sibling metadata JSON. `--stream` and `--dataset` are mutually exclusive. Stream inference requires explicit matrix dimensions `--history-count` and `--future-count`; `--history-tokens` and `--future-tokens` default to 64 and 32. `--seed` defaults to 0 and controls consumer block and row/column selection, not the producer's sampling seed. These options and `--sample-store` apply only to stream inference.
+
+The producer draws and persists window starts; exp2 selects stored blocks and concatenates selected starts until both requested counts are met, then reconstructs the windows from the token stream. This is not independent raw-stream sampling by exp2. The cached final hidden states cannot provide the tokenwise probabilities needed for PMI, so exp2 still runs language-model forwards. The store is a live rolling ring: blocks can be overwritten, so the same consumer seed alone is not a durable snapshot. Retain the recorded exact starts and observed block shard/sequence for reproducibility.
 
 ```bash
 STREAM=wikitext-103-train
-uv run exp2 inference --device cpu --stream "$STREAM" \
+STORE=data/sample_stores/wikitext-103-train__gpt2-small__h64-f32
+uv run exp2 inference --device cpu --stream "$STREAM" --sample-store "$STORE" \
   --history-count 3 --future-count 4 --batch-size 4
 uv run exp2 analysis --device cpu --stream "$STREAM" --centering none
 ```
 
-With default model and results root, this run is stored under `data/experiment_results/exp2_PFH/wikitext-103-train__gpt2-small/`. For stream creation, see the streaming experiments section below.
+`--sample-store` is optional; by default the directory is derived from stream, model directory name and window lengths, here `data/sample_stores/wikitext-103-train__gpt2-small__h64-f32`. Produce a compatible store first using `sample-store produce` (see the shared store section below). With default model and results root, this run is stored under `data/experiment_results/exp2_PFH/wikitext-103-train__gpt2-small/`. Analysis uses the same stream, model and results root to locate the run; it does not consume the store.
 
 On CIRC BlueHive, `bluehive_run/exp2-inference.sbatch` and `bluehive_run/exp2-analysis.sbatch` both request partition `h100`, QoS `h100`, and one H100 GPU. They retain 4 CPUs and 16G memory, with 6 hours for inference and 1 hour for analysis. Submit from the repository root with matching `DATASET` values and an `afterok` dependency; analysis runs all four centering modes. Both scripts overwrite existing outputs, so cancel any older jobs for the same dataset before resubmitting.
 
@@ -569,7 +572,7 @@ Rerunning analysis does not remove preexisting legacy JSON artifacts. Manually r
 
 **Analysis does not infer the model or source from your last `inference` call.** Both subcommands default to `--dataset wikitext` and `--results-root data/experiment_results`, with `--model-path models/gpt2-small` for exp1/exp2, or `--model-a-path models/gpt2-small --model-b-path models/gpt2-medium` for exp3. Pass matching dataset (or, for exp2, stream), results-root, and model flags to inference and analysis for nondefault runs.
 
-Analysis uses only the model paths' directory names to locate the run: it does not load a model, check that the model directory exists, or require/check the sample file or token stream. It validates the source name's format. Inference resolves the named sample file or exp2 token stream in its fixed directory. `--results-root PATH` selects the parent of the experiment directory, not the run root or its `inference/` or `analysis/` child.
+Analysis uses only the model paths' directory names to locate the run: it does not load a model, check that the model directory exists, or require/check the sample file, token stream, or sample store. It validates the source name's format. Inference resolves the named sample file or exp2 token stream in its fixed directory and, for exp2 streams, reads a compatible sample store. `--results-root PATH` selects the parent of the experiment directory, not the run root or its `inference/` or `analysis/` child.
 
 Existing WikiText results have moved to the dataset-prefixed run directories above, and prepared sample files have been renamed to the plain dataset filenames. Historical `metadata.json` files are unchanged: their original `samples_path` values remain records of the inputs used at the time, even though those files have since been renamed.
 
@@ -579,10 +582,10 @@ Other useful options:
 
 - `--dataset NAME`: select a named sample set for inference or analysis; default `wikitext`.
 - `--results-root PATH`: select the results root for inference or analysis; default `data/experiment_results`.
-- `inference --history-count N --future-count N`: use leading samples of each Parquet group; omit both to use all available samples. For exp2 streams, both counts are required and specify the numbers of sampled windows.
+- `inference --history-count N --future-count N`: use leading samples of each Parquet group; omit both to use all available samples. For exp2 streams, both counts are required and specify the matrix dimensions assembled from sampled store blocks.
 - `exp1 inference --top-k K`: select K header tokens per future; default 50.
 - `exp2 inference --batch-size N`: score N futures per inference batch; default 64.
-- `exp2 --stream NAME`: select a token stream instead of a dataset for inference or analysis; inference also accepts stream-only `--history-tokens`, `--future-tokens`, and `--seed`.
+- `exp2 --stream NAME`: select a shared-store stream instead of a dataset for inference or analysis. Inference accepts `--sample-store PATH` (optional store override), `--history-tokens`, `--future-tokens`, and consumer selection `--seed`.
 - `inference --device cpu`: use CPU instead of the default CUDA device.
 
 Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv run exp3 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>`, `uv run python -m experiments.exp2_PFH <subcommand>`, and `uv run python -m experiments.exp3_L_M_diff <subcommand>`.
@@ -639,7 +642,7 @@ The default capacity is 64 GiB of **uncompressed** sample payload; set `sample-s
 
 Training waits until the store contains at least 64 blocks, or its entire capacity if smaller; it may then reuse blocks while producers replace old ones. Start a producer before training: a missing store is an error, while an existing underfilled store causes training to wait. The shard count is fixed when the store is created. To change it or another store configuration, stop **all** producers before using `sample-store produce --overwrite` to recreate the store; never overwrite a store while producers are active.
 
-Fixed probes and their exact-reference analysis, exp11 distillation, exp15, LinGen evaluation, and the finite-sample exp1–exp5/exp14 workflows remain outside this store and retain their existing teacher behavior.
+Fixed probes and their exact-reference analysis, exp11 distillation, exp15, LinGen evaluation, and exp1, exp3–exp5 and exp14 finite-sample workflows remain outside this store and retain their existing teacher behavior. exp2 uses it only when `--stream` is selected; its Parquet input remains supported.
 
 All five experiments default to `--stream wikitext-103-train`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; `--device cpu` is supported. Shared training defaults, except exp10's fixed joint nesting:
 

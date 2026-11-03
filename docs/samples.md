@@ -10,7 +10,7 @@ All examples below were extracted from the files currently in `data/` and checke
 |---|---|---|---|---|---|
 | `wikitext` | `data/history_future_samples/wikitext.parquet` | `data-pipline build-windows` | exp1–exp3 | 64-token history / 32-token future windows | 512 × 512 |
 | `wikitext-large` | `data/history_future_samples/wikitext-large.parquet` | `data-pipline build-wikitext-large` | exp4 | same windows | 10000 × 10000 |
-| `wikitext-103-train` stream | `data/token_streams/wikitext-103-train.npy` + `.json` | `data-pipline build-token-stream` | exp6–exp9 | random windows drawn during training | 117,920,140 tokens (`uint16`) |
+| `wikitext-103-train` stream | `data/token_streams/wikitext-103-train.npy` + `.json` | `data-pipline build-token-stream` | exp2 (shared-store input), streaming experiments | windows reconstructed from persisted or probe starts | 117,920,140 tokens (`uint16`) |
 | `task-single-text` | `data/history_future_samples/task-single-text.parquet` | `data-pipline build-task-inputs` | exp1–exp3 | instruction history / C4 document future | 1309 × 1309 |
 
 ## 2. Shared conventions
@@ -69,22 +69,27 @@ Both files use the same stream, seed and permutation, and differ only in counts 
 
 All three statements, and slot alignment of every `start_token` in both files, were checked against the stored files.
 
-### 3.4 Token stream for exp6–exp9
+### 3.4 Token stream and shared sample generator
 
-Nothing is pre-sampled for the streaming experiments. `TokenStream.sample_starts` in `src/utils/stream_neural_svd.py` draws window starts **uniformly with replacement** from `[0, N − window]`. This differs from the fixed windows:
+The public `sample-store produce` generator uses `TokenStream.sample_starts` in `src/utils/stream_neural_svd.py` to draw history starts, then future starts, uniformly with replacement from `[0, N − window]`. It persists these starts and final-position teacher hidden states in rolling blocks. This differs from the fixed windows:
 
 - starts are not slot-aligned;
 - windows may overlap or repeat;
-- histories and futures are drawn independently, so they are not adjacent in the corpus.
+- histories and futures are drawn independently, so they need not be adjacent in the corpus.
 
-Two independent generators are used (CLI defaults shown):
+Streaming training consumers select blocks and row/column subsets from the store; fixed evaluation probes use a separate generator (default `--probe-seed 1`) and are saved in `train/probe.npz`. For example, a probe draws 1024 history starts (64 tokens), then 1024 future starts (32 tokens). A producer block defaults to 64 histories and 64 futures. Cached states avoid target-grid teacher inference for the shared-store training consumers, though other forwards may still be needed.
 
-| Purpose | Generator | Draws |
-|---|---|---|
-| Fixed probe set (evaluation) | `torch.Generator().manual_seed(1)` (`--probe-seed`) | 1024 history starts (64 tokens), then 1024 future starts (32 tokens) |
-| Training batches | `torch.Generator().manual_seed(0)` (`--seed`) | per step: 64 history starts, then 64 future starts |
+exp2 supports Parquet as before, or `--stream` to select a compatible public sample store. It selects persisted blocks and concatenates their selected starts to the requested history and future counts, then reconstructs windows from the stream; it does not independently sample starts from raw tokens. Its default consumer selection `--seed 0` is separate from the producer seed. Since the rolling store can overwrite blocks, that seed alone cannot reproduce a live store snapshot: exp2 metadata records exact starts and observed block shard/sequence, selected indices and output ranges. Cached final hidden states do not supply PMI's tokenwise probabilities, so exp2 still runs language-model forwards.
 
-Each training step evaluates all 64 × 64 history/future pairs with GPT-2, so every step sees a fresh block. Probe starts are saved in `train/probe.npz`.
+```bash
+uv run sample-store produce --device cuda
+uv run exp2 inference --device cuda --stream wikitext-103-train \
+  --sample-store data/sample_stores/wikitext-103-train__gpt2-small__h64-f32 \
+  --history-count 3 --future-count 4
+uv run exp2 analysis --stream wikitext-103-train --centering none
+```
+
+Run the producer until the store is ready before inference; it may continue running while consumers read. `--sample-store` is optional and defaults to the directory derived from the stream, model and window lengths (64 history and 32 future tokens by default). Counts are required matrix dimensions, not block sizes. See the README shared-store section for capacity, readiness and producer coordination.
 
 ### 3.5 Worked examples
 
@@ -180,9 +185,9 @@ s descent into political disgrace , and the betrayal that forms the crux of both
 
 The junction `background . The New` joins two unrelated articles.
 
-#### Token-stream windows (exp6–exp9)
+#### Token-stream window examples
 
-These four windows are what a fresh exp6–exp9 run with default flags draws first. They were produced with the exact `sample_starts` calls listed in §3.4.
+These four examples illustrate direct seeded draws from the stream: the probe uses seed 1 and the second pair uses seed 0 with 64 history and 64 future draws. They are not a promise of the first windows selected by a current shared-store consumer, whose selections depend on the live store.
 
 | Window | Start | Slot-aligned | Source rows |
 |---|---|---|---|

@@ -12,9 +12,10 @@ from transformers import GPT2Config, GPT2LMHeadModel
 from experiments.exp2_PFH.feature_logprob import (
     build_exp2_pfh,
     parquet_inputs,
-    stream_inputs,
+    sample_store_inputs,
 )
 from utils.inference import CausalLMInference
+from utils.sample_store import produce_blocks, read_store_config, slot_bytes, slot_path
 
 
 class Exp2PFHTests(unittest.TestCase):
@@ -108,24 +109,63 @@ class Exp2PFHTests(unittest.TestCase):
                     matrix[history_index, future_index], expected, delta=1e-5
                 )
 
-    def test_stream_inputs_are_seeded_windows_at_recorded_starts(self) -> None:
+    def test_sample_store_inputs_use_recorded_block_windows(self) -> None:
         stream_path = self.root / "stream.npy"
+        store_dir = self.root / "sample-store"
         tokens = (np.arange(40) % 11).astype(np.uint16)
         np.save(stream_path, tokens)
         stream_path.with_suffix(".json").write_text(
             json.dumps({"vocab_size": 11}), encoding="utf-8"
         )
-        kwargs = dict(
-            history_count=3, future_count=2, history_tokens=4, future_tokens=3, seed=5
+        produce_blocks(
+            store_dir=store_dir, model_path=self.model_path, stream_path=stream_path,
+            device="cpu", history_tokens=4, future_tokens=3, block_histories=2,
+            block_futures=2, max_bytes=2 * slot_bytes(2, 2, 8), shards=1, shard=0,
+            seed=11, pair_batch=4, max_blocks=2, log_every=100, overwrite=False,
         )
-        inputs = stream_inputs(stream_path, **kwargs)
-        self.assertEqual(inputs, stream_inputs(stream_path, **kwargs))
-        for history, start in zip(inputs.histories, inputs.source["history_starts"]):
-            self.assertEqual(history, tokens[start : start + 4].tolist())
-        for future, start in zip(inputs.futures, inputs.source["future_starts"]):
-            self.assertEqual(future, tokens[start : start + 3].tolist())
+        kwargs = dict(
+            store_dir=store_dir, stream_path=stream_path, model_path=self.model_path,
+            history_count=5, future_count=3, history_tokens=4, future_tokens=3, seed=5,
+        )
+        inputs = sample_store_inputs(**kwargs)
+        self.assertEqual(inputs, sample_store_inputs(**kwargs))
+        source = inputs.source
+        self.assertEqual(source["kind"], "sample_store")
+        self.assertEqual(source["store_dir"], str(store_dir))
+        self.assertEqual(source["store_config"], read_store_config(store_dir))
+        self.assertEqual(source["seed"], 5)
+        self.assertEqual(len(inputs.histories), 5)
+        self.assertEqual(len(inputs.futures), 3)
+        self.assertEqual(len(source["blocks"]), 3)
+
+        generator = torch.Generator().manual_seed(5)
+        history_starts, future_starts = [], []
+        for block in source["blocks"]:
+            slot = int(torch.randint(2, (1,), generator=generator))
+            rows = torch.randperm(2, generator=generator).tolist()
+            cols = torch.randperm(2, generator=generator).tolist()
+            history_begin, future_begin = len(history_starts), len(future_starts)
+            rows = rows[:min(2, 5 - history_begin)]
+            cols = cols[:min(2, 3 - future_begin)]
+            with np.load(slot_path(store_dir, slot)) as data:
+                self.assertEqual(block["slot"], slot)
+                self.assertEqual(block["sequence"], int(data["sequence"]))
+                self.assertEqual(block["shard"], int(data["shard"]))
+                self.assertEqual(block["history_indices"], rows)
+                self.assertEqual(block["future_indices"], cols)
+                history_starts.extend(data["history_starts"][rows].tolist())
+                future_starts.extend(data["future_starts"][cols].tolist())
+            self.assertEqual(block["history_range"], [history_begin, len(history_starts)])
+            self.assertEqual(block["future_range"], [future_begin, len(future_starts)])
+
+        self.assertEqual(source["history_starts"], history_starts)
+        self.assertEqual(source["future_starts"], future_starts)
+        self.assertEqual(inputs.histories, [tokens[start : start + 4].tolist()
+                                            for start in history_starts])
+        self.assertEqual(inputs.futures, [tokens[start : start + 3].tolist()
+                                          for start in future_starts])
         with self.assertRaisesRegex(ValueError, "seed must be non-negative"):
-            stream_inputs(stream_path, 3, 2, 4, 3, -1)
+            sample_store_inputs(**{**kwargs, "seed": -1})
 
     def test_existing_output_requires_overwrite_before_model_load(self) -> None:
         output = self.root / "existing"
