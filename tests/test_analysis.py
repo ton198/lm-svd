@@ -343,6 +343,52 @@ class AnalysisTests(unittest.TestCase):
             run_analysis(result_dir=nonsquare, centering="none", device="cpu", overwrite=False)
         self.assertFalse((nonsquare / "analysis").exists())
 
+    def test_exp2_adjacent_truncation_tracks_matched_pair_retrieval(self) -> None:
+        run = self.root / "adjacent-truncation"
+        inference = run / "inference"
+        inference.mkdir(parents=True)
+        matrix = 10 * np.outer([1., 2., 3.], [3., 1., 2.]) + 50 * np.eye(3)
+        np.save(inference / "pmi.npy", matrix)
+        (inference / "metadata.json").write_text(
+            json.dumps({"source": {"pairing": "adjacent"}}), encoding="utf-8"
+        )
+        summary = run_analysis(result_dir=run, centering="none", device="cpu", overwrite=False)
+        output = run / "analysis" / "none"
+        metadata = json.loads((output / "metadata.json").read_text())
+        truncation = metadata["truncation_pairing"]
+        self.assertEqual(truncation["ranks"], [1, 2, 3])
+        expected = {
+            "row_top1": [1 / 3, 2 / 3, 1],
+            "column_top1": [1 / 3, 2 / 3, 2 / 3],
+            "row_mean_rank": [2, 4 / 3, 1],
+            "column_mean_rank": [2, 5 / 3, 4 / 3],
+        }
+        for key, values in expected.items():
+            self.assertEqual(len(truncation[key]), len(values))
+            for actual, value in zip(truncation[key], values):
+                with self.subTest(key=key, value=value):
+                    self.assertAlmostEqual(actual, value)
+        self.assertAlmostEqual(truncation["chance_top1"], 1 / 3)
+        self.assertAlmostEqual(truncation["chance_mean_rank"], 2.0)
+        self.assertEqual(truncation["threshold"]["energy_rank"], 2)
+        self.assertEqual(truncation["threshold"]["row_top1_rank"], 3)
+        self.assertEqual(truncation["threshold"]["column_top1_rank"], 2)
+        self.assertAlmostEqual(truncation["energy_fraction"][0], 0.8845392, places=6)
+        self.assertAlmostEqual(truncation["energy_fraction"][-1], 1.0, places=6)
+        self.assertAlmostEqual(truncation["relative_reconstruction_error"][-1], 0.0, places=6)
+        self.assertAlmostEqual(truncation["mean_gap"][-1], 45.0)
+        self.assertAlmostEqual(truncation["mean_gap"][-1], metadata["pairing_diagnostics"]["mean_gap"])
+        self.assertEqual(
+            {path.name for path in output.iterdir()},
+            {"svd_U.npy", "svd_S.npy", "svd_Vt.npy", "metadata.json",
+             "svd_spectrum.png", "pairing_truncation.png"},
+        )
+        self.assertTrue((output / "pairing_truncation.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertIn("truncation: 2 ranks for 90% energy", summary)
+        with self.assertRaises(FileExistsError):
+            run_analysis(result_dir=run, centering="none", device="cpu", overwrite=False)
+        run_analysis(result_dir=run, centering="none", device="cpu", overwrite=True)
+
     def test_each_experiment_reads_its_own_matrix(self) -> None:
         for module, matrix_name in (
             (exp1_analysis, "matrix.npy"),

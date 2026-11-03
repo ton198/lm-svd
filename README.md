@@ -333,6 +333,8 @@ uv run exp2 analysis --device cpu --stream "$STREAM" --pairing adjacent --center
 
 Adjacent analysis adds `pairing_diagnostics` to metadata and a `pairing:` summary line: diagonal/off-diagonal means and population standard deviations, mean gap, row/column top-1 fractions, and mean ranks. Ranks count entries strictly greater than the diagonal entry, so ties share the best rank. These diagnostics describe the stored uncentered PMI matrix and are identical across centerings; independent and Parquet runs omit them.
 
+Adjacent analysis also adds `truncation_pairing` metadata, a `truncation:` summary line, and `pairing_truncation.png`. For every rank from 1 through all saved singular values (including those below the numerical-rank tolerance), it reconstructs the matrix selected by `--centering` and measures matched-pair row/column top-1, mean ranks, diagonal/off-diagonal mean gap, captured energy, and relative Frobenius reconstruction error. The plot compares energy with top-1 retrieval and shows mean ranks against chance (`1/n` top-1 and `(n+1)/2` mean rank). Threshold ranks are the first ranks reaching 90% energy or 90% of each side's full-rank top-1, without rounding; a zero full-rank top-1 target is reached at rank 1. Thus `none` analyzes raw PMI, while other centerings analyze their transformed matrices. Independent and Parquet runs omit these additions and retain the five standard files.
+
 On CIRC BlueHive, `bluehive_run/exp2-inference.sbatch` and `bluehive_run/exp2-analysis.sbatch` both request partition `h100`, QoS `h100`, and one H100 GPU. They retain 4 CPUs and 16G memory, with 6 hours for inference and 1 hour for analysis. Submit from the repository root with matching `DATASET` values and an `afterok` dependency; analysis runs all four centering modes. Both scripts overwrite existing outputs, so cancel any older jobs for the same dataset before resubmitting.
 
 ### Small CPU smoke run
@@ -506,7 +508,7 @@ The batch script runs all four exp5 centerings with `--overwrite` and a two-hour
 
 ## 9. Understand exp1–exp3 analysis outputs
 
-Experiments exp1–exp3 each own their `analysis` workflow. It reads the matrix and optional sibling `metadata.json` from `<result-dir>/inference/`, then writes exactly five outputs to `<result-dir>/analysis/<centering>/`:
+Experiments exp1–exp3 each own their `analysis` workflow. It reads the matrix and optional sibling `metadata.json` from `<result-dir>/inference/`, then writes five standard outputs to `<result-dir>/analysis/<centering>/` (adjacent exp2 runs additionally write `pairing_truncation.png`):
 
 ```text
 <results-root>/<experiment>/<run>/

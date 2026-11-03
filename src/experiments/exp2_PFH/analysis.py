@@ -18,6 +18,8 @@ MATRIX_NAME = "pmi.npy"
 FACTOR_NAMES = {"U": "svd_U.npy", "S": "svd_S.npy", "Vt": "svd_Vt.npy"}
 METADATA_NAME = "metadata.json"
 PLOT_NAME = "svd_spectrum.png"
+TRUNCATION_PLOT_NAME = "pairing_truncation.png"
+TRUNCATION_THRESHOLD = 0.9
 
 
 def pairing_diagnostics(matrix: np.ndarray) -> dict:
@@ -44,6 +46,88 @@ def pairing_diagnostics(matrix: np.ndarray) -> dict:
     }
 
 
+def truncation_pairing(U: np.ndarray, S: np.ndarray, Vt: np.ndarray) -> dict:
+    n = U.shape[0]
+    K = S.size
+    reconstruction = np.zeros((n, n), dtype=np.float64)
+    metrics = {
+        "mean_gap": [],
+        "row_top1": [],
+        "column_top1": [],
+        "row_mean_rank": [],
+        "column_mean_rank": [],
+    }
+    for k in range(K):
+        reconstruction += S[k] * np.outer(U[:, k], Vt[k])
+        diagnostics = pairing_diagnostics(reconstruction)
+        for key in metrics:
+            metrics[key].append(diagnostics[key])
+
+    energy = np.cumsum(S**2) / np.sum(S**2)
+    error = np.sqrt(np.clip(1.0 - energy, 0.0, None))
+
+    def first_rank(values, target):
+        return next((r for r, value in enumerate(values, 1) if value >= target), K)
+
+    return {
+        "matrix": "rank-r truncation of the centered matrix: U[:, :r] @ diag(S[:r]) @ Vt[:r], r = 1..len(S)",
+        "rank_rule": diagnostics["rank_rule"],
+        "chance_top1": 1 / n,
+        "chance_mean_rank": (n + 1) / 2,
+        "ranks": list(range(1, K + 1)),
+        "energy_fraction": energy.tolist(),
+        "relative_reconstruction_error": error.tolist(),
+        **metrics,
+        "threshold": {
+            "fraction": TRUNCATION_THRESHOLD,
+            "rule": "smallest r whose value is >= fraction * value at r = len(S); energy uses fraction directly",
+            "energy_rank": first_rank(energy, TRUNCATION_THRESHOLD),
+            "row_top1_rank": first_rank(metrics["row_top1"], TRUNCATION_THRESHOLD * metrics["row_top1"][-1]),
+            "column_top1_rank": first_rank(metrics["column_top1"], TRUNCATION_THRESHOLD * metrics["column_top1"][-1]),
+        },
+        "plot": TRUNCATION_PLOT_NAME,
+    }
+
+
+def plot_truncation_pairing(
+    truncation: dict, *, n: int, centering: str, plot_path: Path
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    try:
+        ranks = truncation["ranks"]
+        axes[0].plot(ranks, truncation["energy_fraction"], label="captured energy")
+        axes[0].plot(ranks, truncation["row_top1"], label="row top-1")
+        axes[0].plot(ranks, truncation["column_top1"], label="column top-1")
+        axes[0].axhline(truncation["chance_top1"], linestyle=":", label="chance top-1")
+        axes[0].set_xscale("log")
+        axes[0].set_ylim(0, 1.01)
+        axes[0].set_title("Energy vs matched-pair top-1")
+        axes[0].set_xlabel("truncation rank r")
+        axes[0].set_ylabel("fraction")
+        axes[0].legend()
+
+        axes[1].plot(ranks, truncation["row_mean_rank"], label="row mean rank")
+        axes[1].plot(ranks, truncation["column_mean_rank"], label="column mean rank")
+        axes[1].axhline(truncation["chance_mean_rank"], linestyle=":", label="chance mean rank")
+        axes[1].set_xscale("log")
+        axes[1].set_yscale("log")
+        axes[1].set_title("Matched-pair mean rank")
+        axes[1].set_xlabel("truncation rank r")
+        axes[1].set_ylabel("mean rank (1 = best)")
+        axes[1].legend()
+        fig.suptitle(f"{n} x {n} matrix, centering {centering}: matched pairs under rank-r truncation")
+        fig.tight_layout()
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(plot_path, lambda tmp: fig.savefig(tmp, format="png", dpi=150))
+    finally:
+        plt.close(fig)
+
+
 def run_analysis(*, result_dir: Path, centering: str, device: str, overwrite: bool) -> str:
     inference_dir = result_dir / INFERENCE_DIR
     matrix_path = inference_dir / MATRIX_NAME
@@ -53,8 +137,9 @@ def run_analysis(*, result_dir: Path, centering: str, device: str, overwrite: bo
     factor_paths = {key: output_dir / name for key, name in FACTOR_NAMES.items()}
     metadata_path = output_dir / METADATA_NAME
     plot_path = output_dir / PLOT_NAME
+    truncation_plot_path = output_dir / TRUNCATION_PLOT_NAME
     if not overwrite:
-        for path in (*factor_paths.values(), metadata_path, plot_path):
+        for path in (*factor_paths.values(), metadata_path, plot_path, truncation_plot_path):
             if path.exists():
                 raise FileExistsError(
                     f"output already exists: {path}; pass --overwrite to replace it"
@@ -78,6 +163,11 @@ def run_analysis(*, result_dir: Path, centering: str, device: str, overwrite: bo
     spectrum, loglog_fit = visualize_svd(
         svd.S, rank_tolerance=svd.rank_tolerance, matrix_shape=(m, n), plot_path=plot_path
     )
+    if pairing is not None:
+        truncation = truncation_pairing(svd.U, svd.S, svd.Vt)
+        plot_truncation_pairing(truncation, n=n, centering=centering, plot_path=truncation_plot_path)
+    else:
+        truncation = None
     for key, factor in (("U", svd.U), ("S", svd.S), ("Vt", svd.Vt)):
         write_atomic(factor_paths[key], lambda tmp: save_numpy(tmp, factor))
     metadata = {
@@ -100,6 +190,7 @@ def run_analysis(*, result_dir: Path, centering: str, device: str, overwrite: bo
     pairing_line = ""
     if pairing is not None:
         metadata["pairing_diagnostics"] = pairing
+        metadata["truncation_pairing"] = truncation
         d, o, g = (
             f"{value:.4g}" if value is not None else "n/a"
             for value in (pairing["diagonal_mean"], pairing["off_diagonal_mean"], pairing["mean_gap"])
@@ -107,6 +198,13 @@ def run_analysis(*, result_dir: Path, centering: str, device: str, overwrite: bo
         pairing_line = (
             f"pairing: diagonal mean {d}, off-diagonal mean {o}, gap {g}; "
             f"top-1 row {pairing['row_top1']:.3f}, column {pairing['column_top1']:.3f}\n"
+        )
+        t = truncation["threshold"]
+        pairing_line += (
+            f"truncation: {t['energy_rank']} ranks for 90% energy; "
+            f"90% of full-rank top-1 at r = {t['row_top1_rank']} (row), "
+            f"{t['column_top1_rank']} (column); full-rank top-1 row "
+            f"{truncation['row_top1'][-1]:.3f}, column {truncation['column_top1'][-1]:.3f}\n"
         )
     write_atomic(metadata_path, lambda tmp: save_json(tmp, metadata))
     return (
