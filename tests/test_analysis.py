@@ -381,13 +381,44 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in output.iterdir()},
             {"svd_U.npy", "svd_S.npy", "svd_Vt.npy", "metadata.json",
-             "svd_spectrum.png", "pairing_truncation.png"},
+             "svd_spectrum.png", "pairing_truncation.png", "top5_sparse.png"},
         )
         self.assertTrue((output / "pairing_truncation.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertIn("truncation: 2 ranks for 90% energy", summary)
         with self.assertRaises(FileExistsError):
             run_analysis(result_dir=run, centering="none", device="cpu", overwrite=False)
         run_analysis(result_dir=run, centering="none", device="cpu", overwrite=True)
+
+    def test_exp2_adjacent_top5_sparse_keeps_each_rows_largest_entries(self) -> None:
+        run = self.root / "adjacent-top5"
+        inference = run / "inference"
+        inference.mkdir(parents=True)
+        np.save(inference / "pmi.npy", np.arange(36, dtype=np.float64).reshape(6, 6))
+        (inference / "metadata.json").write_text(
+            json.dumps({"source": {"pairing": "adjacent"}}), encoding="utf-8"
+        )
+        summary = run_analysis(result_dir=run, centering="none", device="cpu", overwrite=False)
+        output = run / "analysis" / "none"
+        metadata = json.loads((output / "metadata.json").read_text())
+        sparse = metadata["top5_sparse"]
+        self.assertEqual(sparse["k"], 5)
+        self.assertEqual(sparse["support_columns"], 5)
+        self.assertEqual(sparse["rows_with_nonpositive_top_value"], 0)
+        self.assertEqual(sparse["diagonal_in_top_fraction"], 5 / 6)
+        self.assertEqual(
+            sparse["column_usage_top10"],
+            [{"column": j, "rows": 6} for j in range(1, 6)],
+        )
+        self.assertEqual(sparse["top10_column_slot_share"], 1.0)
+        self.assertEqual(sparse["row_similarity"]["mean_pairwise_jaccard"], 1.0)
+        self.assertAlmostEqual(sparse["row_similarity"]["chance_jaccard"], 13 / 18)
+        self.assertEqual(sparse["svd"]["rank"], 2)
+        self.assertEqual(sparse["support_recovery"][1], 1.0)
+        self.assertEqual(sparse["support_recovery"][-1], 1.0)
+        self.assertLessEqual(sparse["threshold"]["support_recovery_rank_90"], 2)
+        self.assertAlmostEqual(sparse["energy_fraction"][-1], 1.0)
+        self.assertTrue((output / "top5_sparse.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertIn("top5 sparse: support 5 columns, rank 2", summary)
 
     def test_exp2_stream_seed_selects_run_directory(self) -> None:
         base = self.root / "exp2_PFH"
