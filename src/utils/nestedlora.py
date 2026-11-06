@@ -73,7 +73,7 @@ class NestedLoRALossFunctionEVD(torch.autograd.Function):
         """
         Args:
             ctx: The context object to retrieve saved tensors
-            grad_output: The gradient of the loss with respect to the output
+            grad_outputs: The gradient of the loss with respect to the output
         """
         f, Tf, f1, f2, lam_f1, lam_f2 = ctx.saved_tensors
         operator_f = - (4 / f.shape[0]) * torch.einsum('l,bl...->bl...', ctx.vector_mask, Tf)
@@ -115,16 +115,14 @@ class NestedLoRALossFunctionSVD(torch.autograd.Function):
 class NestedLoRA(nn.Module):
     def __init__(
             self,
-            model,
-            neigs,
-            step=1,
-            sort=False,
-            sequential=False,
+            model : nn.Module,
+            neigs : int,
+            step : int =1,
+            sequential : bool =False,
     ):
         self.name = 'nestedlora'
         super().__init__()
         self.neigs = neigs
-        self.sort = sort
         self.eigvals = None
         self.sort_indices = None
         self.sequential = sequential
