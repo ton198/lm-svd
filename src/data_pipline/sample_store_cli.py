@@ -1,10 +1,21 @@
 """CLI registration for data-pipline sample-store; imports stay lightweight."""
 
 from pathlib import Path
+import argparse
 
 from .cli import positive_float, positive_int
 
 DEFAULT_STREAM = 'wikitext-103-train'
+
+
+def nonnegative_int(value):
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('must be a non-negative integer') from error
+    if number < 0:
+        raise argparse.ArgumentTypeError('must be a non-negative integer')
+    return number
 
 
 def register(subparsers):
@@ -21,8 +32,8 @@ def register(subparsers):
     produce.add_argument('--device', default='cuda')
     produce.add_argument('--samples-per-block', type=positive_int, default=64)
     produce.add_argument('--max-gib', type=positive_float, default=64.0)
-    produce.add_argument('--shards', type=positive_int, default=1)
-    produce.add_argument('--shard', type=int, default=0)
+    produce.add_argument('--worker-id', type=nonnegative_int, required=True,
+                         help='Permanent worker ID; reuse it to resume unfinished blocks')
     produce.add_argument('--seed', type=int, default=0)
     produce.add_argument('--batch-size', type=positive_int, default=64)
     produce.add_argument('--max-blocks', type=positive_int, default=None)
@@ -31,7 +42,8 @@ def register(subparsers):
 
 
 def run(args):
-    from .sample_store import read_shard_states, read_store_config
+    from .sample_store import read_store_config
+    from .sample_store_state import read_store_state
     from utils.experiment_paths import validate_dataset_name
 
     validate_dataset_name(args.stream)
@@ -45,7 +57,7 @@ def run(args):
             store_dir=store_dir, model_path=args.model_path, stream_path=stream_path, device=args.device,
             history_tokens=args.history_tokens, future_tokens=args.future_tokens,
             samples_per_block=args.samples_per_block, max_bytes=int(args.max_gib * 1024**3),
-            shards=args.shards, shard=args.shard, seed=args.seed, batch_size=args.batch_size,
+            worker_id=args.worker_id, seed=args.seed, batch_size=args.batch_size,
             max_blocks=args.max_blocks, log_every=args.log_every, overwrite=args.overwrite,
         )
         for key, value in result.items():
@@ -53,11 +65,12 @@ def run(args):
     else:
         config = read_store_config(store_dir)
         print(f'store_dir: {store_dir}')
-        for key in ('format', 'model_name', 'stream_name', 'samples_per_block', 'num_slots', 'shards'):
+        for key in ('format', 'model_name', 'stream_name', 'samples_per_block', 'num_slots'):
             print(f'{key}: {config[key]}')
-        total = 0
-        for shard, state in enumerate(read_shard_states(store_dir, config['shards'])):
-            count = state['filled'] * config['samples_per_block']
-            total += count
-            print(f"shard {shard}: next_sequence {state['next_sequence']} filled {state['filled']}/{config['slots_per_shard']} samples {count}")
+        state = read_store_state(store_dir)
+        print(f"published_blocks: {len(state['published'])}/{config['num_slots']}")
+        print(f"next_commit: {state['next_commit']}")
+        for worker_id, worker in sorted(state['workers'].items(), key=lambda item: int(item[0])):
+            print(f"worker {worker_id}: slot {worker['slot']} sequence {worker['sequence']}")
+        total = len(state['published']) * config['samples_per_block']
         print(f'published_samples: {total}')

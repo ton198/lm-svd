@@ -33,6 +33,24 @@ print(sorted(m for m in ("torch", "transformers", "matplotlib") if m in sys.modu
                 self.assertEqual(result.stdout.splitlines()[-1], "[]")
 
 class SampleStoreCLIHelpTests(unittest.TestCase):
+    def test_worker_id_is_required_nonnegative_and_shard_flags_are_rejected(self):
+        for args in ([], ['--worker-id', '-1'], ['--worker-id', 'abc'],
+                     ['--worker-id', '1', '--shards', '2'],
+                     ['--worker-id', '1', '--shard', '0']):
+            code = '''
+import sys
+from data_pipline.cli import main
+try:
+    main(['sample-store', 'produce'] + ARGS)
+except SystemExit as error:
+    assert error.code == 2
+else:
+    raise AssertionError('invalid command accepted')
+assert 'transformers' not in sys.modules
+'''.replace('ARGS', repr(args))
+            result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_nested_help_is_available_without_loading_models(self):
         for args in (["sample-store", "-h"], ["sample-store", "produce", "-h"], ["sample-store", "status", "-h"]):
             code = """

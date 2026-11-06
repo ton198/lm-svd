@@ -10,7 +10,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-STORE_FORMAT = "lm-svd-sample-store-v2"
+from .sample_store_state import read_store_state
+
+STORE_FORMAT = "lm-svd-sample-store-v3"
 DEFAULT_MAX_GIB = 64.0
 
 
@@ -48,15 +50,6 @@ def read_store_config(store_dir: Path) -> dict:
     return config
 
 
-def read_shard_states(store_dir: Path, shards: int) -> list[dict]:
-    states = []
-    for shard in range(shards):
-        path = store_dir / f"state-{shard:03d}.json"
-        states.append(json.loads(path.read_text(encoding="utf-8")) if path.is_file()
-                      else {"next_sequence": 0, "filled": 0})
-    return states
-
-
 def slot_path(store_dir: Path, slot: int) -> Path:
     return store_dir / "slots" / f"{slot:07d}.npy"
 
@@ -78,37 +71,35 @@ class SampleSampler:
             self.config["history_tokens"], self.config["future_tokens"], self.config["vocab_size"]
         )
 
-    def _filled(self) -> list[int]:
-        states = read_shard_states(self.store_dir, self.config["shards"])
-        filled = [state["filled"] for state in states]
-        if any(n < 0 or n > self.config["slots_per_shard"] for n in filled):
+    def _published(self) -> list[int]:
+        slots = sorted(int(slot) for slot in read_store_state(self.store_dir)["published"])
+        if any(slot < 0 or slot >= self.config["num_slots"] for slot in slots):
             raise ValueError(f"invalid sample store progress in {self.store_dir}")
-        return filled
+        return slots
 
     def wait_until_ready(self) -> None:
         """Wait for the first complete block; production can continue afterward."""
-        while not sum(self._filled()):
+        while not self._published():
             time.sleep(0.1)
 
     def sample(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        filled = self._filled()
+        slots = self._published()
         block_size = self.config["samples_per_block"]
-        total = sum(filled) * block_size
+        total = len(slots) * block_size
         if not total:
             raise ValueError(f"no published samples in {self.store_dir}")
         index = int(self._generator.integers(total))
         local_slot, row_index = divmod(index, block_size)
-        for shard, count in enumerate(filled):
-            if local_slot < count:
-                break
-            local_slot -= count
-        slot = local_slot * self.config["shards"] + shard
+        slot = slots[local_slot]
         # Opening once keeps all three fields on one inode across atomic replaces.
         block = np.load(slot_path(self.store_dir, slot), mmap_mode="r", allow_pickle=False)
         try:
             if block.shape != (block_size,) or block.dtype != self._dtype:
                 raise ValueError(f"invalid sample block {slot} in {self.store_dir}")
-            return tuple(torch.from_numpy(block[name][row_index].copy())
-                         for name in ("h", "f", "logits"))
+            return (
+                torch.from_numpy(block["h"][row_index].copy()),
+                torch.from_numpy(block["f"][row_index].copy()),
+                torch.from_numpy(block["logits"][row_index].copy()),
+            )
         finally:
             block._mmap.close()

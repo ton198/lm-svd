@@ -75,11 +75,13 @@ All three statements, and slot alignment of every `start_token` in both files, w
 
 ```bash
 uv run data-pipline build-token-stream
-uv run data-pipline sample-store produce --device cuda
+uv run data-pipline sample-store produce --device cuda --worker-id 0
 uv run data-pipline sample-store status
 ```
 
-Generation continues until stopped, overwriting older blocks once the fixed capacity is full. `data_pipline.SampleSampler.sample()` uniformly draws one published sample and returns `(h, f, logits)` as independent CPU tensors. It does not load a model or need the original stream. See the README [training sample section](../README.md#training-sample-generation-and-sampling) for usage, capacity and producer coordination.
+Generation continues until stopped. Workers dynamically claim slots from one shared pool, first filling empty slots and then refreshing the oldest available blocks. A shared `state.json` records claims, per-worker generation sequences and published slots. Reusing a worker ID resumes its unfinished block without advancing the sequence until publication. Slurm defaults the ID to `SLURM_JOB_ID`; `WORKER_ID` overrides it. There is no duplicate-ID detection or automatic reclamation, so use one live process per ID and restart the same ID to recover its claim. The v3 coordination metadata requires rebuilding v1/v2 stores; `.npy` sample fields remain unchanged from v2.
+
+`data_pipline.SampleSampler.sample()` uniformly draws one published sample, including when published slots contain gaps, and returns `(h, f, logits)` as independent CPU tensors. It does not load a model or need the original stream. See the README [training sample section](../README.md#training-sample-generation-and-sampling) for usage, capacity and producer coordination.
 
 exp2 is separate: it tokenizes the local original WikiText text and draws its own h/f windows, then computes PMI with model forwards. It does not read these training samples or prepared history/future Parquet files.
 

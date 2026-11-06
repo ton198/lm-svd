@@ -420,7 +420,7 @@ Both parts live in `data_pipline`. First tokenize local WikiText, then start con
 
 ```bash
 uv run data-pipline build-token-stream
-uv run data-pipline sample-store produce --device cuda
+uv run data-pipline sample-store produce --device cuda --worker-id 0
 # In another terminal:
 uv run data-pipline sample-store status
 ```
@@ -429,7 +429,9 @@ The generator independently draws h and f windows uniformly with replacement (ov
 
 The token-stream builder writes `data/token_streams/wikitext-103-train.npy` and sibling JSON. Build another split using `build-token-stream --split validation --output data/token_streams/wikitext-103-validation.npy`, then use `--stream wikitext-103-validation`. New streams record a tokenizer fingerprint; generation checks it against the local teacher tokenizer. Older stream metadata uses its recorded tokenizer path for the check. Store configuration also records model file sizes and modification times to reject changed checkpoints on restart. All loads are local; neither command downloads files.
 
-The default store is `data/sample_stores/wikitext-103-train__gpt2-small__h64-f32`. Override it with `--store-dir`. Blocks are uncompressed structured `.npy` files supporting memory mapping, with h/f int64 fields and a float32 logits field. Capacity includes block headers; metadata and one temporary staging block per active producer require additional space. Finished blocks replace slots atomically, then progress is published. Full stores overwrite their oldest slots within each shard.
+The default store is `data/sample_stores/wikitext-103-train__gpt2-small__h64-f32`. Override it with `--store-dir`. Blocks are uncompressed structured `.npy` files supporting memory mapping, with h/f int64 fields and a float32 logits field. Capacity includes block headers; metadata and one temporary staging block per active producer require additional space. All workers share one slot pool: first fill unclaimed empty slots, then refresh the oldest published unclaimed slot. The total capacity is independent of worker count.
+
+`state.json` records each worker's claimed slot and next generation sequence, each published slot's commit order, and the next commit number. A fixed `.state.lock` uses POSIX `fcntl.lockf` only while initializing or reading/modifying/writing this shared state. Model loading and generation happen outside the lock. State snapshots and completed blocks are published by atomic replacement; readers can keep sampling a complete old block during its refresh. If every slot is claimed, producers retry after 0.1 seconds.
 
 ```python
 from data_pipline import SampleSampler
@@ -444,15 +446,20 @@ h, f, logits = sampler.sample()
 
 The sampler uniformly draws from all currently published samples, with replacement. It loads no LLM or tokenizer and needs no original WikiText files. Returned tensors own their memory, so later slot replacement or caller mutation is safe. Sampling an initialized but empty store raises `ValueError`; a missing store also raises an error. A seed reproduces choices only while the store contents remain unchanged.
 
-`--max-gib`, `--samples-per-block`, `--batch-size`, `--history-tokens`, `--future-tokens`, and `--seed` control production. `--max-blocks N` stops after N additional blocks; otherwise production continues indefinitely. Restart with the same store configuration to resume. Multiple processes use distinct `--shard` values and the same `--shards` count. On BlueHive:
+`--max-gib`, `--samples-per-block`, `--batch-size`, `--history-tokens`, `--future-tokens`, and `--seed` control production. `--max-blocks N` stops after N additional completed blocks in this invocation; otherwise production continues indefinitely. Each process requires a non-negative integer `--worker-id`. New IDs register automatically, so workers can be added without rebuilding the store. Restart with the same ID and store configuration to resume. An unfinished block is regenerated using the same `(seed, worker_id, sequence)`; sequence advances and the claim is released only after the complete block is replaced and its publication is committed. A crash after replacement but before that commit also redoes the same block.
+
+On BlueHive, submit one producer per job; the script defaults the worker ID to `SLURM_JOB_ID`. Requeue retains this ID. A fresh `sbatch` gets a new ID; set `WORKER_ID` to continue a previous worker instead. `MAX_GIB` controls the entire store, and optional `MAX_BLOCKS` limits each invocation for smoke tests:
 
 ```bash
-for k in 0 1; do
-  SHARDS=2 SHARD=$k sbatch bluehive_run/sample-store-produce.sbatch
-done
+sbatch bluehive_run/sample-store-produce.sbatch
+sbatch bluehive_run/sample-store-produce.sbatch
+# Resume a previous worker in a newly submitted job:
+WORKER_ID=12345 sbatch bluehive_run/sample-store-produce.sbatch
 ```
 
-Stop all producers and samplers before `data-pipline sample-store produce --overwrite` rebuilds a store. Active producers prevent a rebuild. The old hidden-state `.npz` format is rejected and requires explicit regeneration; old `sample-store` commands have been removed. exp2 does not consume this store.
+Run at most one live process per worker ID. There is no duplicate-ID detection, heartbeat, or automatic claim reclamation. Claims survive process exit and await a restart of the same ID; retained worker records do not indicate liveness. `sample-store status` reports each worker's claim and sequence, published blocks/samples, capacity and commit count.
+
+Stop all producers and samplers before deleting or rebuilding a store with `data-pipline sample-store produce --worker-id 0 --overwrite`. This is an offline operation; active-process detection is not performed. The coordination format is `lm-svd-sample-store-v3`; v1 hidden-state stores and v2 sharded stores require an explicit rebuild, with no migration. The token stream and model can be reused, and v3 keeps the v2 `.npy` sample fields unchanged. exp2 does not consume this store.
 
 ## Python inference API
 
