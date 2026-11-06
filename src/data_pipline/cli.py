@@ -46,6 +46,9 @@ def add_window_arguments(
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="data-pipline")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    from .sample_store_cli import register
+
+    register(subparsers)
     build = subparsers.add_parser(
         "build-windows",
         help="Build independent, non-overlapping history/future windows",
@@ -57,7 +60,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     large = subparsers.add_parser(
         "build-wikitext-large",
-        help="Build the large WikiText window set used by exp4",
+        help="Build a large WikiText history/future window set",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     add_window_arguments(
@@ -66,7 +69,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     token_stream = subparsers.add_parser(
         "build-token-stream",
-        help="Tokenize a full split into one token stream for exp6",
+        help="Tokenize a full split into one token stream",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     token_stream.add_argument(
@@ -132,6 +135,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
     try:
+        if args.command == "sample-store":
+            from .sample_store_cli import run
+
+            run(args)
+            return
         if args.command == "build-task-inputs":
             from .task_inputs import build_task_input_tables
 
@@ -179,7 +187,7 @@ def main(argv: list[str] | None = None) -> None:
             output=args.output,
             overwrite=args.overwrite,
         )
-    except (ValueError, FileExistsError) as error:
+    except (ValueError, FileExistsError, OSError) as error:
         parser.error(str(error))
     print(
         f"output: {summary['output']}\n"

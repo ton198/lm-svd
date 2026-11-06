@@ -215,7 +215,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse((result_dir / "analysis").exists())
 
     def test_exp2_analysis_writes_each_centering_to_its_own_directory(self) -> None:
-        run = self.root / "exp2_PFH" / "wikitext__gpt2-small"
+        run = self.root / "exp2_PFH" / "wikitext-direct__gpt2-small"
         inference = run / "inference"
         inference.mkdir(parents=True)
         matrix_path = inference / "pmi.npy"
@@ -420,45 +420,15 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue((output / "top5_sparse.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertIn("top5 sparse: support 5 columns, rank 2", summary)
 
-    def test_exp2_stream_seed_selects_run_directory(self) -> None:
-        base = self.root / "exp2_PFH"
-        seeded_run = base / "wikitext-103-train-adjacent-seed1__gpt2-small"
-        unseeded_run = base / "wikitext-103-train-adjacent__gpt2-small"
-        inference = seeded_run / "inference"
+    def test_exp2_run_name_selects_analysis_without_source_data(self):
+        run = self.root / "exp2_PFH" / "selected-run__gpt2-small"
+        inference = run / "inference"
         inference.mkdir(parents=True)
-        np.save(inference / "pmi.npy", np.array([[5., 1., 0.], [2., 4., 6.], [0., 3., -1.]]))
-        (inference / "metadata.json").write_text(
-            json.dumps({"source": {"pairing": "adjacent", "seed": 1}}), encoding="utf-8"
-        )
-        command = [
-            "analysis", "--stream", "wikitext-103-train", "--pairing", "adjacent",
-            "--seed", "1", "--results-root", str(self.root), "--centering", "none",
-            "--device", "cpu",
-        ]
+        np.save(inference / "pmi.npy", self.matrix)
         with redirect_stdout(StringIO()):
-            exp2_main(command)
-        self.assertTrue((seeded_run / "analysis" / "none" / "metadata.json").exists())
-        self.assertFalse(unseeded_run.exists())
-
-        seed_index = command.index("--seed") + 1
-        command[seed_index] = "0"
-        stderr = StringIO()
-        with redirect_stderr(stderr), self.assertRaises(SystemExit):
-            exp2_main(command)
-        self.assertIn(
-            "wikitext-103-train-adjacent__gpt2-small/inference/pmi.npy", stderr.getvalue()
-        )
-
-        stderr = StringIO()
-        with redirect_stderr(stderr), self.assertRaises(SystemExit):
-            exp2_main(["analysis", "--seed", "1", "--results-root", str(self.root), "--device", "cpu"])
-        self.assertIn("--seed requires --stream", stderr.getvalue())
-
-        command[seed_index] = "-1"
-        stderr = StringIO()
-        with redirect_stderr(stderr), self.assertRaises(SystemExit):
-            exp2_main(command)
-        self.assertIn("--seed must be non-negative", stderr.getvalue())
+            exp2_main(["analysis", "--run-name", "selected-run", "--results-root", str(self.root), "--device", "cpu"])
+        self.assertTrue((run / "analysis" / "none" / "metadata.json").exists())
+        self.assertFalse((self.root / "exp2_PFH" / "wikitext-direct__gpt2-small").exists())
 
     def test_each_experiment_reads_its_own_matrix(self) -> None:
         for module, matrix_name in (

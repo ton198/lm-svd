@@ -1,6 +1,6 @@
 # LM-SVD: GPT-2 Matrix Experiments
 
-Build matrices from local GPT-2 inference, compute their singular value decompositions (SVDs), measure numerical rank, and plot singular-value decay and cumulative energy. For matrices too large to store, learn leading singular components online with NeuralSVD.
+Build matrices from local GPT-2 inference, compute their singular value decompositions (SVDs), measure numerical rank, and plot singular-value decay and cumulative energy.
 
 Experiments use sampled history/future token sequences but construct different matrices:
 
@@ -9,29 +9,22 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp1` | Centered next-token logit for a future-specific header token | histories × (futures × top-k) | `matrix.npy` |
 | `exp2` | No-BOS pointwise mutual information of history and future | histories × futures | `pmi.npy` |
 | `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
-| `exp4` | Centered next-token logit for every vocabulary token | histories × (futures × vocabulary) | Not stored; online NeuralSVD |
-| `exp5` | Same stored top-k centered-logit matrix as exp1 | histories × (futures × top-k) | Reads exp1's `matrix.npy`; NeuralSVD decomposition |
-| `exp6` | Full-vocabulary centered logit on iid stream windows; frozen GPT-2 + trainable MLP features | Streaming history × (future × vocabulary) operator | Not stored; streaming NeuralSVD |
 
-Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead uses `train` → `analysis`, defaults to the larger `wikitext-large` dataset, and analyzes learned features on CPU without loading a model or materializing the matrix.
-
-**exp5** has only `analysis`: it learns singular components from exp1's stored matrix and always compares them with exp1's exact SVD for the selected centering. It performs no inference and loads no language model.
-
-**exp6** uses `train` → `analysis` on a token stream rather than a fixed sample table. Both stages load the local language model; analysis compares learned features against an exact fixed-probe reference.
+Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU.
 
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
-- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp4](#7-experiment-4-online-full-vocabulary-neuralsvd) · [exp5](#8-experiment-5-neuralsvd-on-the-exp1-matrix) · [exp1–exp3 analysis](#9-understand-exp1exp3-analysis-outputs)
-- [Streaming exp6](#experiment-6-streaming-full-vocabulary-neuralsvd) · [Python inference API](#python-inference-api) · [NeuralSVD utility API](#neuralsvd-utility-api) · [Tests](#tests)
+- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs)
+- [Python inference API](#python-inference-api) · [Tests](#tests)
 
 ## Project layout
 
 | Path | Purpose |
 | --- | --- |
 | `src/experiments/` | Experiment commands and workflows |
-| `src/data_pipline/` | Sample and token-stream preparation |
-| `src/utils/` | Shared inference, analysis, and NeuralSVD utilities |
+| `src/data_pipline/` | Data preparation, rolling training-sample generation and random sampling |
+| `src/utils/` | Shared inference and matrix-analysis utilities |
 | `scripts/` | Download and result synchronization scripts |
 | `bluehive_run/` | BlueHive Slurm job scripts and logs |
 | `tests/` | Automated tests |
@@ -120,9 +113,9 @@ uv run data-pipline build-windows \
 
 These exports remain active in the current shell. Before running either download script again, use `unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE` to allow network access.
 
-The output is `data/history_future_samples/wikitext.parquet`. If it already exists, reuse it or explicitly pass `--overwrite` to rebuild it. Experiments exp1–exp3 select this file by default with `--dataset wikitext`. GPT-2 Small and Medium use the same GPT-2 token vocabulary, so the same sample file can be reused for comparisons between them.
+The output is `data/history_future_samples/wikitext.parquet`. If it already exists, reuse it or explicitly pass `--overwrite` to rebuild it. Experiments exp1 and exp3 select this file by default with `--dataset wikitext`; exp2 samples raw WikiText internally. GPT-2 Small and Medium use the same GPT-2 token vocabulary, so the same sample file can be reused for comparisons between them.
 
-For exp4, build the larger window set from the same downloaded source:
+To build a larger window set from the same downloaded source:
 
 ```bash
 uv run data-pipline build-wikitext-large
@@ -132,7 +125,7 @@ This writes `data/history_future_samples/wikitext-large.parquet` with **10000 hi
 
 The pipeline processes sorted shards and rows, encodes each text row independently, concatenates token IDs without inserting separators or EOS tokens, and samples distinct non-overlapping windows. Windows may cross source-row boundaries. Output columns are `sample_id`, `group`, `token_count`, `start_token`, `token_ids`, and `text`. Experiments use **`token_ids`**, not re-encoded text. Sampling settings and source information are stored in the Parquet schema's `lm_svd` metadata.
 
-Experiments using sample sets load them only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). Prepared names include `wikitext`, `wikitext-large`, and `task-single-text`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment. exp2 can alternatively consume a shared sample store, as described below.
+Experiments using sample sets load them only from the fixed directory `data/history_future_samples/<dataset>.parquet`, relative to the working directory. Use `--dataset NAME`, not a file path. Names must contain only lowercase letters, digits, and hyphens, starting with a letter or digit (`[a-z0-9][a-z0-9-]*`). Prepared names include `wikitext`, `wikitext-large`, and `task-single-text`. If a producer's output directory is changed, place its Parquet file in this fixed directory before using it in an experiment.
 
 ### Task × document samples
 
@@ -155,17 +148,16 @@ Histories render as `Instruction: {instruction}` without trailing whitespace; fu
 
 Builder controls include `--task-catalog` (default `data/original/task_sources/single_text.jsonl`), `--input-count` (1309 futures), `--history-max-tokens` (256), `--passage-min-tokens` / `--passage-max-tokens` (96 / 160 passage tokens), and `--seed` (0). `--tokenizer-path` selects the tokenizer, recorded as `tokenizer_path` in `lm_svd` metadata rather than a filename suffix; rebuilding with another tokenizer targets the same filename and requires `--overwrite` to replace existing files. `--output-dir` relocates the generated Parquet file. Use `--c4-paths` to select local C4 files, including after changing the downloader's destination. Existing outputs are refused unless `--overwrite` is explicit.
 
-Select the task dataset by name for exp1–exp3; dataset-prefixed run directories keep its results separate. exp4 requires equal-length concatenated inputs within each block and is not suitable for these variable-length task/document samples:
+Select the task dataset by name for exp1 and exp3; dataset-prefixed run directories keep its results separate:
 
 ```bash
 DATASET=task-single-text
 RESULTS_ROOT=data/experiment_results
 uv run exp1 inference --device cuda --dataset "$DATASET" --results-root "$RESULTS_ROOT"
-uv run exp2 inference --device cuda --dataset "$DATASET" --results-root "$RESULTS_ROOT"
 uv run exp3 inference --device cuda --dataset "$DATASET" --results-root "$RESULTS_ROOT"
 ```
 
-Omit sample limits to use all rows, or set `--history-count N --future-count N` for leading subsets. exp2 supports these variable-length document futures, including in the same batch. Its PMI uses summed log probabilities and is not normalized by future length.
+Omit sample limits to use all rows, or set `--history-count N --future-count N` for leading subsets. exp2 independently samples WikiText and does not use these task/document samples.
 
 ### BlueHive Slurm run
 
@@ -187,13 +179,13 @@ The launcher requires exactly one experiment name; missing or invalid arguments 
 
 Create the log directory before submission, as shown above, so Slurm can open `bluehive_run/logs/slurm-<job-name>-<array-job-id>_<array-task-id>.out` and `.err` before the script starts. The script uses `SLURM_SUBMIT_DIR` as its working directory, so submit from the repository root. Per-experiment inference and analysis logs are created under `bluehive_run/logs/slurm-<job-name>-<array-job-id>_<array-task-id>/`.
 
-The submission creates three independently scheduled array tasks (`--array=1-3`), mapping task IDs 1, 2 and 3 to `exp1`, `exp2` and `exp3`, respectively. Each task requests one H100, 4 CPUs, 16 GiB host memory and a maximum of two hours (`02:00:00`). Each runs only its assigned experiment's inference, then its matching analysis; any failed command stops that task, so failed inference skips analysis. The script uses all dataset rows and the default result directories, without `--overwrite`: existing outputs cause failure rather than being silently replaced. Do not submit overlapping arrays or other jobs against those same result directories.
+The submission creates three independently scheduled array tasks (`--array=1-3`), mapping task IDs 1, 2 and 3 to `exp1`, `exp2` and `exp3`, respectively. Each task requests one H100, 4 CPUs, 16 GiB host memory and a maximum of three hours (`03:00:00`). Each runs only its assigned experiment's inference, then its matching analysis; any failed command stops that task, so failed inference skips analysis. exp1/exp3 use all task dataset rows; exp2 samples WikiText directly with the default 512 × 512 counts and `--run-name wikitext-direct`. The script uses default result directories without `--overwrite`: existing outputs cause failure rather than being silently replaced. Do not submit overlapping arrays or other jobs against those same result directories.
 
 The `h100` partition and `gpu:H100:1` GRES spelling must match the cluster configuration. Each task's resource request is not a measured guarantee that its experiment's full dataset will fit in memory or finish within two hours; reduce inference batch size for GPU-memory pressure or adjust the host-memory/time request based on observed usage.
 
-### Sync analysis and lingen results from BlueHive
+### Sync analysis results from BlueHive
 
-Run locally to pull only `data/experiment_results/<exp>/<run>/{analysis,lingen}/` trees:
+Run locally to pull only `data/experiment_results/<exp>/<run>/analysis/` trees:
 
 ```bash
 scripts/sync_circ_analysis.sh -n --itemize-changes  # Preview transfers and deletions.
@@ -202,7 +194,7 @@ scripts/sync_circ_analysis.sh --max-delete=0 --itemize-changes  # Guard against 
 
 The script uses the SSH alias `circ` and remote repository `/scratch/lli81/projects/ur_research/lm-svd`. Override either with `REMOTE` or `REMOTE_ROOT`. It runs from the local repository root regardless of the calling directory.
 
-`--delete` is enabled: local analysis and lingen files absent from the remote are removed unless guarded by `--max-delete=0`. Excluded `inference/`, `train/`, and loose files are neither copied nor deleted. Empty experiment/run directories without analysis or lingen are pruned from the transfer list. Additional arguments are passed to rsync.
+`--delete` is enabled: local analysis files absent from the remote are removed unless guarded by `--max-delete=0`. Excluded `inference/`, `train/`, and loose files are neither copied nor deleted. Empty experiment/run directories without analysis are pruned from the transfer list. Additional arguments are passed to rsync.
 
 ## 4. Experiment 1: centered-logit matrix
 
@@ -252,7 +244,6 @@ uv run exp1 analysis --device cpu --model-path models/gpt2-small \
 echo "Results: $RESULT_DIR"
 ```
 
-
 ## 5. Experiment 2: no-BOS history/future PMI matrix
 
 For each history `h` and future `f`, exp2 stores pointwise mutual information using no BOS token:
@@ -267,78 +258,31 @@ The first token of each sequence is unscored. Causality makes the history contri
 
 These are differences of log-probability **sums**, not averages, probabilities, or centered logits. Rows correspond to histories; columns correspond to futures. Histories and futures may have different token lengths, including within a batch.
 
-### Full workflow
+### Direct WikiText inference
 
-Set `MODEL` to `gpt2-small` or `gpt2-medium`. All histories and futures in the sample file are used. The default sample file produces a `512 × 512` matrix. Lower `--batch-size` if necessary; it controls how many futures are scored together for each history.
-
-```bash
-MODEL=gpt2-small
-DATASET=wikitext
-RESULTS_ROOT=data/experiment_results
-RESULT_DIR="$RESULTS_ROOT/exp2_PFH/${DATASET}__${MODEL}"
-
-uv run exp2 inference \
-  --model-path "models/$MODEL" \
-  --device cuda \
-  --batch-size 64 \
-  --dataset "$DATASET" --results-root "$RESULTS_ROOT"
-
-uv run exp2 analysis --model-path "models/$MODEL" \
-  --dataset "$DATASET" --results-root "$RESULTS_ROOT" --centering none
-```
-
-`inference` writes `pmi.npy` and `metadata.json` under `$RESULT_DIR/inference/`; `exp2 analysis` reads `inference/pmi.npy`. The metadata records the score definition and a nested `source`: Parquet sources include the sample path, selected sample IDs and parsed source metadata. Sample-store sources record `kind: "sample_store"`, the store directory and configuration, stream path and metadata, window lengths, consumer seed, exact starts, and selected blocks with their observed shard, sequence, row/column indices and output ranges. Old `feature_log_prob.npy` files are neither migrated nor deleted, and analysis of an old run requires a new `pmi.npy`. Rerunning inference where `metadata.json` already exists requires `--overwrite`, even if `pmi.npy` does not yet exist.
-
-### Shared sample-store input
-
-Instead of Parquet, `--stream NAME` selects a compatible public sample store and its token stream `data/token_streams/NAME.npy` and sibling metadata JSON. `--stream` and `--dataset` are mutually exclusive. Stream inference requires explicit matrix dimensions `--history-count` and `--future-count`; `--history-tokens` and `--future-tokens` default to 64 and 32. `--seed` defaults to 0 and controls consumer block and row/column selection, not the producer's sampling seed. These window options and `--sample-store` apply only to stream inference.
-
-Pass the same `--seed` to inference and analysis: nonzero stream seeds append `-seed<N>` to the run name (after `-adjacent` if used), while seed 0 leaves it unchanged.
-
-The producer draws and persists window starts; exp2 selects stored blocks and concatenates selected starts until both requested counts are met, then reconstructs the windows from the token stream. This is not independent raw-stream sampling by exp2. The cached final hidden states cannot provide the tokenwise probabilities needed for PMI, so exp2 still runs language-model forwards. The store is a live rolling ring: blocks can be overwritten, so the same consumer seed alone is not a durable snapshot. Retain the recorded exact starts and observed block shard/sequence for reproducibility.
+exp2 reads original WikiText text shards from `data/original/wikitext/wikitext-103-raw-v1/train-*.parquet`, tokenizes them with the local model's tokenizer, and samples windows internally. These are raw source text shards, not prepared history/future Parquet samples. exp2 does not read the training sample store and does not accept `--dataset`, `--stream`, or `--sample-store`.
 
 ```bash
-STREAM=wikitext-103-train
-STORE=data/sample_stores/wikitext-103-train__gpt2-small__h64-f32
-uv run exp2 inference --device cpu --stream "$STREAM" --sample-store "$STORE" \
-  --history-count 3 --future-count 4 --batch-size 4
-uv run exp2 analysis --device cpu --stream "$STREAM" --centering none
+uv run exp2 inference --device cuda --run-name wikitext-direct
+uv run exp2 analysis --device cuda --run-name wikitext-direct --centering none
 ```
 
-`--sample-store` is optional; by default the directory is derived from stream, model directory name and window lengths, here `data/sample_stores/wikitext-103-train__gpt2-small__h64-f32`. Produce a compatible store first using `sample-store produce` (see the shared store section below). With default model and results root, this run is stored under `data/experiment_results/exp2_PFH/wikitext-103-train__gpt2-small/`. Analysis uses the same stream, model and results root to locate the run; it does not consume the store.
+Defaults: 512 histories × 512 futures, 64-token histories, 32-token futures, seed 0, and independent uniform starts with replacement. Flags `--dataset-dir`, `--config`, `--split`, `--history-count`, `--future-count`, `--history-tokens`, `--future-tokens`, `--seed`, and `--batch-size` control inference. The tokenizer always comes from `--model-path`, with local-only loading. Inputs contain no inserted BOS or separator tokens.
 
-`--pairing independent` is the default: histories and futures use the store's separately persisted starts. With `--pairing adjacent`, histories still use persisted history starts, but future `i` is the `future_tokens` tokens immediately after history `i` (`future_starts = history_starts + history_tokens`). Adjacent inference requires `--stream` and equal history/future counts. It still scores the full matrix: diagonal entries are matched continuations and off-diagonal entries are mismatched. A selected history without enough continuation tokens raises an error; choose another `--seed`.
+`--pairing adjacent` samples histories with enough room for their following futures, and requires equal history/future counts. The full PMI matrix is computed; diagonal entries are matched continuations. Choose a separate `--run-name` for each configuration, pairing or seed; inference and analysis must use the same run name.
 
-Pass `--pairing adjacent` to both inference and analysis. Adjacent runs use `<results-root>/exp2_PFH/<stream>-adjacent__<model-directory-name>/`, leaving independent runs untouched:
+Outputs are `<results-root>/exp2_PFH/<run-name>__<model>/inference/{pmi.npy,metadata.json}`. Metadata records the raw source, tokenizer, pairing, seed and exact window starts. PMI computation and matrix-analysis formulas are unchanged. Adjacent analysis retains pairing diagnostics, `pairing_truncation.png`, and `top5_sparse.png`; analysis discovers pairing from saved metadata.
 
-```bash
-uv run exp2 inference --device cpu --stream "$STREAM" --pairing adjacent \
-  --sample-store "$STORE" --history-count 6 --future-count 6 --batch-size 3 --seed 5
-uv run exp2 analysis --device cpu --stream "$STREAM" --pairing adjacent --seed 5 --centering none
-```
-
-Adjacent analysis adds `pairing_diagnostics` to metadata and a `pairing:` summary line: diagonal/off-diagonal means and population standard deviations, mean gap, row/column top-1 fractions, and mean ranks. Ranks count entries strictly greater than the diagonal entry, so ties share the best rank. These diagnostics describe the stored uncentered PMI matrix and are identical across centerings; independent and Parquet runs omit them.
-
-Adjacent analysis also adds `truncation_pairing` metadata, a `truncation:` summary line, and `pairing_truncation.png`. For every rank from 1 through all saved singular values (including those below the numerical-rank tolerance), it reconstructs the matrix selected by `--centering` and measures matched-pair row/column top-1, mean ranks, diagonal/off-diagonal mean gap, captured energy, and relative Frobenius reconstruction error. The plot compares energy with top-1 retrieval and shows mean ranks against chance (`1/n` top-1 and `(n+1)/2` mean rank). Threshold ranks are the first ranks reaching 90% energy or 90% of each side's full-rank top-1, without rounding; a zero full-rank top-1 target is reached at rank 1. Thus `none` analyzes raw PMI, while other centerings analyze their transformed matrices. Independent and Parquet runs omit these additions and retain the five standard files.
-
-Adjacent analysis additionally writes `top5_sparse` metadata, a `top5 sparse:` summary line, and `top5_sparse.png`. It keeps each row's five largest entries of the stored **uncentered** PMI matrix (or all columns when fewer than five exist), zeroing everything else; diagonal entries are eligible and ties favor the lower column index. This analysis is identical across centerings. It reports column usage, diagonal inclusion, nonpositive selected values, mean pairwise support Jaccard with its exact uniform-subset chance baseline, and mean pairwise cosine. The sparse matrix's singular spectrum, numerical rank, and effective rank (`exp(-sum(p * log(p)))`, with singular-value probabilities `p = S / sum(S)`) quantify its structure. Every rank-r truncation records captured energy, relative Frobenius error, and mean top-five support recovery, with first ranks reaching 50/90/99% energy and 90% support recovery. Recovery selects the largest **absolute** reconstructed entries so negative selected PMI values are not beaten by zeros; its chance baseline is `k/n`. Independent and Parquet outputs remain unchanged.
-
-On CIRC BlueHive, `bluehive_run/exp2-inference.sbatch` and `bluehive_run/exp2-analysis.sbatch` both request partition `h100`, QoS `h100`, and one H100 GPU. They retain 4 CPUs and 16G memory, with 6 hours for inference and 1 hour for analysis. Submit from the repository root with matching `DATASET` values and an `afterok` dependency; analysis runs all four centering modes. Both scripts overwrite existing outputs, so cancel any older jobs for the same dataset before resubmitting.
-
-### Small CPU smoke run
-
-The expected shape is `2 × 2`.
+A small CPU run using local data and model files:
 
 ```bash
 RESULTS_ROOT=$(mktemp -d /tmp/lm-svd-exp2.XXXXXX)
-RESULT_DIR="$RESULTS_ROOT/exp2_PFH/wikitext__gpt2-small"
-uv run exp2 inference --device cpu \
-  --history-count 2 --future-count 2 --batch-size 2 \
-  --dataset wikitext --results-root "$RESULTS_ROOT"
-uv run exp2 analysis --device cpu --model-path models/gpt2-small \
-  --dataset wikitext --results-root "$RESULTS_ROOT" --centering none
-echo "Results: $RESULT_DIR"
+uv run exp2 inference --device cpu --results-root "$RESULTS_ROOT" \
+  --history-count 2 --future-count 2 --batch-size 2
+uv run exp2 analysis --device cpu --results-root "$RESULTS_ROOT"
 ```
+
+On BlueHive, submit `bluehive_run/exp2-inference.sbatch`, then `bluehive_run/exp2-analysis.sbatch` after successful inference. Both accept `RUN_NAME` (default `wikitext-direct`), and analysis runs all four centering strategies. They require the local model, tokenizer and original WikiText training text. Inference and analysis scripts use `--overwrite`.
 
 ## 6. Experiment 3: difference between centered-logit matrices
 
@@ -371,130 +315,7 @@ uv run exp3 analysis \
 
 Override the models with `--model-a-path` and `--model-b-path`. `inference` writes `matrix.npy` (the difference), `matrix_a.npy`, `matrix_b.npy`, `rows.parquet`, `columns.parquet`, and `metadata.json` under `$RESULT_DIR/inference/`. Column tokens and future-only logits in `columns.parquet` come from model A. Analysis processes only the difference `matrix.npy`, not the two component matrices. `global` and `row` centering are linear, so `center(L_A - L_B) = center(L_A) - center(L_B)`; `deflate1` is not linear because it removes the leading singular component of the difference matrix itself.
 
-## 7. Experiment 4: online full-vocabulary NeuralSVD
-
-exp4 learns leading singular components of the exp1 centered-logit matrix **without top-k selection**:
-
-```text
-A[h, (f, z)] = logit(z | h + f) - mean_vocabulary(logits | h + f)
-```
-
-Columns are future-major, then token ID over the full vocabulary. With the default `wikitext-large` samples and GPT-2 Small's vocabulary of 50257, the matrix is `10000 × 502570000` (about 20 TB in float32). It is never stored: training samples history and future subsets independently, generates their full-vocabulary logit block online, and feeds it to `NestedLoRASVDLoss`.
-
-For a bias-free output layer with token embeddings `e_z`, centered logits equal `s(h, f) · (e_z - mean_e)`, where `s` is the final hidden state. exp4 uses a dense history lookup for left features and the right parameterization `g_l(f, z) = W_f[l] · (e_z - mean_e)`, with `W_f` of shape `(rank, hidden_size)`. Thus right features need no lookup table over all future/token pairs. Training uses Adam with dense embedding gradients and rejects output layers with bias.
-
-### Workflow and defaults
-
-```bash
-uv run data-pipline build-wikitext-large
-uv run exp4 train
-uv run exp4 analysis
-```
-
-Both stages default to `--dataset wikitext-large`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; use `--device cpu` for either stage without CUDA. Training uses all available histories and futures, rank 256 when `--rank` is omitted, sequential nesting, history/future batches of 64 each, base learning rate `--lr 1e-2`, seed 0, and logging every 100 steps. The default `--lr-schedule cosine` decays without warmup to `--min-lr 1e-4` over `--lr-decay-steps 30000` updates, starting at step 0 for fresh training or at the resumed step of a constant-lr checkpoint. Cosine training stops at the schedule end (`stop_reason: lr_schedule_end`), not on convergence. Every `--eval-every 1000` steps, training estimates all learned singular values using the analysis formula and records convergence when their maximum relative change is below `--tol 1e-3` for `--patience 3` consecutive evaluations. Use `--lr-schedule constant` to stop on that convergence criterion instead. Set `--max-steps` to cap total steps across resumes; it defaults to no additional cap. Use `--history-count` / `--future-count` for leading subsets, `--history-batch` / `--future-batch` for block sizes, `--rank`, `--lr`, `--log-every`, or `--nesting joint` to adjust training.
-
-Runs are stored under `<results-root>/exp4_neural_svd/<dataset>__<model-directory-name>/`; the directory name does not include rank. Pass matching dataset, results-root, and model-path flags to both stages for nondefault runs. Analysis reads rank from the saved training metadata and needs no rank argument. Training against an existing checkpoint with a different rank fails the resume config check rather than silently restarting.
-
-### BlueHive
-
-After installing `.venv` and preparing `models/gpt2-small` and `data/history_future_samples/wikitext-large.parquet` on the cluster, submit the training-only exp4 job from the repository root:
-
-```bash
-cd /scratch/lli81/lm-svd
-mkdir -p bluehive_run/logs
-sbatch bluehive_run/exp4-train.sbatch
-```
-
-Before the first rank-256 submission, preserve an existing default-dataset rank-32 run by moving it aside on the cluster (only if the source directory exists, and before running `sbatch` above):
-
-```bash
-mv data/experiment_results/exp4_neural_svd/wikitext-large__gpt2-small \
-   data/experiment_results/exp4_neural_svd/wikitext-large__gpt2-small__rank32
-```
-
-The training script accepts `DATASET` and `RANK` environment overrides at submission time; unset values default to `wikitext-large` and `256`, respectively:
-
-```bash
-RANK=128 sbatch bluehive_run/exp4-train.sbatch
-DATASET=task-single-text RANK=128 sbatch bluehive_run/exp4-train.sbatch
-```
-
-For a nondefault dataset, submit analysis with the same `DATASET`, for example `DATASET=task-single-text sbatch bluehive_run/exp4-analysis.sbatch`. Analysis uses the saved training rank, not `RANK`.
-
-The training job requests one H100 on the `preempt` partition, 4 CPUs, 64 GiB host memory, and one day, with requeue enabled and Slurm logs appended. It runs only `exp4 train` with the defaults above unless overridden as shown. Training does not use `--overwrite`: it resumes an existing checkpoint, while completed training outputs without a checkpoint cause an error. Do not submit overlapping jobs against the same result directory.
-
-Resubmit the same training job after a timeout or failure to resume from the latest checkpoint. An existing constant-lr checkpoint starts a 30,000-step cosine decay from its saved step, in place, without copying the old state. Subsequent resumes and Slurm requeues reuse the saved decay start; they neither restart nor extend the schedule. A rerun after the schedule end performs no updates. Submit `sbatch bluehive_run/exp4-analysis.sbatch` separately to run `exp4 analysis --overwrite`, including on a saved snapshot before convergence. The analysis job requests one GPU on the `gpu` partition, 4 CPUs, 32 GiB host memory, and one hour. Exp4 analysis has no `--centering` option and runs once on the learned centered-logit matrix. Resource requests are not a measured guarantee that the full dataset fits or converges within the time limit; adjust the script's batch sizes and memory/time requests based on observed usage.
-
-Slurm stdout/stderr go to `bluehive_run/logs/slurm-lm-svd-exp4-train-<job-id>.out` and `.err` for training, or `slurm-lm-svd-exp4-analysis-<job-id>.out` and `.err` for analysis. Stage logs go to the matching `bluehive_run/logs/slurm-<job-name>-<job-id>/` directory as `exp4-train.out` or `exp4-analysis.out`. Create the log directory before submission so Slurm can open its files.
-
-### Outputs and interpretation
-
-- `train/`: while training, `checkpoint.pt` stores feature weights, Adam moments, RNG state, loss history, convergence state, and learning-rate schedule state every `--checkpoint-every 100` steps, when capped, and at the cosine schedule end. At the default rank 256 and dataset size, the checkpoint is estimated at about 24 GB and `features.pt` at about 7.9 GB. Training automatically resumes from it; interruption between checkpoints loses at most 99 steps at the default interval. Each checkpoint also refreshes six analysis-ready snapshot files: `features.pt` (history and future lookup weights), `token_gram.npy` (the centered token embedding Gram matrix), `loss_history.npy`, `histories.parquet`, `futures.parquet`, and `metadata.json` (matrix definition, training settings/results, `lr_schedule`, `final_lr`, convergence statistics, and source provenance). Each file is replaced atomically, with metadata last; concurrent analysis can read files from adjacent snapshots. Constant-schedule convergence writes the final snapshot and removes the checkpoint. Cosine training records convergence without stopping or deleting the checkpoint, and retains it at the schedule end.
-- `analysis/`: exactly four files: `singular_values.npy`, `left_singular_vectors.npy` (unit-norm columns), `neural_svd_spectrum.png`, and `metadata.json`. The two arrays are written first, then the plot, and `metadata.json` last as the completion marker. Its four top-level sections, in order, are `input`, `spectrum`, `orthogonality`, and `loglog_fit`. `input` records the training directory, input filenames, matrix shape, and the complete training metadata under `train_metadata`; `spectrum` records factor and plot filenames, learned rank/order, singular values, the squared Frobenius norm estimate, and cumulative captured energy with their formulas. `orthogonality` contains `left_error`, `right_error`, and their definition. Input filenames are relative to `input.train_dir`; factor and plot filenames are relative to the analysis metadata directory.
-
-The plot shows singular values on log-log axes with a fitted line labeled by slope `k` and intercept `b`, cumulative captured energy, and training loss. The fit uses every learned singular value in learned order, with indices starting at 1: `log10(σ_i) = k * log10(i) + b`. Least squares weights each squared residual by its log-index cell width, `weight_i = log10((i + 0.5) / (i - 0.5))`, so densely sampled high indices do not dominate the fit. The top-level `loglog_fit` section stores `slope`, `intercept`, `point_count`, `log_base`, `formula`, and `weighting`; the CLI also prints `k` and `b`. With fewer than two points the fit is skipped and its slope/intercept are null, but `weighting` is still recorded. Loss history is read from the training snapshot, not embedded in analysis metadata. Spectrum and energy panels share the exp1–exp3 plotting layer, but exp4 has no numerical-rank markers or fixed energy limits.
-
-Analysis computes feature statistics in torch float64 on the selected device and reads only `train/{features.pt,token_gram.npy,loss_history.npy,metadata.json}`. Future weights remain on CPU and move to the device in chunks of at most 1024 futures, using a flat 2-D matrix product with the token Gram matrix. Downstream diagnostics and output processing remain in NumPy. `--model-path` supplies only the directory name for locating the run; no language model or sample file is loaded. The token Gram matrix gives right-feature norms and inner products without constructing the enormous right-feature array. Analysis does **not** compute an exact matrix SVD, save right singular vectors, or estimate numerical rank. It does not accept `--centering`: no secondary centering is available because the matrix is not stored.
-
-For a capped feasibility smoke, run `uv run exp4 train --max-steps 2 --checkpoint-every 1 --log-every 1 --results-root /tmp/exp4-smoke`. It prints `stop_reason: max_steps` and leaves a checkpoint and analysis-ready snapshot. Run `uv run exp4 analysis --results-root /tmp/exp4-smoke` to analyze it; the summary reports the training step and convergence status. Rerun training with `--max-steps 4` to continue from step 2, or omit the cap to train until the cosine schedule ends. Rerun analysis with `--overwrite` to refresh its outputs. Add `--device cpu` to either command to run without CUDA.
-
-Singular values retain **learned order**, not sorted order. In `metadata.json`, `orthogonality.left_error` and `orthogonality.right_error` report maximum absolute off-diagonal inner products for normalized left/right features. `spectrum.frobenius_norm_sq_estimate` is the sampled squared Frobenius norm estimate, and `spectrum.captured_energy_fraction` divides cumulative squared learned singular values by that estimate; it can exceed 1 before convergence and is reported without clipping. Both the singular-value and captured-energy lists have length `spectrum.learned_rank`. These are learned estimates, not a guarantee of convergence or exact leading singular values; inspect orthogonality, ordering, energy, and loss together.
-
-Training resumes by default when a checkpoint exists, including when snapshot outputs exist alongside it. Resume requires matching sample/model paths, sample counts, rank, nesting, batch sizes, base learning rate, seed, and convergence settings; device, logging/checkpoint intervals, and the total-step cap may change. Constant-lr checkpoints, including legacy checkpoints without schedule state, may switch to cosine. Once cosine is saved, its minimum learning rate and decay length must match, and switching back to constant is rejected. Existing training outputs without a checkpoint require `--overwrite`, which discards both checkpoint and training outputs and restarts at step 0; do not use it to continue an existing run. Analysis also requires `--overwrite` to replace its outputs. Replacing training outputs does not refresh analysis; rerun `exp4 analysis --overwrite` when needed. Use `uv run exp4 <subcommand> --help` or `uv run python -m experiments.exp4_neural_svd <subcommand>`.
-
-Legacy SparseAdam checkpoints are incompatible with dense Adam and fail the resume config check. Start the replacement run once with `uv run exp4 train --overwrite`; subsequent runs and BlueHive requeues resume normally without `--overwrite`.
-
-## 8. Experiment 5: NeuralSVD on the exp1 matrix
-
-exp5 isolates the decomposition method: it reads `<results-root>/exp1_L_M_table/<dataset>__<model-directory-name>/inference/matrix.npy` and its required `metadata.json`, then fits dense row/column lookup tables with sequential NeuralSVD and Adam. It does not run inference, load a model, or read sample files; `--model-path` supplies only the directory name used to locate the run.
-
-### Prerequisites and commands
-
-Both **exp1 inference and exp1 exact analysis for the selected centering** must already exist under the same results root, dataset, and model name. Missing inputs or exact factors are errors before training starts. For example, after the exp1 inference workflow above:
-
-```bash
-# Prepare the required exact reference, then fit and compare NeuralSVD.
-uv run exp1 analysis --centering none
-uv run exp5 analysis
-
-# A different centering requires its own exact reference.
-uv run exp1 analysis --centering deflate1
-uv run exp5 analysis --centering deflate1
-
-uv run exp5 analysis --help
-```
-
-These commands default to `--dataset wikitext`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, `--centering none`, and `--device cuda`. Pass matching dataset, model-path, and results-root flags to exp1 and exp5 for nondefault runs. Use `--device cpu` without CUDA; use `--overwrite` to replace existing analysis outputs.
-
-Training defaults are `--rank 64`, `--history-batch 64`, `--future-batch 64`, `--steps 30000`, `--lr 1e-2`, `--min-lr 1e-4`, `--seed 0`, and `--log-every 1000`. The learning rate follows cosine decay over all steps. Each step samples histories and futures uniformly without replacement and includes **all top-k columns** for each sampled future. Batch sizes must not exceed the stored history/future counts.
-
-### Centering and interpretation
-
-`--centering {none,global,row,deflate1}` supports the same four strategies as exp1. `none`, `global`, and `row` use exactly the same transformed matrix as exp1. For `deflate1`, exp5 instead trains `rank + 1` components on the original stored matrix, drops learned component 0, and measures reconstruction and captured energy against `M - S[0] * outer(U[:, 0], Vt[0, :])`. **exp5 performs no exact SVD**, including for deflation; its required exp1 reference is computed separately.
-
-Singular values remain in **learned order**, not sorted order. Metadata reports reconstruction relative error, maximum absolute off-diagonal Gram entries for unit-norm left/right factors, and the log-log fit over all retained components. Captured energy is `cumsum(S**2) / ||X||_F**2` for the analyzed matrix `X`; it is not normalized to the retained spectrum or clipped and can exceed 1. These learned estimates do not guarantee convergence.
-
-Comparison is always against exp1's matching centering: index-matched singular-value relative errors, left/right absolute vector cosines, and left/right subspace overlaps. Index matching compares learned order with exp1's descending order; subspace overlap is useful when nearby components swap. The exact captured-energy overlay uses exp1's full spectrum as its denominator.
-
-### Outputs and BlueHive
-
-Results go to `<results-root>/exp5_L_M_neural_svd/<dataset>__<model-directory-name>/analysis/<centering>/`:
-
-- `svd_U.npy`, `svd_S.npy`, and `svd_Vt.npy`: retained unit-norm factors and learned singular values.
-- `loss_history.npy`: one loss value per training step.
-- `svd_spectrum.png`: four panels showing the log-log spectrum and fit, cumulative captured energy, alignment with exp1's left/right vectors, and training loss. Spectrum and energy panels include green dashed exp1 exact-SVD overlays.
-- `metadata.json`: input provenance, centering formula, training settings, factor diagnostics, spectrum, log-log fit, and exp1 comparison. It is written last as the completion marker.
-
-After preparing exp1 inference and exact analysis for **all four centerings**, submit from the repository root:
-
-```bash
-mkdir -p bluehive_run/logs
-sbatch bluehive_run/exp5-analysis.sbatch
-```
-
-The batch script runs all four exp5 centerings with `--overwrite` and a two-hour time limit, writing separate `exp5-analysis-<centering>.out` logs. It does not generate the exp1 prerequisites.
-
-## 9. Understand exp1–exp3 analysis outputs
+## 7. Understand exp1–exp3 analysis outputs
 
 Experiments exp1–exp3 each own their `analysis` workflow. It reads the matrix and optional sibling `metadata.json` from `<result-dir>/inference/`, then writes five standard outputs to `<result-dir>/analysis/<centering>/` (adjacent exp2 runs additionally write `pairing_truncation.png` and `top5_sparse.png`):
 
@@ -517,7 +338,7 @@ Experiments exp1–exp3 each own their `analysis` workflow. It reads the matrix 
 
 Analysis computes a thin float64 SVD with PyTorch on `--device cuda` by default. CUDA uses the accurate `gesvd` driver; `--device cpu` uses PyTorch's CPU SVD. Invalid devices and unavailable CUDA produce an error rather than silently switching devices. If GPU memory is insufficient, rerun that analysis with `--device cpu`. Saved factors remain NumPy arrays, and the numerical-rank tolerance is unchanged.
 
-`<run>` is a flat, string-joined directory name: `<dataset>__<model>` for exp1 and parquet-based exp2 (for example, `wikitext__gpt2-small`), `<stream>__<model>` for stream-based exp2, or `<dataset>__<model_a>__minus__<model_b>` for exp3 (for example, `wikitext__gpt2-small__minus__gpt2-medium`). Model labels are the final directory names of the model paths. The dataset or stream is not a separate directory level. Only the requested strategy directory is created.
+`<run>` is `<dataset>__<model>` for exp1, `<run-name>__<model>` for exp2 (default `wikitext-direct__gpt2-small`), or `<dataset>__<model_a>__minus__<model_b>` for exp3. Model labels are the final directory names of the model paths. Only the requested centering directory is created.
 
 ### Secondary centering
 
@@ -564,17 +385,17 @@ Refresh older analyses, including those that used float32 epsilon for rank, by r
 
 ```bash
 uv run exp2 analysis --model-path models/gpt2-small \
-  --dataset wikitext --results-root data/experiment_results \
+  --run-name wikitext-direct --results-root data/experiment_results \
   --centering none --overwrite
 ```
 
-Rerunning analysis does not remove preexisting legacy JSON artifacts. Manually remove obsolete analysis JSON files after refreshing existing exp1–exp4 results, retaining the new `metadata.json`.
+Rerunning analysis does not remove preexisting legacy JSON artifacts. Manually remove obsolete analysis JSON files after refreshing existing exp1–exp3 results, retaining the new `metadata.json`.
 
 ### Directory selection and existing results
 
-**Analysis does not infer the model or source from your last `inference` call.** Both subcommands default to `--dataset wikitext` and `--results-root data/experiment_results`, with `--model-path models/gpt2-small` for exp1/exp2, or `--model-a-path models/gpt2-small --model-b-path models/gpt2-medium` for exp3. Pass matching dataset (or, for exp2, stream), results-root, and model flags to inference and analysis for nondefault runs.
+**Analysis does not infer the model or source from your last inference call.** Pass matching results-root and model flags, plus `--dataset` for exp1/exp3 or `--run-name` for exp2. exp2 defaults to `wikitext-direct`.
 
-Analysis uses only the model paths' directory names to locate the run: it does not load a model, check that the model directory exists, or require/check the sample file, token stream, or sample store. It validates the source name's format. Inference resolves the named sample file or exp2 token stream in its fixed directory and, for exp2 streams, reads a compatible sample store. `--results-root PATH` selects the parent of the experiment directory, not the run root or its `inference/` or `analysis/` child.
+Analysis only uses model directory names and stored inference outputs; it does not load the model, tokenizer, raw WikiText, or prepared samples. `--results-root PATH` selects the parent of the experiment directory.
 
 Existing WikiText results have moved to the dataset-prefixed run directories above, and prepared sample files have been renamed to the plain dataset filenames. Historical `metadata.json` files are unchanged: their original `samples_path` values remain records of the inputs used at the time, even though those files have since been renamed.
 
@@ -582,195 +403,56 @@ Inference refuses to replace its existing outputs without `--overwrite`. Analysi
 
 Other useful options:
 
-- `--dataset NAME`: select a named sample set for inference or analysis; default `wikitext`.
+- `exp1/exp3 --dataset NAME`: select a named sample set; default `wikitext`.
+- `exp2 --run-name NAME`: select an inference/analysis run; default `wikitext-direct`.
 - `--results-root PATH`: select the results root for inference or analysis; default `data/experiment_results`.
-- `inference --history-count N --future-count N`: use leading samples of each Parquet group; omit both to use all available samples. For exp2 streams, both counts are required and specify the matrix dimensions assembled from sampled store blocks.
+- `inference --history-count N --future-count N`: exp1/exp3 select leading prepared samples; exp2 independently draws these counts from raw WikiText (default 512 each).
 - `exp1 inference --top-k K`: select K header tokens per future; default 50.
+- `exp2 inference --pairing {independent,adjacent}`: choose window pairing; default `independent`.
 - `exp2 inference --batch-size N`: score N futures per inference batch; default 64.
-- `exp2 --stream NAME`: select a shared-store stream instead of a dataset for inference or analysis. Both stages accept consumer selection `--seed`; inference also accepts `--sample-store PATH` (optional store override), `--history-tokens`, and `--future-tokens`.
-- `exp2 --pairing {independent,adjacent}`: select stream pairing for inference and analysis; default `independent`. Adjacent inference requires equal counts and analysis uses the separate adjacent run directory.
 - `inference --device cpu`: use CPU instead of the default CUDA device.
 
 Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv run exp3 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>`, `uv run python -m experiments.exp2_PFH <subcommand>`, and `uv run python -m experiments.exp3_L_M_diff <subcommand>`.
 
-## Experiment 6: streaming full-vocabulary NeuralSVD
+## Training sample generation and sampling
 
-This experiment replaces exp4's per-sample lookup tables with functions of token content. A shared teacher sample store supplies each training step with a randomly selected block and randomly selected history/future subsets. Producers draw window starts uniformly with replacement from the token stream (duplicates are allowed); blocks may be reused until overwritten. Histories and futures need not be adjacent in the original text. Every sampled future contributes **all vocabulary tokens** (50,257 for GPT-2); there is no top-k selection, secondary centering, or first-component removal.
-
-```text
-A[h, (f, z)] = logit(z | h + f) - mean_vocabulary(logits | h + f)
-             = s(h + f) · (e_z - mean_e)
-(T v)(h) = E_{f,z}[A[h, (f, z)] v(f, z)]
-```
-
-Here `h` and `f` have independent uniform-start window distributions, `z` is uniform over the vocabulary, and `s` is GPT-2's final hidden state. The centered-unembedding identity projects stored hidden states into a full-vocabulary block without storing the infinite table; float16 storage makes these training targets approximate. The teacher model is frozen; NestedLoRA with Adam trains the feature functions.
-
-### Prepare a token stream and run
-
-Download the local model and WikiText source as above, then tokenize the entire split once. Start a producer in a separate terminal and leave it running while training; inspect its progress with `status`:
+Both parts live in `data_pipline`. First tokenize local WikiText, then start continuous generation:
 
 ```bash
 uv run data-pipline build-token-stream
-uv run sample-store produce --device cuda
+uv run data-pipline sample-store produce --device cuda
+# In another terminal:
+uv run data-pipline sample-store status
 ```
+
+The generator independently draws h and f windows uniformly with replacement (overlap and duplicates are allowed), concatenates their token IDs without BOS or separators, and evaluates the model's last-position prediction. Each sample stores h, f and the **full-vocabulary raw float32 logits**, without softmax, centering or top-k truncation. Defaults are H=64, F=32, 64 paired samples per block, batch size 64, and capacity 64 GiB. This is 64 pairs per block, not a Cartesian history × future grid.
+
+The token-stream builder writes `data/token_streams/wikitext-103-train.npy` and sibling JSON. Build another split using `build-token-stream --split validation --output data/token_streams/wikitext-103-validation.npy`, then use `--stream wikitext-103-validation`. New streams record a tokenizer fingerprint; generation checks it against the local teacher tokenizer. Older stream metadata uses its recorded tokenizer path for the check. Store configuration also records model file sizes and modification times to reject changed checkpoints on restart. All loads are local; neither command downloads files.
+
+The default store is `data/sample_stores/wikitext-103-train__gpt2-small__h64-f32`. Override it with `--store-dir`. Blocks are uncompressed structured `.npy` files supporting memory mapping, with h/f int64 fields and a float32 logits field. Capacity includes block headers; metadata and one temporary staging block per active producer require additional space. Finished blocks replace slots atomically, then progress is published. Full stores overwrite their oldest slots within each shard.
+
+```python
+from data_pipline import SampleSampler
+
+sampler = SampleSampler(
+    "data/sample_stores/wikitext-103-train__gpt2-small__h64-f32", seed=0
+)
+sampler.wait_until_ready()  # Wait for the first block after the store is initialized.
+h, f, logits = sampler.sample()
+# CPU tensors: int64[64], int64[32], float32[vocab_size].
+```
+
+The sampler uniformly draws from all currently published samples, with replacement. It loads no LLM or tokenizer and needs no original WikiText files. Returned tensors own their memory, so later slot replacement or caller mutation is safe. Sampling an initialized but empty store raises `ValueError`; a missing store also raises an error. A seed reproduces choices only while the store contents remain unchanged.
+
+`--max-gib`, `--samples-per-block`, `--batch-size`, `--history-tokens`, `--future-tokens`, and `--seed` control production. `--max-blocks N` stops after N additional blocks; otherwise production continues indefinitely. Restart with the same store configuration to resume. Multiple processes use distinct `--shard` values and the same `--shards` count. On BlueHive:
 
 ```bash
-uv run sample-store status
+for k in 0 1; do
+  SHARDS=2 SHARD=$k sbatch bluehive_run/sample-store-produce.sbatch
+done
 ```
 
-Once the store exists, run training and analysis:
-
-```bash
-uv run exp6 train
-uv run exp6 analysis
-```
-
-The builder defaults to `--dataset-dir data/original/wikitext --config wikitext-103-raw-v1 --split train --tokenizer-path models/gpt2-small --output data/token_streams/wikitext-103-train.npy`. It writes a 1-D integer `.npy` token stream and sibling `.json` with tokenizer, vocabulary, split, dtype, and token-count metadata. Use `--overwrite` to replace them. Training memory-maps the array; it does not use the Parquet history/future sample tables. For another stream, write `data/token_streams/NAME.npy` and its JSON, and pass `--stream NAME`. Use a tokenizer matching the teacher model.
-
-### Shared teacher sample store
-
-Streaming `train` for exp6 uses the sample store. Producers run GPT-2 in float32 and store final-position hidden states in float16, together with history and future starts, in a rolling ring of blocks (default 64 histories × 64 futures). Consumers reconstruct windows from their token stream and project sampled states with the centered unembedding. Only target-grid teacher inference is removed from these training steps: exp6 still runs frozen GPT-2 forwards to encode its individual history and future windows.
-
-Each slot is a losslessly compressed NumPy `.npz` archive written with `np.savez_compressed` (ZIP Deflate). Compression preserves all stored fp16 values, start indices, shapes and dtypes; `np.load` reads both compressed and older uncompressed slots. Producers atomically replace individual slot files. To recompress existing slots offline, stop all producers and hold their shard locks; verify array contents before atomically replacing each archive, leaving `store.json` and shard progress unchanged.
-
-The default capacity is 64 GiB of **uncompressed** sample payload; set `sample-store produce --max-gib` to change it at creation. Slot count is based on that payload size, not compressed file sizes, so compression reduces disk usage without increasing capacity (10,920 slots for the default GPT-2 Small blocks). Archive overhead is additional. The default directory is `data/sample_stores/<stream>__<model-directory-name>__h<history-tokens>-f<future-tokens>`; with the defaults it is `data/sample_stores/wikitext-103-train__gpt2-small__h64-f32`. Use `--store-dir PATH` for producer/status commands and `--sample-store PATH` for training to select another directory. Producer and consumer model, stream and window settings must match, and training batches must fit the block dimensions.
-
-Training waits until the store contains at least 64 blocks, or its entire capacity if smaller; it may then reuse blocks while producers replace old ones. Start a producer before training: a missing store is an error, while an existing underfilled store causes training to wait. The shard count is fixed when the store is created. To change it or another store configuration, stop **all** producers before using `sample-store produce --overwrite` to recreate the store; never overwrite a store while producers are active.
-
-Fixed probes and their exact-reference analysis, LinGen evaluation, and exp1 and exp3–exp5 finite-sample workflows remain outside this store and retain their existing teacher behavior. exp2 uses it only when `--stream` is selected; its Parquet input remains supported.
-
-exp6 defaults to `--stream wikitext-103-train`, `--model-path models/gpt2-small`, `--results-root data/experiment_results`, and `--device cuda`; `--device cpu` is supported. Training defaults:
-
-| Flags | Defaults |
-| --- | --- |
-| `--rank`, `--nesting` | `256`, `sequential` (`joint` also supported) |
-| `--history-tokens`, `--future-tokens` | `64`, `32` |
-| `--history-batch`, `--future-batch` | `64`, `64` |
-| `--probe-histories`, `--probe-futures`, `--probe-seed` | `1024`, `1024`, `1` |
-| `--lr`, `--lr-schedule`, `--min-lr`, `--lr-decay-steps` | `1e-3`, `cosine`, `1e-5`, `30000` |
-| `--eval-every`, `--tol`, `--patience`, `--convergence-rank` | `1000`, `1e-3`, `3`, `32` |
-| `--checkpoint-every`, `--log-every`, `--seed` | `100`, `100`, `0` |
-| `--max-steps` | No cap |
-
-`--probe-histories` must be at least the rank, and the concatenated history/future must fit the teacher's context.
-
-- **exp6** (`exp6_stream_gpt2_mlp`): frozen GPT-2 encodes each window; concatenate the final-token hidden state and mean hidden state. These encoder forwards remain in training, although the target grid comes from the store. Separate left/right MLPs use non-affine LayerNorm, two GELU hidden layers, and output heads. `--mlp-width 1024` controls both hidden layers. GPT-2 weights are neither optimized nor saved in the feature state.
-
-The right head produces `(future_batch, rank, teacher_hidden_size)` weights, contracted with the centered unembedding for vocabulary features, with a fixed initialization scale based on hidden size and token RMS.
-
-### Smoke, resume, and schedules
-
-For a short capped CUDA run using a separate result root:
-
-```bash
-uv run exp6 train --rank 4 --history-batch 4 --future-batch 4 \
-  --probe-histories 32 --probe-futures 8 --max-steps 20 \
-  --eval-every 10 --checkpoint-every 10 --log-every 5 \
-  --results-root /tmp/stream-smoke
-uv run exp6 analysis --results-root /tmp/stream-smoke --reference-future-batch 2
-
-# Continue the exp6 smoke from step 20; retain its configuration.
-uv run exp6 train --rank 4 --history-batch 4 --future-batch 4 \
-  --probe-histories 32 --probe-futures 8 --max-steps 30 \
-  --eval-every 10 --checkpoint-every 10 --log-every 5 \
-  --results-root /tmp/stream-smoke
-```
-
-The capped run reports `stop_reason: max_steps`; continuation prints `resuming from step 20`. This is a feasibility smoke, not a convergence claim. Training automatically restores feature weights, Adam moments, sampling RNG, loss history, and probe-stability state from `train/checkpoint.pt`.
-
-Checkpoint metadata records the sample store identity; a checkpoint with a different store is rejected. A legacy checkpoint without store identity can resume from the selected compatible store.
-
-Cosine decay starts at step 0 without warmup, reaches `--min-lr` after `--lr-decay-steps` (30,000 by default), and holds that rate until convergence. It does not stop before the decay endpoint even if the probe stabilizes earlier; resuming does not restart or extend the decay. `--lr-schedule constant` stops on convergence without a decay wait. The optional `--max-steps` caps either schedule. Probe stability means the maximum relative change among the leading `--convergence-rank` singular values in learned order stays below `--tol` for `--patience` evaluations. The convergence rank defaults to 32 and is capped at `--rank`; this stability check is not an exact-reference accuracy criterion.
-
-Resume configuration must match, including architecture, rank, windows, batches, stream/model paths, optimizer/schedule settings, seed, and probe selection settings. Mismatches raise `checkpoint config mismatch`; there is **no** constant-to-cosine migration. The convergence settings `--eval-every`, `--tol`, `--patience`, and `--convergence-rank` can change on resume, resetting the probe-stability count. Legacy checkpoints with convergence settings stored in their configuration are also accepted and reset probe stability on resume. The step cap and logging/checkpoint intervals can change. Existing training outputs without a checkpoint require `--overwrite`, which restarts at step 0 rather than resuming. Analysis likewise requires `--overwrite` to replace its outputs; replacing training does not refresh existing analysis. Do not run overlapping writers against the same directory.
-
-### Paths, outputs, and probe interpretation
-
-Run directories are `<results-root>/exp6_stream_gpt2_mlp/<stream>__<model-directory-name>/`. Rank and architecture flags are not encoded in the directory name. Pass matching stream, results-root, and model-path flags to locate a nondefault run for analysis.
-
-- `train/features.pt`: trainable feature state and buffers.
-- `train/loss_history.npy`: one loss per completed step.
-- `train/probe.npz`: fixed history/future start indices, sampled once using the probe seed.
-- `train/metadata.json`: configuration, stream metadata, steps, loss/entry-energy estimates, convergence state, and latest probe spectrum (null before the first evaluation); written last. `parameter_counts` records `trainable_total` and `modules` (trainable counts by top-level child module). These counts are metadata only, not part of the resume configuration, so adding them does not invalidate existing checkpoints. Frozen teacher parameters are excluded.
-- `train/checkpoint.pt`: resumable state, saved with a refreshed snapshot every checkpoint interval and at the step cap. Convergence removes the checkpoint.
-- `analysis/`: six files: `singular_values.npy`, `reference_singular_values.npy`, `left_singular_vectors.npy`, `reference_left_singular_vectors.npy`, `neural_svd_spectrum.png`, and `metadata.json` (written last). Vector arrays are probe-histories × rank, with unit-norm columns. The plot compares learned/reference spectra and cumulative energy alongside training loss.
-
-Unlike exp4 analysis, **analysis reloads both the token stream and the local teacher model from paths saved in training metadata** to reconstruct the probe and exact reference. Analysis `--model-path` only names the run directory; it does not override the saved teacher path. Keep those inputs available. `--reference-future-batch 4` controls futures per reference forward: with `Hp` probe histories, each forward contains `q * Hp` concatenated sequences. Lower `q` to reduce peak memory (at the cost of more forwards); the reference still evaluates every probe history/future pair.
-
-Singular values are in **operator units**, with no finite-matrix `sqrt(m*n)` multiplier. For a probe with `Hp` histories, `Fp` futures and vocabulary `V`, the exact reference is the SVD of the dense probe table divided by `sqrt(Hp * Fp * V)`. Analysis obtains it through the history Gram matrix and token Gram matrix rather than materializing the vocabulary-wide table. Its values are sorted descending; learned values retain **learned order**. These units differ from exp4's finite-table matrix singular values.
-
-The fixed probe is an empirical sub-table, not an exact SVD of the full stream operator. Analysis reports:
-
-- Per-component relative error `learned_sigma / reference_sigma - 1`, comparing learned order to descending reference order.
-- Left-vector alignment `abs(dot(learned_u, reference_u))`; near-degenerate reference components can rotate, so also inspect prefix subspace overlap `||U_ref[:, :k].T @ Q_k||_F**2 / k`, where `Q_k` orthonormalizes the first `k` learned vectors.
-- Learned and exact-reference cumulative energy `cumsum(sigma**2) / probe.energy`, where `probe.energy` is the mean squared entry of the full probe table, **not** the energy of just the retained rank. Learned fractions can exceed 1 and are not clipped.
-- Maximum absolute off-diagonal normalized left/right Gram entries and a learned-order log-log spectrum fit.
-
-Stable probe norms, low loss, or a completed learning-rate schedule alone do not guarantee convergence, correct ordering, orthogonality, or full-stream generalization. Use the exact-reference errors, alignments, overlap, and energy together.
-
-### BlueHive
-
-Prepare `.venv`, the local GPT-2 model, and token-stream `.npy`/`.json` on the cluster. Start the two producer shards from the repository root, then check status before submitting training:
-
-```bash
-mkdir -p bluehive_run/logs
-for k in 0 1; do SHARDS=2 SHARD=$k sbatch --parsable bluehive_run/sample-store-produce.sbatch; done
-source .venv/bin/activate
-sample-store status
-```
-
-Both producers share the default 64 GiB store, each owns a distinct shard, and requeues resume production. The script requests an A100 on `preempt`; override the GPU at submission if needed. Wait for at least 64 total blocks before training, or submit earlier and let the consumers wait. Keep `SHARDS=2` for this store; stop all producers before any recreation with `--overwrite`.
-
-Submit training and analysis from the repository root:
-
-```bash
-mkdir -p bluehive_run/logs
-sbatch bluehive_run/exp6-train.sbatch
-# Submit analysis separately after a snapshot is available.
-sbatch bluehive_run/exp6-analysis.sbatch
-
-# Optional training overrides; use the same STREAM for analysis.
-STREAM=wikitext-103-train RANK=128 sbatch bluehive_run/exp6-train.sbatch
-STREAM=wikitext-103-train sbatch bluehive_run/exp6-analysis.sbatch
-```
-
-The training script defaults to `STREAM=wikitext-103-train`, `RANK=256` and accepts these overrides. It requests one H100 on `preempt`, 4 CPUs, 64 GiB host memory, and two days. Slurm sends `USR1` 600 seconds before the time limit, triggering automatic requeue and resume from the latest checkpoint; both training stage and Slurm logs are appended across requeues. Training errors fail the job without requeueing. Use `scancel <job-id>` to stop repeated requeues. The script does not pass `--overwrite`. If rank 256 exhausts H100 memory, use `RANK=128` in a fresh run (or explicitly restart incompatible existing outputs); code defaults stay unchanged. The analysis script uses the same `STREAM` override, reads the saved rank rather than `RANK`, and runs with `--overwrite`. It requests one GPU on `gpu`, 4 CPUs, 32 GiB host memory, and **four hours** for the exact probe reference.
-
-Slurm logs are `bluehive_run/logs/slurm-lm-svd-exp6-{train,analysis}-<job-id>.{out,err}`; stage logs live under the corresponding `slurm-<job-name>-<job-id>/` directory as `exp6-{train,analysis}.out`. Use `uv run exp6 <subcommand> --help` for all flags; the module entry point is `experiments.exp6_stream_gpt2_mlp`.
-
-### lingen: next-token distribution evaluation
-
-`lingen` evaluates an exp6 training snapshot against the teacher on a training or held-out token stream. Build the validation stream once, then choose the evaluation mode:
-
-```bash
-uv run data-pipline build-token-stream --split validation \
-  --output data/token_streams/wikitext-103-validation.npy
-uv run lingen onestep --experiment exp6
-uv run lingen onestep --experiment exp6 --eval-stream wikitext-103-validation
-uv run lingen autoregressive --experiment exp6 --eval-stream wikitext-103-validation
-```
-
-The stream builder requires the local WikiText validation data and GPT-2 tokenizer. `--stream` (default `wikitext-103-train`) and the directory name of `--model-path` (default `models/gpt2-small`) locate the training run under `--results-root` (default `data/experiment_results`); the teacher is loaded from the path saved in training metadata, not from the CLI model path. `--eval-stream` defaults to `--stream` and selects `data/token_streams/<name>.npy` and its metadata. Autoregressive decoding requires the saved teacher's tokenizer.
-
-For history `h` and future `f`, lingen reconstructs centered logits as `(sum_k u_k(h) W_k(f)) Etilde^T`, where `u` is the learned row feature, `W` the learned future weights, and `Etilde` the vocabulary-centered unembedding. The features already absorb the singular values: **do not multiply by sigma again**. The learned distribution `q` is the softmax of these logits; the teacher distribution `p` is the softmax of GPT-2 logits at the last position of `h+f`.
-
-`onestep` samples independent history and future windows and compares `p` and `q`. `autoregressive` samples from `q` at temperature 1; at every step it compares GPT-2 and lingen on the same current context, drops the oldest token, appends the sample, and splits the fixed-length `H+F` window back into `H` history and `F` future tokens. A separate GPT-2 free run starts from the same initial contexts and slides its own window in the same way.
-
-Both modes report KL(p‖q), KL(q‖p), and top-k overlap for k=1, 5, 10, 50: intersection size divided by k (or by vocabulary size when smaller). Top-1 overlap is agreement. The per-pair/step centered logit relative error is the **squared** error `||A - Ahat||² / ||A||²`; onestep also reports the aggregate `sum ||A - Ahat||² / sum ||A||²`, not the mean of per-pair ratios. Autoregressive results include token negative log-likelihoods and GPT-2 perplexities on lingen and GPT-2 generated tokens.
-
-Defaults are `--device cuda`, `--seed 0`, onestep `--pairs 4096 --batch-size 128`, and autoregressive `--sequences 64 --steps 96`; use `--device cpu` when needed. Outputs are under `<results-root>/<experiment>/<stream>__<model-directory-name>/lingen/<eval-stream>/<mode>/`. Onestep writes `metrics.npz` and `metadata.json`; autoregressive writes those plus decoded `samples.jsonl` and `autoregressive.png`. Metadata records inputs, configuration, definitions and summary, and is written last. Existing outputs require `--overwrite`. The evaluation uses the currently saved `train/features.pt` snapshot, which may be from ongoing training; check the recorded training step and rerun with `--overwrite` after training if a later snapshot is needed.
-
-On BlueHive, submit from the repository root after installing `.venv`, preparing the models, training snapshots, and source data:
-
-```bash
-mkdir -p bluehive_run/logs
-sbatch bluehive_run/lingen.sbatch
-# Example: evaluate against validation only.
-EXPERIMENTS="exp6" EVAL_STREAMS="wikitext-103-validation" \
-  STREAM=wikitext-103-train sbatch bluehive_run/lingen.sbatch
-```
-
-The job requests one GPU on `gpu`, 4 CPUs, 32 GiB and four hours. Defaults are `EXPERIMENTS="exp6"`, `EVAL_STREAMS="wikitext-103-train wikitext-103-validation"`, and `STREAM=wikitext-103-train`. It builds the validation stream if its `.npy` is missing, then runs both modes for every selected experiment and evaluation stream with `--overwrite`; a failed command stops the job. Slurm stdout/stderr are `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>.{out,err}`; per-mode logs and `build-validation-stream.out` (when built) are under `bluehive_run/logs/slurm-lm-svd-lingen-<job-id>/`. Use the guarded [sync commands](#sync-analysis-and-lingen-results-from-bluehive) to preview and download the results.
+Stop all producers and samplers before `data-pipline sample-store produce --overwrite` rebuilds a store. Active producers prevent a rebuild. The old hidden-state `.npz` format is rejected and requires explicit regeneration; old `sample-store` commands have been removed. exp2 does not consume this store.
 
 ## Python inference API
 
@@ -789,43 +471,9 @@ scores = inference.continuation_log_probs(
 
 `next_token_logits` returns unnormalized logits as a CPU float32 tensor of shape `(vocab_size,)`. `continuation_log_probs` returns one summed conditional log probability per continuation as a CPU float64 tensor, preserving input order. Inputs must be non-empty integer token-ID sequences within the model vocabulary and context limit; continuations in one call may have different lengths. Scores are sums, not length-normalized averages. Load models sequentially when memory is limited.
 
-`next_token_logits_batch` takes a non-empty batch of non-empty token-ID sequences with **equal lengths** (no padding); each sequence is validated against the vocabulary and context limit. It returns float32 logits of shape `(batch_size, vocab_size)` **on the inference device**, unlike the CPU return from `next_token_logits`. Unequal lengths raise `ValueError`; this is why exp4 uses fixed-length windows rather than variable-length task/document inputs.
+`next_token_logits_batch` takes a non-empty batch of non-empty token-ID sequences with **equal lengths** (no padding); each sequence is validated against the vocabulary and context limit. It returns float32 logits of shape `(batch_size, vocab_size)` **on the inference device**, unlike the CPU return from `next_token_logits`. Unequal lengths raise `ValueError`.
 
 `final_hidden_states(input_ids)` accepts a non-empty 2-D integer tensor of equal-length token-ID sequences, validates vocabulary/context bounds, and returns float32 `(batch_size, sequence_length, hidden_size)` states on the inference device under `torch.no_grad()`. For GPT-2 these are post-final-LayerNorm states; multiplying them by the unembedding transpose reproduces logits without materializing full-sequence logits inside the method.
-
-## NeuralSVD utility API
-
-`utils.NestedLoRASVDLoss` ports the SVD loss and nesting masks from Ryu et al.'s
-NestedLoRA (ICML 2024). It accepts row features `f` of shape `(B_rows, rank)`,
-column features `g` of shape `(B_cols, rank)`, and the corresponding matrix block
-`a_block` of shape `(B_rows, B_cols)`. Sample rows and columns independently.
-Features may come from trainable lookup tables or encoders; the utility does not
-load or save matrices.
-
-```python
-from utils.neural_svd import NestedLoRASVDLoss, neural_svd_spectrum
-
-loss_fn = NestedLoRASVDLoss(rank=3)  # joint nesting; optionally step=2
-# f, g are model outputs; a_block contains A(row_i, column_j).
-loss = loss_fn(f, g, a_block)
-loss.backward()
-# After training, evaluate features on the desired rows and columns:
-spectrum = neural_svd_spectrum(f.detach(), g.detach())
-```
-
-Move `loss_fn` to the features' device with `.to(device)`. It computes both
-normalized operator products internally, converts `a_block` to `f`'s dtype and
-device, and does not differentiate through the block. `sequential=True` selects
-the original asymmetric prefix gradients and requires `step=1`.
-`nesting_masks(rank, step=1, sequential=False)` exposes the masks separately.
-
-`neural_svd_spectrum` returns a `NeuralSVDSpectrum` with `singular_values`, `left`,
-and `right`; columns of the latter two have unit mean square. For a finite
-`m × n` matrix evaluated on all rows and columns uniformly, multiply the returned
-singular values by `sqrt(m * n)` to recover matrix singular values, and divide
-`left` and `right` by `sqrt(m)` and `sqrt(n)` for unit-norm vectors. Results retain
-the learned column order: they are not sorted, so unconverged ordering remains
-visible. exp4 uses the same learned-order convention with closed-form right-feature moments, and exp5 applies it to exp1's stored finite matrix; exp1–exp3 retain their exact matrix-analysis workflows.
 
 ## Tests
 
@@ -833,25 +481,4 @@ visible. exp4 uses the same learned-order convention with closed-form right-feat
 uv run python -m unittest discover -s tests
 ```
 
-The default suite keeps short-step training tests using a tiny random GPT-2 fixture. The convergence/SVD-recovery test is opt-in because it trains to convergence:
-
-```bash
-RUN_SLOW=1 uv run python -m unittest \
-  tests.test_exp4_neural_svd.Exp4NeuralSVDTests.test_training_and_analysis_recover_top_two_singular_values -v
-```
-
-Streaming exp6 also has an opt-in tiny-model top-two singular-value recovery test using a static 64-block sample store (30,000-step cosine decay, with a 60,000-step guard; no downloaded model or dataset needed):
-
-```bash
-RUN_SLOW=1 uv run python -m unittest tests.test_stream_neural_svd -v
-```
-
-This command checks the learned spectrum against the exact all-starts operator spectrum at 2% relative tolerance, independently of whether stochastic training triggers the convergence stop condition. Convergence stopping is tested separately; this recovery check is not a claim that a real-data run has converged.
-
-For fast log-log spectrum verification without training, model downloads, or sample data, run:
-
-```bash
-uv run python -m unittest tests.test_analysis tests.test_exp4_neural_svd.Exp4AnalysisTests -v --durations 5
-```
-
-These tests cover power-law fits, learned component order, rank-one skipped fits, saved analysis artifacts, and plotting artists using small matrices and synthetic snapshots.
+The suite uses tiny random GPT-2 fixtures and synthetic matrices; no downloaded models or datasets are needed.

@@ -25,8 +25,14 @@ source .venv/bin/activate
 
 # Each array task runs only its assigned experiment; inference failure skips analysis.
 experiment="exp${SLURM_ARRAY_TASK_ID}"
+if [[ "$experiment" == exp2 ]]; then
+    # exp2 independently samples local WikiText rather than task Parquet inputs.
+    run_args=(--run-name "${RUN_NAME:-wikitext-direct}")
+else
+    run_args=(--dataset task-single-text)
+fi
 printf 'Running %s inference; log: %s/%s.out\n' "$experiment" "$log_dir" "$experiment"
-"$experiment" inference --dataset task-single-text > "$log_dir/$experiment.out" 2>&1
+"$experiment" inference "${run_args[@]}" > "$log_dir/$experiment.out" 2>&1
 
 printf 'Running %s analysis; log: %s/%s-analysis.out\n' "$experiment" "$log_dir" "$experiment"
-"$experiment" analysis --dataset task-single-text > "$log_dir/$experiment-analysis.out" 2>&1
+"$experiment" analysis "${run_args[@]}" > "$log_dir/$experiment-analysis.out" 2>&1

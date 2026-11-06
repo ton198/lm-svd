@@ -23,6 +23,7 @@ class TokenStreamTests(unittest.TestCase):
         self.tokenizer_path.mkdir()
         self.output = self.root / "streams" / "train.npy"
         self.tokenizer = MagicMock()
+        self.tokenizer.backend_tokenizer.to_str.return_value = '{"model":{"type":"WordLevel","vocab":{"1":1}}}'
         self.tokenizer.__len__.return_value = 11
         self.tokenizer.side_effect = lambda texts, **kwargs: {
             "input_ids": [[int(token) for token in text.split()] for text in texts]
@@ -73,6 +74,7 @@ class TokenStreamTests(unittest.TestCase):
                 "config": "tiny",
                 "split": "train",
                 "tokenizer_path": str(self.tokenizer_path),
+                "tokenizer_fingerprint": "cf150fb9e05644cfd0b994edd898f422566d3d5428418bb054f8cae8ca7ef1c5",
                 "vocab_size": 11,
                 "stream_tokens": 6,
                 "dtype": "uint16",

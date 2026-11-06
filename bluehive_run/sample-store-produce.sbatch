@@ -37,5 +37,5 @@ requeue() {
     scontrol requeue "$SLURM_JOB_ID"
 }
 trap requeue USR1
-sample-store produce --stream "$stream" --device cuda --shards "$shards" --shard "$shard" --max-gib "$max_gib" >> "$log_dir/sample-store-${stream}-shard${shard}.out" 2>&1 &
+data-pipline sample-store produce --stream "$stream" --device cuda --shards "$shards" --shard "$shard" --max-gib "$max_gib" >> "$log_dir/sample-store-${stream}-shard${shard}.out" 2>&1 &
 wait $!

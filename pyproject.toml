@@ -1,7 +1,7 @@
 [project]
 name = "lm-svd"
 version = "0.1.0"
-description = "Local GPT-2 matrix experiments and streaming NeuralSVD analysis"
+description = "Local GPT-2 matrix experiments and SVD analysis"
 readme = "README.md"
 authors = [
     { name = "Tony Li", email = "ton20060624@outlook.com" }
@@ -22,11 +22,6 @@ data-pipline = "data_pipline.cli:main"
 exp1 = "experiments.exp1_L_M_table.cli:main"
 exp2 = "experiments.exp2_PFH.cli:main"
 exp3 = "experiments.exp3_L_M_diff.cli:main"
-exp4 = "experiments.exp4_neural_svd.cli:main"
-exp5 = "experiments.exp5_L_M_neural_svd.cli:main"
-exp6 = "experiments.exp6_stream_gpt2_mlp.cli:main"
-lingen = "experiments.lingen.cli:main"
-sample-store = "utils.sample_store_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]

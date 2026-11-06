@@ -10,10 +10,6 @@ class CLIStartupTests(unittest.TestCase):
             "experiments.exp1_L_M_table.cli",
             "experiments.exp2_PFH.cli",
             "experiments.exp3_L_M_diff.cli",
-            "experiments.exp4_neural_svd.cli",
-            "experiments.exp5_L_M_neural_svd.cli",
-            "experiments.exp6_stream_gpt2_mlp.cli",
-            "utils.sample_store_cli",
         ):
             with self.subTest(module=module):
                 code = f"""
@@ -35,6 +31,22 @@ print(sorted(m for m in ("torch", "transformers", "matplotlib") if m in sys.modu
                     check=True,
                 )
                 self.assertEqual(result.stdout.splitlines()[-1], "[]")
+
+class SampleStoreCLIHelpTests(unittest.TestCase):
+    def test_nested_help_is_available_without_loading_models(self):
+        for args in (["sample-store", "-h"], ["sample-store", "produce", "-h"], ["sample-store", "status", "-h"]):
+            code = """
+import sys
+from data_pipline.cli import main
+try:
+    main(ARGS)
+except SystemExit as error:
+    assert error.code == 0
+assert not any(m in sys.modules for m in ('torch', 'transformers', 'matplotlib'))
+""".replace("ARGS", repr(args))
+            result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usage:", result.stdout)
 
 
 if __name__ == "__main__":

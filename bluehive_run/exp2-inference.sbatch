@@ -23,10 +23,10 @@ printf 'Job ID: %s\nNode: %s\nWorking directory: %s\n' \
 nvidia-smi
 source .venv/bin/activate
 
-# Override at submit time, e.g. DATASET=task-single-text sbatch bluehive_run/exp2-inference.sbatch
-dataset="${DATASET:-wikitext}"
-run_args=(--dataset "$dataset" --model-path models/gpt2-small --device cuda)
+# Override RUN_NAME for a separate direct-WikiText run.
+run_name="${RUN_NAME:-wikitext-direct}"
+run_args=(--run-name "$run_name" --model-path models/gpt2-small --device cuda)
 
 # Inference cannot resume; --overwrite recomputes and replaces any earlier matrix.
-printf 'Running exp2 inference on %s; log: %s/exp2-inference.out\n' "$dataset" "$log_dir"
+printf 'Running exp2 inference on %s; log: %s/exp2-inference.out\n' "$run_name" "$log_dir"
 exp2 inference "${run_args[@]}" --overwrite > "$log_dir/exp2-inference.out" 2>&1

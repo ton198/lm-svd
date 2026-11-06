@@ -23,12 +23,12 @@ printf 'Job ID: %s\nNode: %s\nWorking directory: %s\n' \
 nvidia-smi
 source .venv/bin/activate
 
-# Must match the exp2 inference arguments (including DATASET) so analysis reads the same run directory.
-dataset="${DATASET:-wikitext}"
-run_args=(--dataset "$dataset" --model-path models/gpt2-small --device cuda)
+# RUN_NAME must match inference so analysis reads the same run directory.
+run_name="${RUN_NAME:-wikitext-direct}"
+run_args=(--run-name "$run_name" --model-path models/gpt2-small --device cuda)
 
 # Run all centering modes; --overwrite replaces only that mode's analysis outputs.
 for centering in none global row deflate1; do
-    printf 'Running exp2 analysis on %s with centering %s; log: %s/exp2-analysis-%s.out\n' "$dataset" "$centering" "$log_dir" "$centering"
+    printf 'Running exp2 analysis on %s with centering %s; log: %s/exp2-analysis-%s.out\n' "$run_name" "$centering" "$log_dir" "$centering"
     exp2 analysis "${run_args[@]}" --centering "$centering" --overwrite > "$log_dir/exp2-analysis-${centering}.out" 2>&1
 done

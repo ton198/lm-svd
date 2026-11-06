@@ -30,6 +30,51 @@ class CausalLMInferenceTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._temporary_directory.cleanup()
 
+    def test_final_hidden_states_match_logits_without_gradients(self) -> None:
+        ids = torch.tensor([[1, 2, 3, 4, 5], [5, 6, 7, 8, 9]])
+        hidden = self.inference.final_hidden_states(ids)
+        self.assertEqual(hidden.shape, (2, 5, 8))
+        self.assertEqual(hidden.dtype, torch.float32)
+        self.assertFalse(hidden.requires_grad)
+        with torch.no_grad():
+            expected = self.inference.model(input_ids=ids, use_cache=False).logits
+            actual = hidden @ self.inference.model.get_output_embeddings().weight.T
+        torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
+        for dtype in (torch.int32, torch.int64):
+            with self.subTest(dtype=dtype):
+                torch.testing.assert_close(
+                    self.inference.final_hidden_states(ids.to(dtype)), hidden,
+                    rtol=0, atol=0,
+                )
+
+    def test_final_hidden_states_reject_invalid_inputs(self) -> None:
+        invalid = (
+            [[1, 2]],
+            torch.tensor(1),
+            torch.tensor([1, 2]),
+            torch.ones((1, 1, 1), dtype=torch.long),
+            torch.empty((0, 2), dtype=torch.long),
+            torch.empty((2, 0), dtype=torch.long),
+            torch.ones((1, 2), dtype=torch.float32),
+            torch.ones((1, 2), dtype=torch.bool),
+        )
+        for ids in invalid:
+            with self.subTest(ids=ids):
+                with self.assertRaisesRegex(
+                    ValueError, "^input_ids must be a non-empty 2-D integer tensor$"
+                ):
+                    self.inference.final_hidden_states(ids)
+        with self.assertRaisesRegex(
+            ValueError, "^token_ids length 7 exceeds model maximum 6$"
+        ):
+            self.inference.final_hidden_states(torch.ones((1, 7), dtype=torch.long))
+        for token_id in (-1, 11):
+            with self.subTest(token_id=token_id):
+                with self.assertRaisesRegex(
+                    ValueError, r"^token ids must be in \[0, 11\)$"
+                ):
+                    self.inference.final_hidden_states(torch.tensor([[1, token_id]]))
+
     def test_model_properties_and_eval_mode(self) -> None:
         self.assertEqual(self.inference.vocab_size, 11)
         self.assertEqual(self.inference.max_length, 6)

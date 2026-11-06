@@ -5,14 +5,9 @@ import re
 
 SAMPLES_DIR = Path("data/history_future_samples")
 DEFAULT_DATASET = "wikitext"
-STREAMS_DIR = Path("data/token_streams")
-SAMPLE_STORES_DIR = Path("data/sample_stores")
-DEFAULT_STREAM = "wikitext-103-train"
 DEFAULT_RESULTS_ROOT = Path("data/experiment_results")
 INFERENCE_DIR = "inference"
-TRAIN_DIR = "train"
 ANALYSIS_DIR = "analysis"
-LINGEN_DIR = "lingen"
 _DATASET_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
@@ -33,22 +28,6 @@ def dataset_samples_path(dataset: str) -> Path:
             f"unknown dataset: {dataset}; available: {names} (files in {SAMPLES_DIR})"
         )
     return path
-
-
-def token_stream_path(stream: str) -> Path:
-    validate_dataset_name(stream)
-    path = STREAMS_DIR / f"{stream}.npy"
-    if not path.is_file():
-        names = ", ".join(sorted(p.stem for p in STREAMS_DIR.glob("*.npy"))) or "none"
-        raise ValueError(
-            f"unknown stream: {stream}; available: {names} (files in {STREAMS_DIR})"
-        )
-    return path
-
-
-def sample_store_dir(stream: str, model_label: str, history_tokens: int, future_tokens: int) -> Path:
-    validate_dataset_name(stream)
-    return SAMPLE_STORES_DIR / f"{stream}__{model_label}__h{history_tokens}-f{future_tokens}"
 
 
 def run_dir(results_root: Path, experiment: str, dataset: str, model_label: str) -> Path:
