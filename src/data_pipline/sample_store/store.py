@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .sample_store_state import read_store_state
+from .state import read_store_state
 
 STORE_FORMAT = "lm-svd-sample-store-v3"
 DEFAULT_MAX_GIB = 64.0

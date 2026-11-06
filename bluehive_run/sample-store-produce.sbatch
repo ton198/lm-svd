@@ -27,13 +27,11 @@ source .venv/bin/activate
 
 # Override GPU with sbatch --gres=gpu:H100:1 when needed.
 stream="${STREAM:-wikitext-103-train}"
-worker_id="${WORKER_ID:-$SLURM_JOB_ID}"
 max_gib="${MAX_GIB:-64}"
 extra_args=()
 if [[ -n "${MAX_BLOCKS:-}" ]]; then
     extra_args+=(--max-blocks "$MAX_BLOCKS")
 fi
-printf 'Worker ID: %s\n' "$worker_id"
 
 # Requeue resumes production without overwriting the store.
 requeue() {
@@ -41,5 +39,5 @@ requeue() {
     scontrol requeue "$SLURM_JOB_ID"
 }
 trap requeue USR1
-data-pipline sample-store produce --stream "$stream" --device cuda --worker-id "$worker_id" --max-gib "$max_gib" "${extra_args[@]}" >> "$log_dir/sample-store-${stream}-worker${worker_id}.out" 2>&1 &
+data-pipline sample-store produce --stream "$stream" --device cuda --worker-id "$SLURM_JOB_ID" --max-gib "$max_gib" "${extra_args[@]}" >> "$log_dir/sample-store-${stream}-worker${SLURM_JOB_ID}.out" 2>&1 &
 wait $!

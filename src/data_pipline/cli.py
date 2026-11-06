@@ -46,7 +46,7 @@ def add_window_arguments(
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="data-pipline")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    from .sample_store_cli import register
+    from .sample_store.cli import register
 
     register(subparsers)
     build = subparsers.add_parser(
@@ -136,7 +136,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         if args.command == "sample-store":
-            from .sample_store_cli import run
+            from .sample_store.cli import run
 
             run(args)
             return

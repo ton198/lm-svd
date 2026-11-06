@@ -18,10 +18,10 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
-from data_pipline import SampleSampler
-from data_pipline.sample_store import slot_bytes, slot_path
-from data_pipline.sample_store_state import read_store_state, claim_slot
-from data_pipline.sample_store_producer import produce_blocks
+from data_pipline.sample_store import SampleSampler
+from data_pipline.sample_store.store import slot_bytes, slot_path
+from data_pipline.sample_store.state import read_store_state, claim_slot
+from data_pipline.sample_store.producer import produce_blocks
 from utils.common import write_atomic
 from utils.inference import CausalLMInference
 
@@ -175,7 +175,7 @@ assert 'transformers' not in sys.modules
                     observed.append(sampler.sample())
             write_atomic(path, wrapped)
         before = np.load(slot_path(self.store, 0)).copy()
-        with patch('data_pipline.sample_store_producer.write_atomic', side_effect=pause_before_replace):
+        with patch('data_pipline.sample_store.producer.write_atomic', side_effect=pause_before_replace):
             self.produce(max_bytes=slot_bytes(4, 3, 2, 11), max_blocks=3)
         self.assertEqual(len(observed), 3)
         for sample in observed:
@@ -276,7 +276,7 @@ assert 'transformers' not in sys.modules
 import os, sys, torch
 from pathlib import Path
 from unittest.mock import patch
-import data_pipline.sample_store_producer as producer
+import data_pipline.sample_store.producer as producer
 torch.set_num_threads(1)
 stage, store, model, stream, capacity = sys.argv[1:]
 def crash(*args, **kwargs):
@@ -290,7 +290,7 @@ target, action = {
     'write': ('save_numpy', partial_write),
     'replace': ('publish_slot', crash),
 }[stage]
-with patch('data_pipline.sample_store_producer.' + target, side_effect=action):
+with patch('data_pipline.sample_store.producer.' + target, side_effect=action):
     producer.produce_blocks(store_dir=Path(store), model_path=Path(model), stream_path=Path(stream),
         device='cpu', worker_id=17, history_tokens=3, future_tokens=2, samples_per_block=4,
         max_bytes=int(capacity), batch_size=2, max_blocks=1)
@@ -323,7 +323,7 @@ with patch('data_pipline.sample_store_producer.' + target, side_effect=action):
         code = '''
 import sys, torch
 from pathlib import Path
-from data_pipline.sample_store_producer import produce_blocks
+from data_pipline.sample_store.producer import produce_blocks
 torch.set_num_threads(1)
 store, model, stream, capacity, worker = sys.argv[1:]
 produce_blocks(store_dir=Path(store), model_path=Path(model), stream_path=Path(stream),
@@ -357,7 +357,7 @@ produce_blocks(store_dir=Path(store), model_path=Path(model), stream_path=Path(s
         capacity = slot_bytes(4, 3, 2, 11)
         self.produce(max_bytes=capacity)
         sampler = SampleSampler(self.store)
-        with patch('data_pipline.sample_store_producer.publish_slot', side_effect=RuntimeError('crash')):
+        with patch('data_pipline.sample_store.producer.publish_slot', side_effect=RuntimeError('crash')):
             with self.assertRaisesRegex(RuntimeError, 'crash'):
                 self.produce(max_bytes=capacity)
         pending = np.load(slot_path(self.store, 0)).copy()
@@ -383,7 +383,7 @@ produce_blocks(store_dir=Path(store), model_path=Path(model), stream_path=Path(s
                 self.produce(worker_id=10, max_bytes=capacity)
             except BaseException as error:
                 errors.append(error)
-        with patch('data_pipline.sample_store_producer.time.sleep', side_effect=sleep):
+        with patch('data_pipline.sample_store.producer.time.sleep', side_effect=sleep):
             thread = threading.Thread(target=run)
             thread.start()
             try:

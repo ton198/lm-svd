@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from data_pipline import sample_store_state as state
+from data_pipline.sample_store import state
 
 
 class SampleStoreStateTests(unittest.TestCase):
@@ -50,7 +50,7 @@ class SampleStoreStateTests(unittest.TestCase):
         code = '''
 import sys, time
 from pathlib import Path
-from data_pipline.sample_store_state import register_worker, claim_slot, publish_slot
+from data_pipline.sample_store.state import register_worker, claim_slot, publish_slot
 p, worker = Path(sys.argv[1]), int(sys.argv[2])
 register_worker(p, worker)
 for _ in range(30):

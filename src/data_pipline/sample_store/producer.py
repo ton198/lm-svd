@@ -13,11 +13,11 @@ from transformers import AutoTokenizer
 from utils.common import save_json, save_numpy, write_atomic
 from utils.inference import CausalLMInference
 
-from .sample_store import (
+from .store import (
     STORE_FORMAT, read_store_config, sample_dtype, slot_bytes, slot_path,
 )
-from .token_stream import TokenStream, tokenizer_fingerprint
-from .sample_store_state import (
+from ..token_stream import TokenStream, tokenizer_fingerprint
+from .state import (
     claim_slot, publish_slot, read_store_state, state_lock, write_store_state,
 )
 

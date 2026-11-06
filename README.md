@@ -416,7 +416,7 @@ Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv
 
 ## Training sample generation and sampling
 
-Both parts live in `data_pipline`. First tokenize local WikiText, then start continuous generation:
+Sample generation, storage, coordination and CLI code live in the `data_pipline.sample_store` package (`producer.py`, `store.py`, `state.py` and `cli.py`). First tokenize local WikiText, then start continuous generation:
 
 ```bash
 uv run data-pipline build-token-stream
@@ -448,13 +448,11 @@ The sampler uniformly draws from all currently published samples, with replaceme
 
 `--max-gib`, `--samples-per-block`, `--batch-size`, `--history-tokens`, `--future-tokens`, and `--seed` control production. `--max-blocks N` stops after N additional completed blocks in this invocation; otherwise production continues indefinitely. Each process requires a non-negative integer `--worker-id`. New IDs register automatically, so workers can be added without rebuilding the store. Restart with the same ID and store configuration to resume. An unfinished block is regenerated using the same `(seed, worker_id, sequence)`; sequence advances and the claim is released only after the complete block is replaced and its publication is committed. A crash after replacement but before that commit also redoes the same block.
 
-On BlueHive, submit one producer per job; the script defaults the worker ID to `SLURM_JOB_ID`. Requeue retains this ID. A fresh `sbatch` gets a new ID; set `WORKER_ID` to continue a previous worker instead. `MAX_GIB` controls the entire store, and optional `MAX_BLOCKS` limits each invocation for smoke tests:
+On BlueHive, submit one producer per job; the script always uses `SLURM_JOB_ID` as the worker ID. Requeue retains this ID and resumes its progress; a fresh `sbatch` gets a new ID and registers a new worker. `MAX_GIB` controls the entire store, and optional `MAX_BLOCKS` limits each invocation for smoke tests:
 
 ```bash
 sbatch bluehive_run/sample-store-produce.sbatch
 sbatch bluehive_run/sample-store-produce.sbatch
-# Resume a previous worker in a newly submitted job:
-WORKER_ID=12345 sbatch bluehive_run/sample-store-produce.sbatch
 ```
 
 Run at most one live process per worker ID. There is no duplicate-ID detection, heartbeat, or automatic claim reclamation. Claims survive process exit and await a restart of the same ID; retained worker records do not indicate liveness. `sample-store status` reports each worker's claim and sequence, published blocks/samples, capacity and commit count.

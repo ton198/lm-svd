@@ -3,7 +3,7 @@
 from pathlib import Path
 import argparse
 
-from .cli import positive_float, positive_int
+from ..cli import positive_float, positive_int
 
 DEFAULT_STREAM = 'wikitext-103-train'
 
@@ -42,8 +42,8 @@ def register(subparsers):
 
 
 def run(args):
-    from .sample_store import read_store_config
-    from .sample_store_state import read_store_state
+    from .store import read_store_config
+    from .state import read_store_state
     from utils.experiment_paths import validate_dataset_name
 
     validate_dataset_name(args.stream)
@@ -51,7 +51,7 @@ def run(args):
         f'{args.stream}__{args.model_path.name}__h{args.history_tokens}-f{args.future_tokens}'
     )
     if args.store_command == 'produce':
-        from .sample_store_producer import produce_blocks
+        from .producer import produce_blocks
         stream_path = Path('data/token_streams') / f'{args.stream}.npy'
         result = produce_blocks(
             store_dir=store_dir, model_path=args.model_path, stream_path=stream_path, device=args.device,

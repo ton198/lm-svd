@@ -6,7 +6,7 @@ import unittest
 
 
 class SampleStoreSlurmTests(unittest.TestCase):
-    def test_script_uses_job_id_or_explicit_worker_id(self):
+    def test_script_uses_only_slurm_job_id(self):
         script = Path(__file__).resolve().parents[1] / 'bluehive_run/sample-store-produce.sbatch'
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -27,7 +27,7 @@ class SampleStoreSlurmTests(unittest.TestCase):
                        SLURM_JOB_NAME='sample-store', CAPTURE=str(root / 'args'),
                        MAX_BLOCKS='2', MAX_GIB='1')
             env.pop('WORKER_ID', None)
-            for override, expected in ((None, '456'), ('123', '123')):
+            for override, expected in ((None, '456'), ('123', '456')):
                 with self.subTest(override=override):
                     if override is not None:
                         env['WORKER_ID'] = override
