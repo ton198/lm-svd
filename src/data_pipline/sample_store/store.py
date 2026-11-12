@@ -55,8 +55,12 @@ def slot_path(store_dir: Path, slot: int) -> Path:
 
 
 class SampleSampler:
-    """Uniformly sample persisted (history, future, raw next-token logits).
+    """Sample (history, future, raw logits) from a pool of up to 100 blocks.
 
+    Select up to 100 distinct published blocks uniformly and merge them in RAM.
+    Draw rows uniformly with replacement, reloading after as many draws as rows.
+    On a fixed store each row has uniform marginal probability, but consecutive
+    draws share a pool. Producer updates become visible at the next pool load.
     A seed reproduces sampling only while store contents stay fixed. Returned
     CPU tensors own their memory, even when producers replace the selected slot.
     """
@@ -70,6 +74,8 @@ class SampleSampler:
         self._dtype = sample_dtype(
             self.config["history_tokens"], self.config["future_tokens"], self.config["vocab_size"]
         )
+        self._pool = None
+        self._remaining = 0
 
     def _published(self) -> list[int]:
         slots = sorted(int(slot) for slot in read_store_state(self.store_dir)["published"])
@@ -82,24 +88,32 @@ class SampleSampler:
         while not self._published():
             time.sleep(0.1)
 
-    def sample(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _load_pool(self) -> None:
         slots = self._published()
         block_size = self.config["samples_per_block"]
-        total = len(slots) * block_size
-        if not total:
+        if not slots:
             raise ValueError(f"no published samples in {self.store_dir}")
-        index = int(self._generator.integers(total))
-        local_slot, row_index = divmod(index, block_size)
-        slot = slots[local_slot]
-        # Opening once keeps all three fields on one inode across atomic replaces.
-        block = np.load(slot_path(self.store_dir, slot), mmap_mode="r", allow_pickle=False)
-        try:
+        selected = self._generator.choice(slots, size=min(100, len(slots)), replace=False)
+        # Release the old pool first, and fill one allocation to avoid holding
+        # 100 separate blocks plus a concatenated copy at the same time.
+        self._pool = None
+        pool = np.empty(len(selected) * block_size, dtype=self._dtype)
+        for index, slot in enumerate(selected):
+            # Each eager load owns a consistent snapshot across atomic replacements.
+            block = np.load(slot_path(self.store_dir, int(slot)), allow_pickle=False)
             if block.shape != (block_size,) or block.dtype != self._dtype:
                 raise ValueError(f"invalid sample block {slot} in {self.store_dir}")
-            return (
-                torch.from_numpy(block["h"][row_index].copy()),
-                torch.from_numpy(block["f"][row_index].copy()),
-                torch.from_numpy(block["logits"][row_index].copy()),
-            )
-        finally:
-            block._mmap.close()
+            pool[index * block_size:(index + 1) * block_size] = block
+        self._pool = pool
+        self._remaining = len(pool)
+
+    def sample(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._remaining == 0:
+            self._load_pool()
+        row_index = int(self._generator.integers(len(self._pool)))
+        self._remaining -= 1
+        return (
+            torch.from_numpy(self._pool["h"][row_index].copy()),
+            torch.from_numpy(self._pool["f"][row_index].copy()),
+            torch.from_numpy(self._pool["logits"][row_index].copy()),
+        )

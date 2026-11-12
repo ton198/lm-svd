@@ -48,6 +48,7 @@ def main():
 
     print(f"Training on {device}")
     train_svd_network(model=model,
+                      device=device,
                       dataloader=dataloader,
                       optimizer=optimizer,
                       scheduler=None,

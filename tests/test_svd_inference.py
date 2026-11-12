@@ -77,7 +77,7 @@ class SVDInferenceTrainingTests(unittest.TestCase):
                     optimizer, lambda step: 1.0
                 )
                 trained = train_svd_network(
-                    model, dataloader, optimizer, scheduler, epochs=500
+                    model, "cpu", dataloader, optimizer, scheduler, epochs=500
                 )
                 self.assertIs(trained, model)
                 self.assertEqual(scheduler.last_epoch, 500)
@@ -113,6 +113,18 @@ class SVDInferenceTrainingTests(unittest.TestCase):
                         )
                 residual = torch.linalg.norm(matrix - left @ right.T)
                 self.assertAlmostEqual(residual.item(), expected_values[2].item(), places=3)
+
+    def test_masks_follow_model_device_without_changing_checkpoints(self):
+        for sequential in (False, True):
+            with self.subTest(sequential=sequential):
+                model = NestedLoRA(nn.Linear(2, 3), neigs=3, sequential=sequential)
+                checkpoint = {name: value.clone() for name, value in model.state_dict().items()}
+                self.assertEqual(set(checkpoint), {'model.weight', 'model.bias'})
+                model.to('meta')
+                self.assertEqual(model.vector_mask.device.type, 'meta')
+                self.assertEqual(model.matrix_mask.device.type, 'meta')
+                restored = NestedLoRA(nn.Linear(2, 3), neigs=3, sequential=sequential)
+                restored.load_state_dict(checkpoint, strict=True)
 
     def test_mlp_recovers_svd_of_50_by_50_matrix(self):
         """Learn all five nonzero modes of a dense 50x50 rank-five matrix."""

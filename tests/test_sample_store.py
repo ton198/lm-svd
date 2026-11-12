@@ -19,10 +19,10 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
 from data_pipline.sample_store import SampleSampler
-from data_pipline.sample_store.store import slot_bytes, slot_path
+from data_pipline.sample_store.store import sample_dtype, slot_bytes, slot_path
 from data_pipline.sample_store.state import read_store_state, claim_slot
 from data_pipline.sample_store.producer import produce_blocks
-from utils.common import write_atomic
+from utils.common import save_numpy, write_atomic
 from utils.inference import CausalLMInference
 
 
@@ -136,6 +136,75 @@ assert h.shape == (3,) and f.shape == (2,) and logits.shape == (11,)
 assert 'transformers' not in sys.modules
 """
         subprocess.run([sys.executable, '-c', script, str(self.store)], check=True)
+
+    def test_sampler_reuses_one_loaded_block_then_refreshes(self):
+        self.produce(max_bytes=slot_bytes(4, 3, 2, 11))
+        path = slot_path(self.store, 0)
+        original = np.load(path)
+        # Mark every row so the cached snapshot and replacement are distinguishable.
+        for field, value in (('h', 1), ('f', 2), ('logits', 3)):
+            original[field].fill(value)
+        np.save(path, original)
+        replacement = original.copy()
+        for field, value in (('h', 4), ('f', 5), ('logits', 6)):
+            replacement[field].fill(value)
+        sampler = SampleSampler(self.store, seed=7)
+        with patch('data_pipline.sample_store.store.np.load', wraps=np.load) as load, \
+             patch('data_pipline.sample_store.store.read_store_state', wraps=read_store_state) as state:
+            first = sampler.sample()
+            # A producer atomically replacing the file must not change the in-memory block.
+            write_atomic(path, lambda tmp: save_numpy(tmp, replacement))
+            first[0].fill_(99)  # Caller mutation must not modify the cached block.
+            for _ in range(3):
+                for tensor, value in zip(sampler.sample(), (1, 2, 3)):
+                    self.assertTrue(torch.all(tensor == value).item())
+            self.assertEqual(load.call_count, 1)
+            self.assertEqual(state.call_count, 1)
+            for tensor, value in zip(sampler.sample(), (4, 5, 6)):
+                self.assertTrue(torch.all(tensor == value).item())
+            self.assertEqual(load.call_count, 2)
+            self.assertEqual(state.call_count, 2)
+
+    def test_sampler_pools_up_to_100_distinct_blocks(self):
+        for available in (3, 103):
+            with self.subTest(available=available):
+                store = self.store.parent / f'pool-{available}'
+                self.produce(store_dir=store, max_blocks=0,
+                             max_bytes=available * slot_bytes(4, 3, 2, 11))
+                block = np.zeros(4, dtype=sample_dtype(3, 2, 11))
+                for slot in range(available):
+                    for row in range(4):
+                        block['h'][row].fill(row)
+                        block['f'][row].fill(slot % 11)
+                        block['logits'][row].fill(slot * 4 + row)
+                    np.save(slot_path(store, slot), block)
+                state_data = read_store_state(store)
+                state_data['published'] = {str(slot): slot for slot in range(available)}
+                state_data['next_commit'] = available
+                (store / 'state.json').write_text(json.dumps(state_data))
+                sampler = SampleSampler(store, seed=19)
+                count = min(100, available)
+                observed = set()
+                with patch('data_pipline.sample_store.store.np.load', wraps=np.load) as load, \
+                     patch('data_pipline.sample_store.store.read_store_state', wraps=read_store_state) as state:
+                    for draw in range(count * 4):
+                        h, f, logits = sampler.sample()
+                        if draw == 0:
+                            self.assertEqual(load.call_count, count)
+                        slot, row = divmod(int(logits[0]), 4)
+                        self.assertTrue(torch.all(h == row).item())
+                        self.assertTrue(torch.all(f == slot % 11).item())
+                        self.assertTrue(torch.all(logits == slot * 4 + row).item())
+                        observed.add(slot)
+                    self.assertEqual(load.call_count, count)
+                    self.assertEqual(state.call_count, 1)
+                    selected = {int(call.args[0].stem) for call in load.call_args_list}
+                    self.assertEqual(len(selected), count)
+                    self.assertTrue(observed <= selected)
+                    self.assertGreater(len(observed), 1)
+                    sampler.sample()
+                    self.assertEqual(load.call_count, 2 * count)
+                    self.assertEqual(state.call_count, 2)
 
     def test_restart_is_identical_to_uninterrupted_generation(self):
         self.produce(max_blocks=2)

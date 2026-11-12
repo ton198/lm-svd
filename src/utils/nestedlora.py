@@ -62,8 +62,8 @@ class NestedLoRALossFunctionSVD(torch.autograd.Function):
             g: (B2, L)
             Tadjf: (B2, L)
         """
-        ctx.vector_mask = vector_mask = vector_mask.to(f.device)
-        ctx.matrix_mask = matrix_mask = matrix_mask.to(f.device)
+        ctx.vector_mask = vector_mask
+        ctx.matrix_mask = matrix_mask
         loss_metric, lam_f, lam_g = compute_loss_metric(f, g, matrix_mask)
         ctx.save_for_backward(f, Tg, g, Tadjf, lam_f, lam_g)
         # O(B^2 * L) version only
@@ -110,7 +110,7 @@ class NestedLoRA(nn.Module):
         self.sort_indices = None
         self.sequential = sequential
         if sequential:
-            self.vector_mask, self.matrix_mask = get_sequential_nesting_masks(self.neigs)
+            vector_mask, matrix_mask = get_sequential_nesting_masks(self.neigs)
         else:
             end_indices = list(range(step, neigs + 1, step))
             if neigs not in end_indices:
@@ -118,7 +118,9 @@ class NestedLoRA(nn.Module):
             step_weights = np.zeros(neigs)
             step_weights[np.array(end_indices) - 1] = 1.
             step_weights = torch.tensor(step_weights / sum(step_weights))
-            self.vector_mask, self.matrix_mask = get_joint_nesting_masks(step_weights)
+            vector_mask, matrix_mask = get_joint_nesting_masks(step_weights)
+        self.register_buffer('vector_mask', vector_mask, persistent=False)
+        self.register_buffer('matrix_mask', matrix_mask, persistent=False)
         self.model = model
 
     def forward(self, *args):

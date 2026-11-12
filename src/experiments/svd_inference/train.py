@@ -9,9 +9,9 @@ from utils.nestedlora import NestedLoRA
 
 from torch import nn
 
-def train_svd_network(model: NestedLoRA, dataloader, optimizer, scheduler, epochs, checkpoint_saving : Callable[[nn.Module], None] | None = None):
+def train_svd_network(model: NestedLoRA, device : str, dataloader, optimizer, scheduler, epochs, checkpoint_saving : Callable[[nn.Module], None] | None = None):
     """Train on batches of h (B,H), f_concat_z (B,Z,F+1), scores (B,Z)."""
-    device = next(model.parameters()).device
+    model.to(device)
     for epoch in range(epochs):
         model.train()
         train_loss = 0
