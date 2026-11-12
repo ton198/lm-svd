@@ -30,7 +30,7 @@ def main():
     neigs = 128
     batch_size = 32
     tokens_per_pair = 16
-    batches_per_epoch = 1000
+    batches_per_epoch = 100
     epochs = 100000
     lr = 3e-4
 
