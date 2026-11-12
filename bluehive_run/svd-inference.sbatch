@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=lm-svd-training
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:A100:1
+#SBATCH --job-name=svd-inference-training
+#SBATCH --partition=preempt
+#SBATCH --gres=gpu:H100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=6:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=bluehive_run/logs/slurm-%x-%j.out
 #SBATCH --error=bluehive_run/logs/slurm-%x-%j.err
 
