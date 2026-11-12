@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=svd-inference-training
-#SBATCH --partition=preempt
+#SBATCH --partition=h100
+#SBATCH --qos=h100
 #SBATCH --gres=gpu:H100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G

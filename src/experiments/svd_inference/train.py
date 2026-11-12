@@ -15,6 +15,7 @@ def train_svd_network(model: NestedLoRA, device : str, dataloader, optimizer, sc
     for epoch in range(epochs):
         model.train()
         train_loss = 0
+        kernel_energy = 0
         for h, f_concat_z, scores in dataloader:
             h, f_concat_z, scores = [
                 tensor.to(device) for tensor in (h, f_concat_z, scores)
@@ -31,6 +32,7 @@ def train_svd_network(model: NestedLoRA, device : str, dataloader, optimizer, sc
                 for i in range(h.shape[0])
             ]).mean()
             train_loss += loss.item()
+            kernel_energy += scores.square().mean().item()
             loss.backward()
             optimizer.step()
             if scheduler is not None:
@@ -39,7 +41,9 @@ def train_svd_network(model: NestedLoRA, device : str, dataloader, optimizer, sc
         if checkpoint_saving is not None and (epoch + 1) % 100 == 0:
             checkpoint_saving(model)
         train_loss /= len(dataloader)
-        print(f"Epoch {epoch}: Train loss: {train_loss:.4f}")
+        kernel_energy /= len(dataloader)
+        # E[K^2] is the scale of the loss: a perfect fit of every mode reaches about -E[K^2].
+        print(f"Epoch {epoch}: Train loss: {train_loss:.4f}  E[K^2]: {kernel_energy:.4f}")
 
     return model
 
@@ -58,6 +62,8 @@ class _SampleStoreDataset(Dataset):
 
     def __getitem__(self, index):
         h, f, logits = self.sampler.sample()
+        # Softmax ignores a per-(h, f) shift; remove it as exp1's centered_logits does.
+        logits = logits - logits.mean()
         token_ids = torch.randint(
             logits.shape[0], (self.tokens_per_pair,), generator=self.generator
         )
@@ -76,7 +82,10 @@ def load_data(
     seed: int = 0,
     tokens_per_pair: int = 32,
 ) -> DataLoader:
-    """Sample h (B,H), f_concat_z (B,Z,F+1), scores (B,Z), with Z=tokens_per_pair."""
+    """Sample h (B,H), f_concat_z (B,Z,F+1), scores (B,Z), with Z=tokens_per_pair.
+
+    Scores are logits minus their full-vocabulary mean.
+    """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     if batches_per_epoch <= 0:

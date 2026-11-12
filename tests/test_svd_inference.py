@@ -252,9 +252,10 @@ class SVDInferenceDataLoaderTests(unittest.TestCase):
                         )
                         token_ids = future[:, -1]
                         self.assertTrue(((0 <= token_ids) & (token_ids < 17)).all().item())
+                        logits = torch.from_numpy(record["logits"].copy())
                         torch.testing.assert_close(
                             kernel_values,
-                            torch.from_numpy(record["logits"].copy())[token_ids],
+                            (logits - logits.mean())[token_ids],
                             rtol=0,
                             atol=0,
                         )
