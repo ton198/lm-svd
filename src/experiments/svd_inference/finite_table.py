@@ -131,6 +131,32 @@ def spectral_fit(table, target_rows) -> tuple[torch.Tensor, torch.Tensor]:
     return U, weights.masked_fill(S <= tolerance, 0.0)
 
 
+def deflated_relative_error(coefficients, basis_logits, target_logits) -> torch.Tensor:
+    """Relative squared logit error with the leading basis direction removed.
+
+    Center the logits over the vocabulary, take the leading right singular
+    direction b of the centered basis logits, and project it out of both sides:
+
+        ||P (v L - l_t)||^2 / ||P l_t||^2,   P = I - b b^T
+
+    This is the evaluation-side counterpart of deflate1. Zero coefficients
+    score exactly one. Coefficients of shape (..., T, N) give errors of shape
+    (..., T), so several fits can share one SVD.
+    """
+    coefficients = torch.as_tensor(coefficients, dtype=torch.float64)
+    basis = torch.as_tensor(basis_logits, dtype=torch.float64)
+    target = torch.as_tensor(target_logits, dtype=torch.float64)
+    basis = basis - basis.mean(dim=-1, keepdim=True)
+    target = target - target.mean(dim=-1, keepdim=True)
+    direction = torch.linalg.svd(basis, full_matrices=False).Vh[0]
+
+    def deflate(rows: torch.Tensor) -> torch.Tensor:
+        return rows - (rows @ direction).unsqueeze(-1) * direction
+
+    error = deflate(coefficients @ basis - target).square().sum(dim=-1)
+    return error / deflate(target).square().sum(dim=-1)
+
+
 @torch.no_grad()
 def report_finite_table_baseline(
     *,
@@ -177,7 +203,9 @@ def report_finite_table_baseline(
         gpt_model.next_token_logits_batch(basis[start : start + batch_size].tolist())
         for start in range(0, num_basis, batch_size)
     ]).to(device="cpu", dtype=torch.float64)
-    true_logits = gpt_model.next_token_logits_batch(targets.tolist())
+    true_logits = gpt_model.next_token_logits_batch(targets.tolist()).to(
+        device="cpu", dtype=torch.float64
+    )
     approx_logits = coefficients @ basis_logits
 
     print(
@@ -213,8 +241,7 @@ def report_finite_table_baseline(
     # fitting at all. The oracle fits the coefficients on the very logits being
     # evaluated, so it bounds what any coefficients on this basis can reach.
     centered_basis = basis_logits - basis_logits.mean(dim=-1, keepdim=True)
-    centered_true = true_logits.to(device="cpu", dtype=torch.float64)
-    centered_true = centered_true - centered_true.mean(dim=-1, keepdim=True)
+    centered_true = true_logits - true_logits.mean(dim=-1, keepdim=True)
     oracle_coefficients, _ = fit_coefficients(centered_basis, centered_true)
     references = {}
     for name, description, reference_logits in (
@@ -251,22 +278,47 @@ def report_finite_table_baseline(
             f"  {row['table_residual_vs_mean_row']:17.4f}  {row['coefficient_l1']:7.2f}"
         )
 
-    # deflate1: fit on the table without its leading singular component, then
-    # add the leading term back. The least-squares fit separates by direction,
-    # so this must reproduce the ordinary coefficients.
+    # deflate1: least-squares fit on M - S[0] * outer(U[:, 0], Vt[0]), which is
+    # the ordinary fit without its leading-direction term. These coefficients
+    # sum to about zero, so on their own they describe only how a target
+    # deviates from what all histories share.
     leading = weights[:, :1] @ basis_directions[:, :1].T
     deflated = weights[:, 1:] @ basis_directions[:, 1:].T
     deflate1 = {
-        "description": "coefficients fitted on M - S[0] * outer(U[:, 0], Vt[0]) plus the "
-                       "leading-direction term, compared with the ordinary fit",
+        "fit": "least squares on M - S[0] * outer(U[:, 0], Vt[0]), M = U @ diag(S) @ Vt",
         "restore_max_abs_coefficient_difference": (
             deflated + leading - coefficients
         ).abs().max().item(),
         "leading_term_coefficient_l1": leading.abs().sum(dim=-1).mean().item(),
-        "deflated_coefficient_l1": deflated.abs().sum(dim=-1).mean().item(),
     }
+    for name, values in fit_diagnostics(deflated).items():
+        if name.startswith("coefficient"):
+            per_target[f"deflate1_{name}"] = values
+            deflate1[name] = values.mean().item()
+    for name, description, deflate1_logits in (
+        ("fit_only", "sum_i v'_i LM(h_i)", deflated @ basis_logits),
+        ("fit_plus_basis_mean", "mean_i LM(h_i) + sum_i v'_i LM(h_i)",
+         basis_logits.mean(dim=0) + deflated @ basis_logits),
+    ):
+        print(f"deflate1 {name} ({description}):")
+        deflate1[name], _ = summarize_next_token_approximation(
+            deflate1_logits, true_logits, top_k=eval_top_k, output_path=None
+        )
+    uniform = torch.full_like(coefficients, 1 / num_basis)
+    deflated_errors = deflated_relative_error(
+        torch.stack((deflated, coefficients, uniform)), basis_logits, true_logits
+    ).mean(dim=-1)
+    deflate1["deflated_logit_relative_error"] = dict(zip(
+        ("deflate1_fit", "ordinary_fit", "uniform_mean"), deflated_errors.tolist()
+    ))
     print(
-        "deflate1 then restore vs ordinary fit, max |coefficient difference|: "
+        "deflate1: relative squared logit error with the leading basis-logit direction "
+        "removed from both sides (zero coefficients score 1):"
+    )
+    for name, value in deflate1["deflated_logit_relative_error"].items():
+        print(f"  {name}: {value:.6g}")
+    print(
+        "deflate1 fit plus leading term vs ordinary fit, max |coefficient difference|: "
         f"{deflate1['restore_max_abs_coefficient_difference']:.3g}"
     )
 

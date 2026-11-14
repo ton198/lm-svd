@@ -12,6 +12,7 @@ from data_pipline.sample_store.store import STORE_FORMAT, SampleSampler, sample_
 from experiments.exp1_L_M_table.table import build_matrix, select_header_tokens
 from experiments.svd_inference.finite_table import (
     build_rows,
+    deflated_relative_error,
     fit_coefficients,
     report_finite_table_baseline,
     sample_distinct,
@@ -196,6 +197,38 @@ class SpectralFitTests(unittest.TestCase):
         )
 
 
+class DeflatedRelativeErrorTests(unittest.TestCase):
+    def setUp(self):
+        generator = torch.Generator().manual_seed(2)
+        common = torch.randn(30, generator=generator, dtype=torch.float64)
+        self.basis = 20 * common + torch.randn(5, 30, generator=generator, dtype=torch.float64)
+        self.coefficients = torch.randn(3, 5, generator=generator, dtype=torch.float64)
+        centered = self.basis - self.basis.mean(dim=-1, keepdim=True)
+        self.direction = torch.linalg.svd(centered, full_matrices=False).Vh[0]
+
+    def test_exact_combination_has_zero_error_and_no_fit_has_error_one(self):
+        targets = self.coefficients @ self.basis
+        torch.testing.assert_close(
+            deflated_relative_error(self.coefficients, self.basis, targets),
+            torch.zeros(3, dtype=torch.float64), rtol=0, atol=1e-18,
+        )
+        torch.testing.assert_close(
+            deflated_relative_error(torch.zeros_like(self.coefficients), self.basis, targets),
+            torch.ones(3, dtype=torch.float64),
+        )
+
+    def test_ignores_the_leading_direction_and_constant_shifts(self):
+        targets = self.coefficients @ self.basis
+        shifted = targets + 7.0 * self.direction + 3.0
+        self.assertLess(
+            deflated_relative_error(self.coefficients, self.basis, shifted).max().item(), 1e-18
+        )
+        # The same shift is a large error without deflation.
+        centered = shifted - shifted.mean(dim=-1, keepdim=True)
+        fitted = self.coefficients @ (self.basis - self.basis.mean(dim=-1, keepdim=True))
+        self.assertGreater((fitted - centered).square().sum(dim=-1).min().item(), 1.0)
+
+
 class SummarizeTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -310,6 +343,36 @@ class ReportTests(FiniteTableFixture):
         residuals = [metrics["table_residual_vs_mean_row"] for metrics in sweep.values()]
         self.assertEqual(residuals, sorted(residuals, reverse=True))
         self.assertLess(saved["deflate1"]["restore_max_abs_coefficient_difference"], 1e-8)
+
+    def test_small_run_evaluates_the_deflate1_fit_on_its_own(self):
+        output_dir = self.root / "report-deflate1"
+        report_finite_table_baseline(
+            store_dir=self.store, model_path=self.model_path, output_dir=output_dir,
+            num_basis=6, num_futures=4, top_k=3, num_targets=2, batch_size=3,
+            seed=1, device="cpu",
+        )
+        saved = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
+        deflate1 = saved["deflate1"]
+        for name in ("fit_only", "fit_plus_basis_mean"):
+            for metric in ("kl_true_to_approx", "centered_logit_rmse", "top1_agreement"):
+                self.assertTrue(math.isfinite(deflate1[name][metric]), (name, metric))
+        errors = deflate1["deflated_logit_relative_error"]
+        self.assertEqual(set(errors), {"deflate1_fit", "ordinary_fit", "uniform_mean"})
+        for value in errors.values():
+            self.assertTrue(math.isfinite(value))
+            self.assertGreaterEqual(value, 0.0)
+        self.assertEqual(len(saved["per_target"]["deflate1_coefficient_sum"]), 2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_small_run_completes_on_cuda(self):
+        output_dir = self.root / "report-cuda"
+        result = report_finite_table_baseline(
+            store_dir=self.store, model_path=self.model_path, output_dir=output_dir,
+            num_basis=6, num_futures=4, top_k=3, num_targets=2, batch_size=3,
+            seed=1, device="cuda",
+        )
+        self.assertTrue(math.isfinite(result["kl_true_to_approx"]))
+        self.assertTrue((output_dir / "metrics.json").is_file())
 
     def test_rejects_non_positive_counts(self):
         for name in ("num_basis", "num_futures", "top_k", "num_targets", "batch_size"):
