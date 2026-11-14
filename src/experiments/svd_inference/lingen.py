@@ -98,7 +98,7 @@ def report_next_token_approximation(num_target_histories: int = 32) -> dict[str,
     store_dir = Path("data/sample_stores/wikitext-103-train__gpt2-small__h64-f32")
     output_path = Path("next_token_approximation.png")
     top_k = 10
-    num_reference_histories = 128
+    num_reference_histories = 4096
     seed = 0
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
