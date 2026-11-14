@@ -19,16 +19,18 @@ import torch
 
 from data_pipline.sample_store.store import SampleSampler
 from experiments.exp1_L_M_table.table import select_header_tokens
-from utils.common import Sample, save_json, write_atomic
+from utils.common import Sample, save_json, save_numpy, write_atomic
 from utils.inference import CausalLMInference
 
 from .lingen import summarize_next_token_approximation
 
 DEFAULT_STORE_DIR = Path("data/sample_stores/wikitext-103-train__gpt2-small__h64-f32")
 DEFAULT_MODEL_PATH = Path("models/gpt2-small")
-DEFAULT_OUTPUT_DIR = Path(
-    "data/experiment_results/svd_inference_finite_table/wikitext-103-train__gpt2-small/analysis"
+_RUN_DIR = Path(
+    "data/experiment_results/svd_inference_finite_table/wikitext-103-train__gpt2-small"
 )
+DEFAULT_OUTPUT_DIR = _RUN_DIR / "analysis"
+DEFAULT_TABLE_DIR = _RUN_DIR / "inference"
 _FIELDS = {"h": 0, "f": 1}
 
 
@@ -90,6 +92,11 @@ def build_rows(
     return matrix
 
 
+def _save_npz(path: Path, **arrays: np.ndarray) -> None:
+    with path.open("wb") as stream:
+        np.savez(stream, **arrays)
+
+
 def fit_coefficients(table, target_rows) -> tuple[torch.Tensor, torch.Tensor]:
     """Least-squares coefficients of each target row on the basis rows.
 
@@ -115,15 +122,23 @@ def report_finite_table_baseline(
     store_dir: str | Path = DEFAULT_STORE_DIR,
     model_path: str | Path = DEFAULT_MODEL_PATH,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
-    num_basis: int = 1024,
-    num_futures: int = 1024,
+    table_dir: str | Path | None = DEFAULT_TABLE_DIR,
+    num_basis: int = 8192,
+    num_futures: int = 2048,
     top_k: int = 50,
-    num_targets: int = 32,
+    num_targets: int = 50,
     batch_size: int = 1024,
     seed: int = 0,
     device: str | None = None,
 ) -> dict[str, float]:
-    """Run the baseline; print and save mean/std metrics over target histories."""
+    """Run the baseline; print and save mean/std metrics over target histories.
+
+    The defaults are the paper's setup (40,000 histories, 10,000 futures, 50
+    targets, top-50 tokens) with histories and futures each cut by about five
+    to fit a few GPU hours. With table_dir set, the sampled tokens, the table
+    and the evaluated logits are saved there before the fit, so coefficients
+    can be refitted later without rerunning the model.
+    """
     for name, value in (("num_basis", num_basis), ("num_futures", num_futures),
                         ("top_k", top_k), ("num_targets", num_targets),
                         ("batch_size", batch_size)):
@@ -147,7 +162,18 @@ def report_finite_table_baseline(
     table = build_rows(gpt_model, basis, futures, header_token_ids, batch_size)
     print(f"Building {num_targets} target rows", flush=True)
     target_rows = build_rows(gpt_model, targets, futures, header_token_ids, batch_size)
+    if table_dir is not None:
+        table_dir = Path(table_dir)
+        table_dir.mkdir(parents=True, exist_ok=True)
+        write_atomic(table_dir / "tokens.npz", lambda tmp: _save_npz(
+            tmp, targets=targets.numpy(), basis=basis.numpy(), futures=futures.numpy(),
+            header_token_ids=header_token_ids,
+        ))
+        write_atomic(table_dir / "table.npy", lambda tmp: save_numpy(tmp, table))
+        write_atomic(table_dir / "target_rows.npy", lambda tmp: save_numpy(tmp, target_rows))
+        print(f"Saved table to {table_dir}", flush=True)
 
+    print("Fitting coefficients", flush=True)
     coefficients, _ = fit_coefficients(table, target_rows)
 
     # LM(x): full-vocabulary next-token logits after the history alone.
@@ -158,6 +184,12 @@ def report_finite_table_baseline(
     true_logits = gpt_model.next_token_logits_batch(targets.tolist()).to(
         device="cpu", dtype=torch.float64
     )
+    if table_dir is not None:
+        for name, logits in (("basis_logits", basis_logits), ("target_logits", true_logits)):
+            write_atomic(
+                table_dir / f"{name}.npy",
+                lambda tmp, logits=logits: save_numpy(tmp, logits.to(torch.float32).numpy()),
+            )
     approx_logits = coefficients @ basis_logits
 
     print(
@@ -200,6 +232,7 @@ def report_finite_table_baseline(
             "seed": seed, "num_basis": num_basis, "num_futures": num_futures,
             "top_k": top_k, "num_targets": num_targets, "eval_top_k": eval_top_k,
             "table_shape": list(table.shape),
+            "table_dir": None if table_dir is None else str(table_dir),
             "table_value": "logit(token | history + future) - mean(logits over full vocabulary)",
             "header_context": "future_only",
             "fit": "float64 minimum-norm least squares of each target row on the basis rows",
@@ -224,10 +257,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--store-dir", type=Path, default=DEFAULT_STORE_DIR)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--num-basis", type=int, default=1024)
-    parser.add_argument("--num-futures", type=int, default=1024)
+    parser.add_argument(
+        "--table-dir", type=Path, default=DEFAULT_TABLE_DIR,
+        help="Where the sampled tokens, table and evaluated logits are saved",
+    )
+    parser.add_argument("--num-basis", type=int, default=8192)
+    parser.add_argument("--num-futures", type=int, default=2048)
     parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--num-targets", type=int, default=32)
+    parser.add_argument("--num-targets", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=1024,
                         help="Sequences per GPT-2 forward pass")
     parser.add_argument("--seed", type=int, default=0)

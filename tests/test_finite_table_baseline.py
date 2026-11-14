@@ -205,7 +205,7 @@ class ReportTests(FiniteTableFixture):
         result = report_finite_table_baseline(
             store_dir=self.store, model_path=self.model_path, output_dir=output_dir,
             num_basis=6, num_futures=4, top_k=3, num_targets=2, batch_size=3,
-            seed=1, device="cpu",
+            seed=1, device="cpu", table_dir=None,
         )
         self.assertTrue((output_dir / "next_token_approximation.png").is_file())
         saved = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
@@ -226,7 +226,7 @@ class ReportTests(FiniteTableFixture):
         report_finite_table_baseline(
             store_dir=self.store, model_path=self.model_path, output_dir=output_dir,
             num_basis=6, num_futures=4, top_k=3, num_targets=2, batch_size=3,
-            seed=1, device="cpu",
+            seed=1, device="cpu", table_dir=None,
         )
         references = json.loads(
             (output_dir / "metrics.json").read_text(encoding="utf-8")
@@ -239,13 +239,51 @@ class ReportTests(FiniteTableFixture):
             ["metrics.json", "next_token_approximation.png"],
         )
 
+    def test_small_run_saves_the_table_and_logits_for_offline_refits(self):
+        table_dir = self.root / "report-table" / "inference"
+        report_finite_table_baseline(
+            store_dir=self.store, model_path=self.model_path,
+            output_dir=self.root / "report-table" / "analysis", table_dir=table_dir,
+            num_basis=6, num_futures=4, top_k=3, num_targets=2, batch_size=3,
+            seed=1, device="cpu",
+        )
+        table = np.load(table_dir / "table.npy")
+        target_rows = np.load(table_dir / "target_rows.npy")
+        basis_logits = np.load(table_dir / "basis_logits.npy")
+        target_logits = np.load(table_dir / "target_logits.npy")
+        tokens = np.load(table_dir / "tokens.npz")
+        self.assertEqual((table.shape, table.dtype), ((6, 12), np.float32))
+        self.assertEqual(target_rows.shape, (2, 12))
+        self.assertEqual((basis_logits.shape, basis_logits.dtype), ((6, VOCAB), np.float32))
+        self.assertEqual(target_logits.shape, (2, VOCAB))
+        self.assertEqual(tokens["basis"].shape, (6, HISTORY_TOKENS))
+        self.assertEqual(tokens["targets"].shape, (2, HISTORY_TOKENS))
+        self.assertEqual(tokens["futures"].shape, (4, FUTURE_TOKENS))
+        self.assertEqual(tokens["header_token_ids"].shape, (4, 3))
+        # The saved arrays are exactly what the reported fit used.
+        inference = CausalLMInference(self.model_path, "cpu")
+        rebuilt = build_rows(
+            inference, torch.from_numpy(tokens["basis"]), torch.from_numpy(tokens["futures"]),
+            tokens["header_token_ids"], 3,
+        )
+        np.testing.assert_allclose(table, rebuilt, rtol=0, atol=1e-5)
+
+    def test_without_table_dir_nothing_but_the_analysis_is_written(self):
+        root = self.root / "report-no-table"
+        report_finite_table_baseline(
+            store_dir=self.store, model_path=self.model_path, output_dir=root / "analysis",
+            table_dir=None, num_basis=6, num_futures=4, top_k=3, num_targets=2,
+            batch_size=3, seed=1, device="cpu",
+        )
+        self.assertEqual([path.name for path in root.iterdir()], ["analysis"])
+
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_small_run_completes_on_cuda(self):
         output_dir = self.root / "report-cuda"
         result = report_finite_table_baseline(
             store_dir=self.store, model_path=self.model_path, output_dir=output_dir,
             num_basis=6, num_futures=4, top_k=3, num_targets=2, batch_size=3,
-            seed=1, device="cuda",
+            seed=1, device="cuda", table_dir=None,
         )
         self.assertTrue(math.isfinite(result["kl_true_to_approx"]))
         self.assertTrue((output_dir / "metrics.json").is_file())
@@ -255,7 +293,7 @@ class ReportTests(FiniteTableFixture):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 report_finite_table_baseline(
                     store_dir=self.store, model_path=self.model_path,
-                    output_dir=self.root / "unused", device="cpu",
+                    output_dir=self.root / "unused", device="cpu", table_dir=None,
                     **{"num_basis": 6, "num_futures": 4, "top_k": 3, "num_targets": 2,
                        "batch_size": 3, name: 0},
                 )

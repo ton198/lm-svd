@@ -3,9 +3,9 @@
 #SBATCH --partition=h100
 #SBATCH --qos=h100
 #SBATCH --gres=gpu:H100:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=00:30:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=06:00:00
 #SBATCH --output=bluehive_run/logs/slurm-%x-%j.out
 #SBATCH --error=bluehive_run/logs/slurm-%x-%j.err
 
