@@ -3,6 +3,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ from transformers import GPT2Config, GPT2LMHeadModel
 
 from data_pipline.sample_store.store import STORE_FORMAT, SampleSampler, sample_dtype, slot_path
 from experiments.exp1_L_M_table.table import build_matrix, select_header_tokens
+from experiments.svd_inference import finite_table
 from experiments.svd_inference.finite_table import (
     build_rows,
     fit_coefficients,
@@ -120,6 +122,27 @@ class BuildRowsTests(FiniteTableFixture):
                 self.assertEqual(actual.shape, (5, 4 * 3))
                 self.assertEqual(actual.dtype, np.float32)
                 np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-5)
+
+
+    def test_resumes_into_an_existing_array_from_a_given_row(self):
+        inference = CausalLMInference(self.model_path, "cpu")
+        histories = torch.from_numpy(self.records["h"][:5].copy())
+        futures = torch.from_numpy(self.records["f"][:4].copy())
+        future_samples = [Sample(index, row) for index, row in enumerate(futures.tolist())]
+        header_token_ids, _ = select_header_tokens(inference, future_samples, 3)
+        expected = build_rows(inference, histories, futures, header_token_ids, 3)
+
+        out = np.full((5, 12), np.nan, dtype=np.float32)
+        out[:2] = expected[:2]
+        saved = []
+        result = build_rows(
+            inference, histories, futures, header_token_ids, 3,
+            out=out, start=2, checkpoint=saved.append,
+        )
+        self.assertIs(result, out)
+        np.testing.assert_allclose(out, expected, rtol=0, atol=1e-6)
+        # The final row count is always checkpointed.
+        self.assertEqual(saved[-1], 5)
 
 
 class FitCoefficientsTests(unittest.TestCase):
@@ -276,6 +299,86 @@ class ReportTests(FiniteTableFixture):
             batch_size=3, seed=1, device="cpu",
         )
         self.assertEqual([path.name for path in root.iterdir()], ["analysis"])
+
+    def _run(self, root, **overrides):
+        options = dict(
+            store_dir=self.store, model_path=self.model_path, output_dir=root / "analysis",
+            table_dir=root / "inference", num_basis=6, num_futures=4, top_k=3,
+            num_targets=2, batch_size=4, seed=1, device="cpu",
+        )
+        options.update(overrides)
+        return report_finite_table_baseline(**options)
+
+    def test_interrupted_run_resumes_with_the_same_samples_and_finishes(self):
+        root = self.root / "report-resume"
+        real = CausalLMInference.next_token_logits_batch
+        calls = {"count": 0}
+
+        def counted(inference, sequences):
+            calls["count"] += 1
+            return real(inference, sequences)
+
+        with mock.patch.object(CausalLMInference, "next_token_logits_batch", counted):
+            uninterrupted = self._run(self.root / "report-resume-reference")
+        full_run_calls = calls["count"]
+
+        def failing(inference, sequences):
+            calls["count"] += 1
+            if calls["count"] > 4:
+                raise RuntimeError("preempted")
+            return real(inference, sequences)
+
+        calls["count"] = 0
+        with mock.patch.object(CausalLMInference, "next_token_logits_batch", failing), \
+                mock.patch.object(finite_table, "CHECKPOINT_EVERY", 2), \
+                self.assertRaisesRegex(RuntimeError, "preempted"):
+            self._run(root)
+        tokens_before = dict(np.load(root / "inference" / "tokens.npz"))
+        progress = json.loads((root / "inference" / "progress.json").read_text(encoding="utf-8"))
+        self.assertFalse(progress["complete"])
+        self.assertEqual(progress["table"], 4)
+
+        # The store may have changed since the first attempt: the resumed run must
+        # reuse the saved samples instead of drawing new ones.
+        calls["count"] = 0
+        with mock.patch.object(CausalLMInference, "next_token_logits_batch", counted), \
+                mock.patch.object(finite_table, "sample_distinct",
+                                  side_effect=AssertionError("resampled")):
+            resumed = self._run(root)
+        self.assertLess(calls["count"], full_run_calls)
+        tokens_after = np.load(root / "inference" / "tokens.npz")
+        for name, values in tokens_before.items():
+            np.testing.assert_array_equal(tokens_after[name], values)
+        progress = json.loads((root / "inference" / "progress.json").read_text(encoding="utf-8"))
+        self.assertTrue(progress["complete"])
+        for name in ("kl_true_to_approx", "centered_logit_rmse", "coefficient_l1"):
+            self.assertAlmostEqual(resumed[name], uninterrupted[name], places=5)
+
+    def test_finished_run_is_not_reused_by_the_next_run(self):
+        root = self.root / "report-rerun"
+        self._run(root)
+        with mock.patch.object(finite_table, "sample_distinct",
+                               wraps=finite_table.sample_distinct) as sampled:
+            self._run(root)
+        self.assertEqual(sampled.call_count, 3)
+
+    def test_interrupted_run_with_other_settings_is_not_resumed(self):
+        root = self.root / "report-other-settings"
+        real = CausalLMInference.next_token_logits_batch
+        calls = {"count": 0}
+
+        def failing(inference, sequences):
+            calls["count"] += 1
+            if calls["count"] > 4:
+                raise RuntimeError("preempted")
+            return real(inference, sequences)
+
+        with mock.patch.object(CausalLMInference, "next_token_logits_batch", failing), \
+                self.assertRaises(RuntimeError):
+            self._run(root)
+        self._run(root, num_basis=5)
+        self.assertEqual(np.load(root / "inference" / "table.npy").shape, (5, 12))
+        self.assertEqual(np.load(root / "inference" / "tokens.npz")["basis"].shape[0], 5)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_small_run_completes_on_cuda(self):

@@ -11,7 +11,9 @@ basis histories' own next-token logits:
 from __future__ import annotations
 
 import argparse
+import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +34,7 @@ _RUN_DIR = Path(
 DEFAULT_OUTPUT_DIR = _RUN_DIR / "analysis"
 DEFAULT_TABLE_DIR = _RUN_DIR / "inference"
 _FIELDS = {"h": 0, "f": 1}
+CHECKPOINT_EVERY = 64
 
 
 def sample_distinct(
@@ -69,22 +72,36 @@ def build_rows(
     futures: torch.Tensor,
     header_token_ids: np.ndarray,
     batch_size: int,
+    *,
+    out: np.ndarray | None = None,
+    start: int = 0,
+    checkpoint: Callable[[int], None] | None = None,
 ) -> np.ndarray:
-    """Batched exp1 `build_matrix`: one (futures * top_k) row per history."""
+    """Batched exp1 `build_matrix`: one (futures * top_k) row per history.
+
+    To continue an interrupted build, pass the partly filled array as `out`
+    and the number of finished rows as `start`. `checkpoint` is called with
+    the number of finished rows every CHECKPOINT_EVERY rows and at the end.
+    """
     header = torch.as_tensor(header_token_ids, dtype=torch.long, device=inference.device)
-    matrix = np.empty((len(histories), header.numel()), dtype=np.float32)
+    matrix = (
+        np.empty((len(histories), header.numel()), dtype=np.float32) if out is None else out
+    )
     started = time.perf_counter()
-    for history_index, history in enumerate(histories):
+    for history_index in range(start, len(histories)):
+        history = histories[history_index]
         chunks = []
-        for start in range(0, len(futures), batch_size):
-            batch = futures[start : start + batch_size]
+        for offset in range(0, len(futures), batch_size):
+            batch = futures[offset : offset + batch_size]
             sequences = torch.cat((history.expand(len(batch), -1), batch), dim=1)
             logits = inference.next_token_logits_batch(sequences.tolist())
             centered = logits - logits.mean(dim=-1, keepdim=True)
-            chunks.append(centered.gather(1, header[start : start + batch_size]))
+            chunks.append(centered.gather(1, header[offset : offset + batch_size]))
         matrix[history_index] = torch.cat(chunks).flatten().cpu().numpy()
         done = history_index + 1
-        if done % 64 == 0 or done == len(histories):
+        if done % CHECKPOINT_EVERY == 0 or done == len(histories):
+            if checkpoint is not None:
+                checkpoint(done)
             print(
                 f"history {done}/{len(histories)} done, elapsed {time.perf_counter() - started:.1f}s",
                 flush=True,
@@ -136,8 +153,10 @@ def report_finite_table_baseline(
     The defaults are the paper's setup (40,000 histories, 10,000 futures, 50
     targets, top-50 tokens) with histories and futures each cut by about five
     to fit a few GPU hours. With table_dir set, the sampled tokens, the table
-    and the evaluated logits are saved there before the fit, so coefficients
-    can be refitted later without rerunning the model.
+    and the evaluated logits are saved there, so coefficients can be refitted
+    later without rerunning the model. An interrupted run with the same
+    settings continues from its last checkpoint with the samples it already
+    drew; a finished run is never reused.
     """
     for name, value in (("num_basis", num_basis), ("num_futures", num_futures),
                         ("top_k", top_k), ("num_targets", num_targets),
@@ -148,30 +167,90 @@ def report_finite_table_baseline(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     eval_top_k = 10
 
-    # Targets are drawn first, as in lingen.report_next_token_approximation.
-    sampler = SampleSampler(store_dir, seed=seed)
-    targets = sample_distinct(sampler, num_targets, "h")
-    basis = sample_distinct(sampler, num_basis, "h", exclude=targets)
-    futures = sample_distinct(sampler, num_futures, "f")
-
+    settings = {
+        "store_dir": str(store_dir), "model_path": str(model_path), "seed": seed,
+        "num_basis": num_basis, "num_futures": num_futures, "top_k": top_k,
+        "num_targets": num_targets,
+    }
+    columns = num_futures * top_k
     gpt_model = CausalLMInference(model_path, device=device)
-    header_token_ids, _ = select_header_tokens(
-        gpt_model, [Sample(index, row) for index, row in enumerate(futures.tolist())], top_k
-    )
-    print(f"Building {num_basis} x {num_futures * top_k} basis table", flush=True)
-    table = build_rows(gpt_model, basis, futures, header_token_ids, batch_size)
-    print(f"Building {num_targets} target rows", flush=True)
-    target_rows = build_rows(gpt_model, targets, futures, header_token_ids, batch_size)
+
+    # progress stays None when nothing is saved; otherwise it counts finished rows.
+    progress = None
     if table_dir is not None:
         table_dir = Path(table_dir)
-        table_dir.mkdir(parents=True, exist_ok=True)
-        write_atomic(table_dir / "tokens.npz", lambda tmp: _save_npz(
-            tmp, targets=targets.numpy(), basis=basis.numpy(), futures=futures.numpy(),
-            header_token_ids=header_token_ids,
-        ))
-        write_atomic(table_dir / "table.npy", lambda tmp: save_numpy(tmp, table))
-        write_atomic(table_dir / "target_rows.npy", lambda tmp: save_numpy(tmp, target_rows))
-        print(f"Saved table to {table_dir}", flush=True)
+        progress_path = table_dir / "progress.json"
+        if progress_path.is_file():
+            saved = json.loads(progress_path.read_text(encoding="utf-8"))
+            if saved.get("settings") == settings and not saved.get("complete"):
+                progress = saved
+    if progress is not None:
+        # The store keeps changing, so the samples must come from the first attempt.
+        print(
+            f"Resuming {table_dir}: {progress['table']}/{num_basis} table rows, "
+            f"{progress['target_rows']}/{num_targets} target rows done", flush=True,
+        )
+        tokens = np.load(table_dir / "tokens.npz")
+        targets, basis, futures = (
+            torch.from_numpy(tokens[name]) for name in ("targets", "basis", "futures")
+        )
+        header_token_ids = tokens["header_token_ids"]
+        table = np.load(table_dir / "table.npy", mmap_mode="r+")
+        target_rows = np.load(table_dir / "target_rows.npy", mmap_mode="r+")
+    else:
+        # Targets are drawn first, as in lingen.report_next_token_approximation.
+        sampler = SampleSampler(store_dir, seed=seed)
+        targets = sample_distinct(sampler, num_targets, "h")
+        basis = sample_distinct(sampler, num_basis, "h", exclude=targets)
+        futures = sample_distinct(sampler, num_futures, "f")
+        header_token_ids, _ = select_header_tokens(
+            gpt_model, [Sample(index, row) for index, row in enumerate(futures.tolist())],
+            top_k,
+        )
+        if table_dir is None:
+            table = np.empty((num_basis, columns), dtype=np.float32)
+            target_rows = np.empty((num_targets, columns), dtype=np.float32)
+        else:
+            table_dir.mkdir(parents=True, exist_ok=True)
+            # No progress file means no resumable state while the files are replaced.
+            progress_path.unlink(missing_ok=True)
+            write_atomic(table_dir / "tokens.npz", lambda tmp: _save_npz(
+                tmp, targets=targets.numpy(), basis=basis.numpy(), futures=futures.numpy(),
+                header_token_ids=header_token_ids,
+            ))
+            table = np.lib.format.open_memmap(
+                table_dir / "table.npy", mode="w+", dtype=np.float32,
+                shape=(num_basis, columns),
+            )
+            target_rows = np.lib.format.open_memmap(
+                table_dir / "target_rows.npy", mode="w+", dtype=np.float32,
+                shape=(num_targets, columns),
+            )
+            progress = {"settings": settings, "table": 0, "target_rows": 0, "complete": False}
+            write_atomic(progress_path, lambda tmp: save_json(tmp, progress))
+
+    def checkpoint(name: str, rows: np.ndarray) -> Callable[[int], None] | None:
+        if progress is None:
+            return None
+
+        def save(done: int) -> None:
+            rows.flush()
+            progress[name] = done
+            write_atomic(progress_path, lambda tmp: save_json(tmp, progress))
+
+        return save
+
+    print(f"Building {num_basis} x {columns} basis table", flush=True)
+    build_rows(
+        gpt_model, basis, futures, header_token_ids, batch_size, out=table,
+        start=progress["table"] if progress else 0, checkpoint=checkpoint("table", table),
+    )
+    print(f"Building {num_targets} target rows", flush=True)
+    build_rows(
+        gpt_model, targets, futures, header_token_ids, batch_size, out=target_rows,
+        start=progress["target_rows"] if progress else 0,
+        checkpoint=checkpoint("target_rows", target_rows),
+    )
 
     print("Fitting coefficients", flush=True)
     coefficients, _ = fit_coefficients(table, target_rows)
@@ -246,6 +325,9 @@ def report_finite_table_baseline(
     metrics_path = output_dir / "metrics.json"
     write_atomic(metrics_path, lambda tmp: save_json(tmp, result))
     print(f"Saved metrics to {metrics_path}")
+    if progress is not None:
+        progress["complete"] = True
+        write_atomic(progress_path, lambda tmp: save_json(tmp, progress))
     return metrics
 
 
