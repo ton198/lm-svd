@@ -88,8 +88,6 @@ def report_next_token_approximation(num_target_histories: int = 32) -> dict[str,
     Logit errors use vocabulary-centered logits, matching the training target
     and ignoring constant offsets that do not affect next-token probabilities.
     """
-    from matplotlib.figure import Figure
-
     if num_target_histories < 1:
         raise ValueError("num_target_histories must be positive")
 
@@ -108,12 +106,33 @@ def report_next_token_approximation(num_target_histories: int = 32) -> dict[str,
     ht = torch.stack([sampler.sample()[0] for _ in range(num_target_histories)])
     hn = torch.stack([sampler.sample()[0] for _ in range(num_reference_histories)])
 
-    if top_k < 1:
-        raise ValueError("top_k must be positive")
-
     approx_logits, true_logits = evaluate_next_token_approximation(
         gpt_model, model, hn, ht
     )
+    print(f"Next-token approximation: {ht.shape[0]} target histories, {hn.shape[0]} reference histories")
+    metrics, _ = summarize_next_token_approximation(
+        approx_logits, true_logits, top_k=top_k, output_path=output_path
+    )
+    return metrics
+
+
+def summarize_next_token_approximation(
+    approx_logits: torch.Tensor,
+    true_logits: torch.Tensor,
+    *,
+    top_k: int,
+    output_path: str | Path | None,
+) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
+    """Compare (target, vocabulary) logit matrices; print metrics and save a figure.
+
+    Return the mean/std of every metric and the per-target values behind them.
+    Pass output_path=None to skip the figure.
+    """
+    from matplotlib.figure import Figure
+
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+
     approx_logits = approx_logits.detach().to(device="cpu", dtype=torch.float64)
     true_logits = true_logits.detach().to(device="cpu", dtype=torch.float64)
     if true_logits.ndim != 2 or approx_logits.shape != true_logits.shape or not true_logits.numel():
@@ -142,11 +161,13 @@ def report_next_token_approximation(num_target_histories: int = 32) -> dict[str,
         ).any(dim=-1).double().mean(dim=-1),
     }
     metrics = {}
-    print(f"Next-token approximation: {ht.shape[0]} target histories, {hn.shape[0]} reference histories")
     for name, values in per_history_metrics.items():
         metrics[name] = values.mean().item()
         metrics[f"{name}_std"] = values.std(unbiased=False).item()
         print(f"  {name}: mean={metrics[name]:.6g}, std={metrics[f'{name}_std']:.6g}")
+
+    if output_path is None:
+        return metrics, per_history_metrics
 
     figure = Figure(figsize=(13, 5), constrained_layout=True)
     logit_axis, error_axis = figure.subplots(1, 2)
@@ -172,7 +193,7 @@ def report_next_token_approximation(num_target_histories: int = 32) -> dict[str,
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=150)
     print(f"Saved evaluation plots to {output_path}")
-    return metrics
+    return metrics, per_history_metrics
 
 if __name__ == "__main__":
     report_next_token_approximation()
