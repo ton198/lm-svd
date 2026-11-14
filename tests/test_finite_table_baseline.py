@@ -12,11 +12,9 @@ from data_pipline.sample_store.store import STORE_FORMAT, SampleSampler, sample_
 from experiments.exp1_L_M_table.table import build_matrix, select_header_tokens
 from experiments.svd_inference.finite_table import (
     build_rows,
-    deflated_relative_error,
     fit_coefficients,
     report_finite_table_baseline,
     sample_distinct,
-    spectral_fit,
 )
 from experiments.svd_inference.lingen import summarize_next_token_approximation
 from utils.common import Sample
@@ -158,77 +156,6 @@ class FitCoefficientsTests(unittest.TestCase):
         self.assertLess(residual.item(), 1e-20)
 
 
-class SpectralFitTests(unittest.TestCase):
-    def setUp(self):
-        generator = torch.Generator().manual_seed(1)
-        self.table = torch.randn(6, 40, generator=generator, dtype=torch.float64)
-        self.targets = torch.randn(3, 40, generator=generator, dtype=torch.float64)
-        self.U, self.S, self.Vh = torch.linalg.svd(self.table, full_matrices=False)
-
-    def test_all_directions_reproduce_the_least_squares_fit(self):
-        basis_directions, weights = spectral_fit(self.table, self.targets)
-        expected, _ = fit_coefficients(self.table, self.targets)
-        self.assertEqual(weights.shape, (3, 6))
-        torch.testing.assert_close(weights @ basis_directions.T, expected, rtol=0, atol=1e-10)
-
-    def test_first_k_directions_fit_the_rank_k_truncated_table(self):
-        basis_directions, weights = spectral_fit(self.table, self.targets)
-        for rank in (1, 2, 5):
-            with self.subTest(rank=rank):
-                truncated = (self.U[:, :rank] * self.S[:rank]) @ self.Vh[:rank]
-                expected, _ = fit_coefficients(truncated, self.targets)
-                torch.testing.assert_close(
-                    weights[:, :rank] @ basis_directions[:, :rank].T, expected,
-                    rtol=0, atol=1e-10,
-                )
-
-    def test_deflate1_fit_is_the_full_fit_without_its_leading_term(self):
-        basis_directions, weights = spectral_fit(self.table, self.targets)
-        leading = self.S[0] * torch.outer(self.U[:, 0], self.Vh[0])
-        deflated_targets = self.targets - torch.outer(self.targets @ self.Vh[0], self.Vh[0])
-        deflated, _ = fit_coefficients(self.table - leading, deflated_targets)
-        torch.testing.assert_close(
-            weights[:, 1:] @ basis_directions[:, 1:].T, deflated, rtol=0, atol=1e-10
-        )
-        # Adding the leading direction back restores the ordinary fit exactly.
-        full, _ = fit_coefficients(self.table, self.targets)
-        torch.testing.assert_close(
-            deflated + weights[:, :1] @ basis_directions[:, :1].T, full, rtol=0, atol=1e-10
-        )
-
-
-class DeflatedRelativeErrorTests(unittest.TestCase):
-    def setUp(self):
-        generator = torch.Generator().manual_seed(2)
-        common = torch.randn(30, generator=generator, dtype=torch.float64)
-        self.basis = 20 * common + torch.randn(5, 30, generator=generator, dtype=torch.float64)
-        self.coefficients = torch.randn(3, 5, generator=generator, dtype=torch.float64)
-        centered = self.basis - self.basis.mean(dim=-1, keepdim=True)
-        self.direction = torch.linalg.svd(centered, full_matrices=False).Vh[0]
-
-    def test_exact_combination_has_zero_error_and_no_fit_has_error_one(self):
-        targets = self.coefficients @ self.basis
-        torch.testing.assert_close(
-            deflated_relative_error(self.coefficients, self.basis, targets),
-            torch.zeros(3, dtype=torch.float64), rtol=0, atol=1e-18,
-        )
-        torch.testing.assert_close(
-            deflated_relative_error(torch.zeros_like(self.coefficients), self.basis, targets),
-            torch.ones(3, dtype=torch.float64),
-        )
-
-    def test_ignores_the_leading_direction_and_constant_shifts(self):
-        targets = self.coefficients @ self.basis
-        shifted = targets + 7.0 * self.direction + 3.0
-        self.assertLess(
-            deflated_relative_error(self.coefficients, self.basis, shifted).max().item(), 1e-18
-        )
-        # The same shift is a large error without deflation.
-        centered = shifted - shifted.mean(dim=-1, keepdim=True)
-        fitted = self.coefficients @ (self.basis - self.basis.mean(dim=-1, keepdim=True))
-        self.assertGreater((fitted - centered).square().sum(dim=-1).min().item(), 1.0)
-
-
 class SummarizeTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -294,9 +221,9 @@ class ReportTests(FiniteTableFixture):
         self.assertGreaterEqual(result["table_relative_residual"], 0.0)
         self.assertEqual(len(saved["per_target"]["table_residual_vs_mean_row"]), 2)
 
-    def test_small_run_reports_reference_approximations(self):
+    def test_small_run_reports_the_uniform_mean_reference(self):
         output_dir = self.root / "report-references"
-        result = report_finite_table_baseline(
+        report_finite_table_baseline(
             store_dir=self.store, model_path=self.model_path, output_dir=output_dir,
             num_basis=6, num_futures=4, top_k=3, num_targets=2, batch_size=3,
             seed=1, device="cpu",
@@ -304,64 +231,13 @@ class ReportTests(FiniteTableFixture):
         references = json.loads(
             (output_dir / "metrics.json").read_text(encoding="utf-8")
         )["references"]
-        self.assertEqual(set(references), {"uniform_mean", "oracle_full_vocab_fit"})
-        for metrics in references.values():
-            self.assertTrue(math.isfinite(metrics["kl_true_to_approx"]))
-            self.assertTrue(math.isfinite(metrics["centered_logit_rmse"]))
-        # The oracle minimizes each target's centered-logit squared error over all
-        # coefficient vectors, so no other coefficients can beat it on that target.
-        oracle_rmse = references["oracle_full_vocab_fit"]["centered_logit_rmse"]
-        self.assertLessEqual(oracle_rmse, result["centered_logit_rmse"] + 1e-9)
-        self.assertLessEqual(
-            oracle_rmse, references["uniform_mean"]["centered_logit_rmse"] + 1e-9
-        )
+        self.assertEqual(set(references), {"uniform_mean"})
+        for name in ("kl_true_to_approx", "centered_logit_rmse", "top1_agreement"):
+            self.assertTrue(math.isfinite(references["uniform_mean"][name]), name)
         self.assertEqual(
             sorted(path.name for path in output_dir.iterdir()),
             ["metrics.json", "next_token_approximation.png"],
         )
-
-    def test_small_run_reports_rank_sweep_and_deflate1_identity(self):
-        output_dir = self.root / "report-rank-sweep"
-        result = report_finite_table_baseline(
-            store_dir=self.store, model_path=self.model_path, output_dir=output_dir,
-            num_basis=6, num_futures=4, top_k=3, num_targets=2, batch_size=3,
-            seed=1, device="cpu",
-        )
-        saved = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
-        sweep = saved["rank_sweep"]
-        # Powers of two below the basis size, then the basis size itself.
-        self.assertEqual(list(sweep), ["1", "2", "4", "6"])
-        for metrics in sweep.values():
-            for name in ("kl_true_to_approx", "centered_logit_rmse", "top1_agreement",
-                         "table_residual_vs_mean_row", "coefficient_l1"):
-                self.assertTrue(math.isfinite(metrics[name]), name)
-        # Using every direction is the ordinary least-squares fit.
-        for name in ("kl_true_to_approx", "centered_logit_rmse", "coefficient_l1",
-                     "table_residual_vs_mean_row"):
-            self.assertAlmostEqual(sweep["6"][name], result[name], places=6)
-        # More directions can only lower the in-table residual.
-        residuals = [metrics["table_residual_vs_mean_row"] for metrics in sweep.values()]
-        self.assertEqual(residuals, sorted(residuals, reverse=True))
-        self.assertLess(saved["deflate1"]["restore_max_abs_coefficient_difference"], 1e-8)
-
-    def test_small_run_evaluates_the_deflate1_fit_on_its_own(self):
-        output_dir = self.root / "report-deflate1"
-        report_finite_table_baseline(
-            store_dir=self.store, model_path=self.model_path, output_dir=output_dir,
-            num_basis=6, num_futures=4, top_k=3, num_targets=2, batch_size=3,
-            seed=1, device="cpu",
-        )
-        saved = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
-        deflate1 = saved["deflate1"]
-        for name in ("fit_only", "fit_plus_basis_mean"):
-            for metric in ("kl_true_to_approx", "centered_logit_rmse", "top1_agreement"):
-                self.assertTrue(math.isfinite(deflate1[name][metric]), (name, metric))
-        errors = deflate1["deflated_logit_relative_error"]
-        self.assertEqual(set(errors), {"deflate1_fit", "ordinary_fit", "uniform_mean"})
-        for value in errors.values():
-            self.assertTrue(math.isfinite(value))
-            self.assertGreaterEqual(value, 0.0)
-        self.assertEqual(len(saved["per_target"]["deflate1_coefficient_sum"]), 2)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_small_run_completes_on_cuda(self):
