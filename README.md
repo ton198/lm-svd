@@ -10,13 +10,14 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp2` | No-BOS pointwise mutual information of history and future | histories × futures | `pmi.npy` |
 | `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
 | `exp4` | Same entry as `exp1`, in a training table and a disjoint validation table | histories × (futures × top-k), twice | `train/matrix.npy`, `val/matrix.npy` |
+| `exp5` | Same entry as `exp1` minus the header token's centered logit after the future alone, one (history, future) pair at a time | no stored matrix; evaluated on the `exp4` tables | — |
 
-Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead runs `inference` → `train`: it builds two tables with their exact SVDs, trains NeuralSVD on the training table, and compares the learned modes with both exact SVDs during training.
+Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead runs `inference` → `train`: it builds two tables with their exact SVDs, trains NeuralSVD on the training table, and compares the learned modes with both exact SVDs during training. **exp5** has only `train`: it trains two MLPs on frozen GPT-2 hidden states with pairs from the sample store and compares them with the exact SVDs of the exp4 tables.
 
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
-- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs) · [exp4](#experiment-4-neuralsvd-on-an-explicit-table)
+- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs) · [exp4](#experiment-4-neuralsvd-on-an-explicit-table) · [exp5](#experiment-5-gpt-2-hidden-states-and-mlps-on-the-l_m-table)
 - [Python inference API](#python-inference-api) · [Tests](#tests)
 
 ## Project layout
@@ -459,6 +460,67 @@ RESULTS_ROOT=$(mktemp -d /tmp/lm-svd-exp4.XXXXXX)
 uv run exp4 inference --results-root "$RESULTS_ROOT" --batch-size 256 \
   --train-histories 128 --train-futures 32 --val-histories 64 --val-futures 16
 uv run exp4 train --results-root "$RESULTS_ROOT" --steps 400 --eval-every 200
+```
+
+## Experiment 5: GPT-2 hidden states and MLPs on the L_M table
+
+exp5 tests whether a network that reads only frozen GPT-2 hidden states can learn the modes of the exp1 table, with the right side producing every header column of a future in one pass.
+
+```text
+left:   history -> frozen GPT-2 -> hidden state at the last token -> 2-layer MLP -> (rank,)
+right:  future  -> frozen GPT-2 -> hidden state at the last token -> 2-layer MLP -> (top-k, rank)
+
+A[history, (future, j)] ≈ g(future, j) + left(history) · right(future)[j]
+```
+
+The hidden state is the final layer after `ln_f`. Each side passes through GPT-2 on its own; the networks never see `history + future`. Slot `j` of the right output is the future's `j`-th header token (descending future-only logit, as in exp1). The right MLP is not given the header token ids. Only the two MLPs are trained. Each is `LayerNorm → Linear → GELU → Linear`, and `--mlp-width` is the size of the middle layer.
+
+### The fixed first mode
+
+`g(future, j)` is the centered logit of header token `j` after the future alone. exp5 fixes the first mode to `1 × g` and trains the NestedLoRA loss on the rest, `A − g`. `g` comes from the same GPT-2 pass that gives the right network its input, so it is also available for futures the network has never seen. On the exp1 table (`wikitext`, GPT-2 Small, 512 × 25,600):
+
+| Removed from the table | Energy left | Share of the largest remaining mode | σ₁/σ₂, about |
+| --- | ---: | ---: | ---: |
+| nothing | 100% | 99.6% | 46 |
+| `g` (exp5) | 1.22% | 67% | 4 |
+| each column's mean over the histories | 0.42% | 11% | 1.2 |
+
+`g` and the column means correlate at 0.93. Their difference is still constant over the histories and remains as the first mode of what exp5 trains on.
+
+### Run
+
+exp5 needs the exp4 tables and a sample store that holds published blocks from the same model (see [Training sample generation and sampling](#training-sample-generation-and-sampling)). A producer may keep running during training.
+
+```bash
+uv run exp4 inference                                              # the evaluation tables
+uv run data-pipline sample-store produce --device cuda --worker-id 0   # in another terminal
+uv run exp5 train
+```
+
+Each step draws `--batch-size` (default 256) independent (history, future) pairs from the store. For each pair it takes the stored logits of `history + future` on the future's header tokens, centers them over the vocabulary and subtracts `g`. The loss uses those entries for its operator term and every history and column of the batch for its metric term. In expectation this is the loss of a full history × future grid, because the store draws histories and futures independently.
+
+Every `--eval-every` steps the learned features of both exp4 tables are compared with the exact SVD of that table minus `g`, in the same columns as exp4 (`sv_rel_err`, `left_overlap`, `right_overlap`, `energy`, `exact_energy`). The header tokens stored by exp4 are kept: a batched pass can order near-tied tokens differently, so exp5 only checks that they are among the model's top-k.
+
+Outputs under `<results-root>/exp5_gpt2_mlp_table/<dataset>__<model>/train/`: `eval_history.jsonl` (one line per evaluation with `train_loss`, `kernel_energy`, `seconds_per_step` and the `train` and `val` comparisons), `checkpoint.pt` (the MLPs only) and `metadata.json`, which also records how much energy `g` leaves in each table. `--dataset` and `--model-path` select the exp4 run to evaluate on; `--store-dir` selects the store. Rank, MLP width and learning rate are set with `--neigs`, `--mlp-width` and `--lr`.
+
+Things to keep in mind when reading the numbers:
+
+- **They are not comparable with exp4's.** exp5 is measured on the tables minus `g`; exp4's `train/` and `train-column-mean/` runs are measured on the stored tables and on the tables minus their column means. Compare each run's `energy` with its own `exact_energy`.
+- **Both tables are held out to the same degree.** Store pairs come from the whole training stream and are not excluded from the tables; a pair overlaps a validation window with a probability of about 0.1%. The `train` table is no longer "seen" data, it is just the larger table.
+- **A loss far below `−E[K²]` means the store is too small or too stale.** `kernel_energy` is `E[K²]`, and a fit of the table ends near `−E[K²]`. When the same pairs are drawn many times, the network can instead fit which history came with which future, and the loss drops well below that. Keep a producer running so the store is refreshed.
+- **A continued run draws other pairs.** Running `train` again continues from the checkpoint up to `--steps` (`--overwrite` starts over), but the store changes while producers run, so the pairs are not reproduced.
+
+On BlueHive, submit `bluehive_run/exp5-train.sbatch` after `exp4-inference.sbatch`, with `sample-store-produce.sbatch` running or its store already filled. Arguments after the script name are passed to the command.
+
+Small smoke run on CPU, after the commands above have produced the tables and at least one block:
+
+```bash
+RESULTS_ROOT=$(mktemp -d /tmp/lm-svd-exp5.XXXXXX)
+mkdir -p "$RESULTS_ROOT/exp4_table_neural_svd"
+ln -s "$PWD/data/experiment_results/exp4_table_neural_svd/wikitext-large__gpt2-small" \
+  "$RESULTS_ROOT/exp4_table_neural_svd/"
+uv run exp5 train --results-root "$RESULTS_ROOT" --device cpu \
+  --steps 20 --eval-every 10 --neigs 8 --mlp-width 64 --batch-size 16
 ```
 
 ## Training sample generation and sampling

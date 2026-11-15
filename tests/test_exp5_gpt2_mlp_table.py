@@ -22,6 +22,7 @@ from data_pipline.sample_store.store import slot_bytes
 from experiments.exp1_L_M_table.table import centered_logits, select_header_tokens
 from experiments.exp4_table_neural_svd.tables import build_exp4_tables
 from experiments.exp4_table_neural_svd.train import compare_with_exact_svd
+from experiments.exp5_gpt2_mlp_table.cli import main
 from experiments.exp5_gpt2_mlp_table.features import (
     future_only_logits,
     header_tokens,
@@ -438,6 +439,61 @@ class TrainingTests(Exp5Fixture):
         expected = self.inference.next_token_logits(h[0].tolist() + f[0].tolist())
         torch.testing.assert_close(logits[0], expected, rtol=0, atol=1e-6)
         self.assertNotEqual(sampler_seed(0, 0), sampler_seed(0, 2))
+
+
+class CLITests(Exp5Fixture):
+    def setUp(self):
+        # Place the fixture's tables where the CLI looks for exp4's output.
+        self.results_root = self.root / f"results-{self.id().rsplit('.', 1)[-1]}"
+        shutil.copytree(
+            self.inference_dir,
+            self.results_root / "exp4_table_neural_svd" / "tiny__model" / "inference",
+        )
+
+    def run_cli(self, *extra):
+        main([
+            "train", "--results-root", str(self.results_root), "--dataset", "tiny",
+            "--model-path", str(self.model_path), "--store-dir", str(self.store_dir),
+            "--device", "cpu", "--neigs", "2", "--mlp-width", "16", "--batch-size", "8",
+            "--steps", "2", "--eval-every", "2", *extra,
+        ])
+
+    def test_train_writes_under_the_exp5_run_directory(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.run_cli()
+        run = self.results_root / "exp5_gpt2_mlp_table" / "tiny__model" / "train"
+        self.assertTrue((run / "eval_history.jsonl").is_file())
+        self.assertIn(f"output_dir: {run}", output.getvalue())
+        self.assertIn("step: 2", output.getvalue())
+
+    def test_errors_are_reported_as_usage_errors(self):
+        for extra in (["--store-dir", str(self.root / "no-store")], ["--dataset", "missing"]):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    self.run_cli(*extra)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_defaults_match_the_design(self):
+        with patch("experiments.exp5_gpt2_mlp_table.train.train_exp5") as train:
+            train.return_value = {"output_dir": "x", "step": 0, "evaluations": 0}
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["train"])
+        options = train.call_args.kwargs
+        self.assertEqual(
+            {key: options[key] for key in (
+                "neigs", "mlp_width", "batch_size", "steps", "eval_every", "lr", "seed",
+                "device", "overwrite")},
+            {"neigs": 128, "mlp_width": 4096, "batch_size": 256, "steps": 100000,
+             "eval_every": 1000, "lr": 3e-4, "seed": 42, "device": "cuda",
+             "overwrite": False})
+        self.assertEqual(options["model_path"], Path("models/gpt2-small"))
+        self.assertEqual(
+            options["store_dir"],
+            Path("data/sample_stores/wikitext-103-train__gpt2-small__h64-f32"))
+        self.assertEqual(options["inference_dir"], Path(
+            "data/experiment_results/exp4_table_neural_svd/wikitext-large__gpt2-small/inference"))
+        self.assertEqual(options["output_dir"], Path(
+            "data/experiment_results/exp5_gpt2_mlp_table/wikitext-large__gpt2-small/train"))
 
 
 if __name__ == "__main__":
