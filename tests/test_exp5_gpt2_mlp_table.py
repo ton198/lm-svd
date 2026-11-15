@@ -22,6 +22,7 @@ from experiments.exp5_gpt2_mlp_table.features import (
     last_hidden,
     pair_targets,
 )
+from experiments.exp5_gpt2_mlp_table.loss import paired_loss
 from experiments.exp5_gpt2_mlp_table.model import Exp5Network, build_model
 from utils.common import Sample
 from utils.inference import CausalLMInference
@@ -157,6 +158,48 @@ class ModelTests(unittest.TestCase):
         self.assertIsInstance(model, NestedLoRA)
         self.assertFalse(model.sequential)
         self.assertEqual(model.neigs, 4)
+
+
+class PairedLossTests(unittest.TestCase):
+    def reference(self, model, left, right, target):
+        batch, top_k = target.shape
+        slots = right.reshape(batch, top_k, -1)
+        operator = -2 * (
+            target[:, :, None] * left[:, None, :] * slots * model.vector_mask
+        ).sum(-1).mean()
+        metric = (
+            model.matrix_mask * (left.T @ left / batch) * (right.T @ right / (batch * top_k))
+        ).sum()
+        return operator + metric
+
+    def check(self, batch, top_k, rank):
+        torch.manual_seed(0)
+        model = build_model(hidden_size=8, rank=rank, top_k=top_k, mlp_width=16).double()
+        left = torch.randn(batch, rank, dtype=torch.float64, requires_grad=True)
+        right = torch.randn(batch * top_k, rank, dtype=torch.float64, requires_grad=True)
+        target = torch.randn(batch, top_k, dtype=torch.float64)
+        loss = paired_loss(model, left, right, target)
+        expected = self.reference(model, left, right, target)
+        torch.testing.assert_close(loss, expected)
+        for got, want in zip(
+            torch.autograd.grad(loss, (left, right)),
+            torch.autograd.grad(expected, (left, right)),
+        ):
+            torch.testing.assert_close(got, want)
+            self.assertTrue(torch.isfinite(got).all())
+
+    def test_value_and_gradients_match_the_formula(self):
+        self.check(batch=5, top_k=3, rank=4)
+
+    def test_single_pair_batch_is_finite(self):
+        self.check(batch=1, top_k=3, rank=4)
+
+    def test_mismatched_shapes_are_rejected(self):
+        model = build_model(hidden_size=8, rank=4, top_k=3, mlp_width=16)
+        with self.assertRaises(ValueError):
+            paired_loss(model, torch.zeros(2, 4), torch.zeros(5, 4), torch.zeros(2, 3))
+        with self.assertRaises(ValueError):
+            paired_loss(model, torch.zeros(3, 4), torch.zeros(6, 4), torch.zeros(2, 3))
 
 
 if __name__ == "__main__":
