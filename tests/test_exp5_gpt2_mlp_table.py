@@ -1,8 +1,11 @@
+import contextlib
+import io
 import json
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pyarrow as pa
@@ -13,6 +16,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
+from data_pipline.sample_store import SampleSampler
 from data_pipline.sample_store.producer import produce_blocks
 from data_pipline.sample_store.store import slot_bytes
 from experiments.exp1_L_M_table.table import centered_logits, select_header_tokens
@@ -27,13 +31,23 @@ from experiments.exp5_gpt2_mlp_table.features import (
 from experiments.exp5_gpt2_mlp_table.loss import paired_loss
 from experiments.exp5_gpt2_mlp_table.model import Exp5Network, build_model
 from experiments.exp5_gpt2_mlp_table.tables import eval_features, load_eval_table
+from experiments.exp5_gpt2_mlp_table.train import (
+    check_store,
+    draw_pairs,
+    sampler_seed,
+    train_exp5,
+)
 from utils.common import Sample
 from utils.inference import CausalLMInference
 from utils.nestedlora import NestedLoRA
 
 VOCAB, HISTORY_TOKENS, FUTURE_TOKENS, TOP_K = 17, 3, 2, 3
-HISTORIES = [[row, (row + 1) % VOCAB, (row + 4) % VOCAB] for row in range(6)]
-FUTURES = [[(row + 2) % VOCAB, (row + 5) % VOCAB] for row in range(5)]
+# The store's token stream is 7 * i mod VOCAB, so its windows are arithmetic runs with
+# step 7. The table rows and columns are such windows too: the tables are sub-grids of
+# the 17 x 17 grid of windows the store's pairs come from.
+STREAM_STEP = 7
+HISTORIES = [[(row + STREAM_STEP * i) % VOCAB for i in range(HISTORY_TOKENS)] for row in range(6)]
+FUTURES = [[(row + 2 + STREAM_STEP * i) % VOCAB for i in range(FUTURE_TOKENS)] for row in range(5)]
 
 
 class Exp5Fixture(unittest.TestCase):
@@ -67,26 +81,30 @@ class Exp5Fixture(unittest.TestCase):
             "token_ids": pa.array(windows, type=pa.list_(pa.int32())),
         }), samples_path)
         cls.inference_dir = cls.root / "inference"
-        build_exp4_tables(
-            samples_path=samples_path, model_path=cls.model_path, device="cpu",
-            train_histories=4, train_futures=3, val_histories=2, val_futures=2,
-            top_k=TOP_K, batch_size=2, output_dir=cls.inference_dir, overwrite=False,
-        )
-        # Sample store: 6 blocks of 4 pairs.
+        with contextlib.redirect_stdout(io.StringIO()):  # the builder's progress lines
+            build_exp4_tables(
+                samples_path=samples_path, model_path=cls.model_path, device="cpu",
+                train_histories=4, train_futures=3, val_histories=2, val_futures=2,
+                top_k=TOP_K, batch_size=2, output_dir=cls.inference_dir, overwrite=False,
+            )
+        # Sample store: 100 blocks of 16 pairs, several pairs per cell of the window grid.
+        # With few pairs a network can fit which history came with which future instead.
         stream_path = cls.root / "stream.npy"
-        np.save(stream_path, (np.arange(200, dtype=np.uint16) * 7) % VOCAB)
+        np.save(stream_path, (np.arange(200, dtype=np.uint16) * STREAM_STEP) % VOCAB)
         stream_path.with_suffix(".json").write_text(json.dumps({
             "vocab_size": VOCAB, "config": "tiny", "split": "train",
             "tokenizer_path": str(cls.model_path),
         }))
         cls.store_dir = cls.root / "store"
-        produce_blocks(
-            store_dir=cls.store_dir, model_path=cls.model_path, stream_path=stream_path,
-            device="cpu", history_tokens=HISTORY_TOKENS, future_tokens=FUTURE_TOKENS,
-            samples_per_block=4,
-            max_bytes=8 * slot_bytes(4, HISTORY_TOKENS, FUTURE_TOKENS, VOCAB),
-            worker_id=0, seed=0, batch_size=2, max_blocks=6, log_every=100, overwrite=False,
-        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            produce_blocks(
+                store_dir=cls.store_dir, model_path=cls.model_path, stream_path=stream_path,
+                device="cpu", history_tokens=HISTORY_TOKENS, future_tokens=FUTURE_TOKENS,
+                samples_per_block=16,
+                max_bytes=100 * slot_bytes(16, HISTORY_TOKENS, FUTURE_TOKENS, VOCAB),
+                worker_id=0, seed=0, batch_size=16, max_blocks=100, log_every=1000,
+                overwrite=False,
+            )
 
 
 class FeatureTests(Exp5Fixture):
@@ -288,6 +306,138 @@ class EvalTableTests(Exp5Fixture):
         # exp4's comparison accepts the result unchanged.
         comparison = compare_with_exact_svd(left, right, loaded.table)
         self.assertEqual(comparison["ranks"], [1, 2, 4])
+
+
+class TrainingTests(Exp5Fixture):
+    def train(self, output_dir, **changes):
+        options = dict(
+            inference_dir=self.inference_dir, store_dir=self.store_dir,
+            model_path=self.model_path, output_dir=output_dir, device="cpu", neigs=2,
+            mlp_width=16, batch_size=8, steps=4, eval_every=2, lr=1e-2, seed=0,
+            overwrite=False,
+        )
+        options.update(changes)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return train_exp5(**options)
+
+    def records(self, output_dir):
+        lines = (output_dir / "eval_history.jsonl").read_text().splitlines()
+        return [json.loads(line) for line in lines]
+
+    def test_writes_outputs_and_compares_both_tables(self):
+        output = self.root / "run-outputs"
+        summary = self.train(output)
+        self.assertEqual(summary, {"output_dir": str(output), "step": 4, "evaluations": 2})
+        records = self.records(output)
+        self.assertEqual([record["step"] for record in records], [2, 4])
+        for record in records:
+            self.assertEqual(set(record), {
+                "step", "train_loss", "kernel_energy", "seconds_per_step", "train", "val"})
+            self.assertEqual(record["train"]["ranks"], [1, 2])
+            self.assertTrue(np.isfinite(record["train_loss"]))
+        metadata = json.loads((output / "metadata.json").read_text())
+        self.assertEqual(metadata["top_k"], TOP_K)
+        self.assertEqual(metadata["mlp_width"], 16)
+        self.assertEqual(metadata["table_shapes"], {"train": [4, 9], "val": [2, 6]})
+        self.assertEqual(
+            set(metadata["tables"]["val"]), {"residual_energy", "residual_top_mode"})
+        self.assertIn("0.1%", metadata["isolation"])
+        self.assertEqual(metadata["store"]["history_tokens"], HISTORY_TOKENS)
+
+    def test_only_the_mlps_are_trained_and_saved(self):
+        output = self.root / "run-frozen"
+        self.train(output)
+        checkpoint = torch.load(output / "checkpoint.pt", weights_only=True)
+        self.assertTrue(all(
+            key.startswith(("model.left.", "model.right."))
+            for key in checkpoint["model_state_dict"]))
+        metadata = json.loads((output / "metadata.json").read_text())
+        network = Exp5Network(hidden_size=8, rank=2, top_k=TOP_K, mlp_width=16)
+        self.assertEqual(
+            metadata["trainable_parameters"], sum(p.numel() for p in network.parameters()))
+
+    def test_training_recovers_the_leading_mode_of_both_tables(self):
+        output = self.root / "run-learns"
+        self.train(output, steps=300, eval_every=100, batch_size=16)
+        records = self.records(output)
+        # An untrained network scores at or below zero; the exact value is 1.
+        for name in ("train", "val"):
+            self.assertGreater(records[-1][name]["captured_energy"][0], 0.5)
+        self.assertLess(records[-1]["train_loss"], records[0]["train_loss"])
+        # A fit of the table itself ends near -E[K^2]; far below it means the
+        # network fits which history came with which future.
+        self.assertGreater(records[-1]["train_loss"], -1.5 * records[-1]["kernel_energy"])
+
+    def test_resume_and_step_edge_cases(self):
+        output = self.root / "run-resume"
+        self.train(output, steps=2)
+        self.assertEqual(self.train(output, steps=4)["evaluations"], 2)  # continues from 2
+        self.assertEqual(
+            self.train(output, steps=4), {"output_dir": str(output), "step": 4, "evaluations": 2})
+        self.assertEqual(self.train(output, steps=3)["step"], 4)  # not above the checkpoint
+        self.assertEqual([record["step"] for record in self.records(output)], [2, 4])
+        with self.assertRaisesRegex(ValueError, "--overwrite"):
+            self.train(output, steps=6, lr=1e-3)
+        self.assertEqual(self.train(output, steps=2, lr=1e-3, overwrite=True)["step"], 2)
+        late = self.root / "run-late-eval"
+        self.assertEqual(self.train(late, steps=3, eval_every=10)["evaluations"], 1)
+
+    def test_rejects_missing_tables_and_a_negative_seed(self):
+        with self.assertRaisesRegex(ValueError, "exp4 inference"):
+            self.train(self.root / "run-none", inference_dir=self.root / "absent")
+        with self.assertRaises(ValueError):
+            self.train(self.root / "run-seed", seed=-1)
+
+    def store_config(self):
+        return json.loads((self.store_dir / "store.json").read_text())
+
+    def check(self, config):
+        check_store(
+            config, self.model_path, history_tokens=HISTORY_TOKENS,
+            future_tokens=FUTURE_TOKENS, vocab_size=VOCAB)
+
+    def test_rejects_a_store_with_other_window_lengths_or_vocabulary(self):
+        self.check(self.store_config())
+        for key in ("history_tokens", "future_tokens", "vocab_size"):
+            with self.subTest(key=key):
+                config = self.store_config()
+                config[key] += 1
+                with self.assertRaisesRegex(ValueError, key):
+                    self.check(config)
+
+    def test_rejects_a_store_from_other_model_files(self):
+        config = self.store_config()
+        name = next(iter(config["model_files"]))
+        config["model_files"][name]["size"] += 1
+        with self.assertRaisesRegex(ValueError, "model"):
+            self.check(config)
+        # A different modification time alone is accepted.
+        config = self.store_config()
+        config["model_files"][name]["mtime_ns"] += 1
+        self.check(config)
+
+    def test_a_mismatched_store_stops_training(self):
+        store = self.root / "store-other-model"
+        shutil.copytree(self.store_dir, store)
+        config = self.store_config()
+        config["model_files"][next(iter(config["model_files"]))]["size"] += 1
+        (store / "store.json").write_text(json.dumps(config))
+        with self.assertRaisesRegex(ValueError, "model"):
+            self.train(self.root / "run-other-model", store_dir=store)
+
+    def test_waits_for_the_first_block(self):
+        with patch.object(SampleSampler, "wait_until_ready", autospec=True) as wait:
+            self.train(self.root / "run-wait")
+        wait.assert_called_once()
+
+    def test_draw_pairs_stacks_store_samples(self):
+        h, f, logits = draw_pairs(SampleSampler(self.store_dir, seed=3), 5)
+        self.assertEqual(
+            (h.shape, f.shape, logits.shape),
+            ((5, HISTORY_TOKENS), (5, FUTURE_TOKENS), (5, VOCAB)))
+        expected = self.inference.next_token_logits(h[0].tolist() + f[0].tolist())
+        torch.testing.assert_close(logits[0], expected, rtol=0, atol=1e-6)
+        self.assertNotEqual(sampler_seed(0, 0), sampler_seed(0, 2))
 
 
 if __name__ == "__main__":
