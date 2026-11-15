@@ -9,13 +9,14 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp1` | Centered next-token logit for a future-specific header token | histories × (futures × top-k) | `matrix.npy` |
 | `exp2` | No-BOS pointwise mutual information of history and future | histories × futures | `pmi.npy` |
 | `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
+| `exp4` | Same entry as `exp1`, in a training table and a disjoint validation table | histories × (futures × top-k), twice | `train/matrix.npy`, `val/matrix.npy` |
 
-Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU.
+Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead runs `inference` → `train`: it builds two tables with their exact SVDs, trains NeuralSVD on the training table, and compares the learned modes with both exact SVDs during training.
 
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
-- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs)
+- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs) · [exp4](#experiment-4-neuralsvd-on-an-explicit-table)
 - [Python inference API](#python-inference-api) · [Tests](#tests)
 
 ## Project layout
@@ -413,6 +414,48 @@ Other useful options:
 - `inference --device cpu`: use CPU instead of the default CUDA device.
 
 Use `uv run exp1 <subcommand> --help`, `uv run exp2 <subcommand> --help`, or `uv run exp3 <subcommand> --help` for available options. Module entry points also work: `uv run python -m experiments.exp1_L_M_table <subcommand>`, `uv run python -m experiments.exp2_PFH <subcommand>`, and `uv run python -m experiments.exp3_L_M_diff <subcommand>`.
+
+## Experiment 4: NeuralSVD on an explicit table
+
+exp4 tests whether NeuralSVD training can fit one explicit table, and whether what it learns carries over to a second table it never sees. Both tables use the exp1 entry and the exp1 column layout (top-k header tokens per future). Their exact SVDs are computed first and serve as the reference.
+
+```bash
+uv run exp4 inference   # build both tables and their exact SVDs
+uv run exp4 train       # train on the training table, compare every 1000 steps
+```
+
+**`inference`** reads `wikitext-large` by default. The training table takes the first 2048 histories and 1024 futures; the validation table takes the next 1024 histories and 512 futures, so the two tables share no history and no future. With top-k 50 the shapes are `2048 × 51200` and `1024 × 25600`, which costs about 2.6 million language-model forward passes. The SVD is a float64 thin SVD of the stored matrix with no secondary centering. Outputs under `<results-root>/exp4_table_neural_svd/<dataset>__<model>/inference/`:
+
+| File | Content |
+| --- | --- |
+| `{train,val}/matrix.npy` | The table, float32 |
+| `{train,val}/tokens.npz` | `histories`, `futures`, `header_token_ids`, and the sample IDs of both |
+| `{train,val}/svd.npz` | All singular values `S`, and the leading 256 singular vectors `U`, `Vt` |
+| `metadata.json` | Settings and table shapes; written last, so it marks a finished build |
+
+**`train`** uses the `svd_inference` network (`get_nested_lora_network`). Each step draws 32 distinct rows and 512 distinct columns of the training table and feeds the full `32 × 512` sub-table between them to the NestedLoRA loss. Every 1000 steps it evaluates the learned features of every row and column of both tables against that table's exact SVD, for ranks 1, 2, 4, …, 128:
+
+| Printed column | Meaning |
+| --- | --- |
+| `sv_rel_err` | Learned singular value of mode `rank` over the exact one, minus 1. The learned value is the product of that mode's left and right feature norms. |
+| `left_overlap`, `right_overlap` | `‖U_kᵀ Q_k‖²_F / k`, where `Q_k` is an orthonormal basis of the first `k` learned features. 1 means the same subspace; a random subspace scores about `k / rows` (or `k / columns`). |
+| `energy` | `1 − ‖A − L_k R_kᵀ‖² / ‖A‖²` for the first `k` learned modes |
+| `exact_energy` | The same quantity for the exact rank-`k` truncation, which is the upper bound of `energy` |
+
+The first mode holds almost all of the energy, so compare `energy` with `exact_energy` rather than with 1.
+
+Outputs under `.../train/`: `eval_history.jsonl` (one line per evaluation, with the `train` and `val` comparisons), `checkpoint.pt` and `metadata.json`. Running `train` again with the same settings continues from the checkpoint up to `--steps`; `--overwrite` starts over. Batch sizes, rank and learning rate are set with `--history-batch`, `--column-batch`, `--neigs` and `--lr`.
+
+On BlueHive, submit `bluehive_run/exp4-inference.sbatch`, then `bluehive_run/exp4-train.sbatch`. Arguments after the script name are passed to the command.
+
+Small smoke run:
+
+```bash
+RESULTS_ROOT=$(mktemp -d /tmp/lm-svd-exp4.XXXXXX)
+uv run exp4 inference --results-root "$RESULTS_ROOT" --batch-size 256 \
+  --train-histories 128 --train-futures 32 --val-histories 64 --val-futures 16
+uv run exp4 train --results-root "$RESULTS_ROOT" --steps 400 --eval-every 200
+```
 
 ## Training sample generation and sampling
 
