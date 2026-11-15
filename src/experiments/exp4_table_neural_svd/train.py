@@ -4,6 +4,10 @@ Every step draws random rows and random columns of the training table and
 feeds the full sub-table between them to the NestedLoRA loss. At each
 evaluation the learned features of every row and column of both tables are
 compared with that table's exact SVD.
+
+With table switching the steps instead draw from a fresh table that is
+replaced every few steps (see fresh_tables.py); the two stored tables are then
+only compared against.
 """
 
 from __future__ import annotations
@@ -30,9 +34,22 @@ class Table:
     histories: torch.Tensor  # (N, H) int64
     columns: torch.Tensor  # (C, F + 1) int64: a future followed by one header token
     matrix: torch.Tensor  # (N, C) float32
-    singular_values: torch.Tensor  # (min(N, C),) float64, descending
-    left_vectors: torch.Tensor  # (N, R) float64
-    right_vectors: torch.Tensor  # (C, R) float64
+    # The exact SVD; None for a table that is only trained on.
+    singular_values: torch.Tensor | None = None  # (min(N, C),) float64, descending
+    left_vectors: torch.Tensor | None = None  # (N, R) float64
+    right_vectors: torch.Tensor | None = None  # (C, R) float64
+
+
+@dataclass(frozen=True)
+class TableSwitching:
+    """Train on a fresh table of this size for every `steps_per_table` steps."""
+
+    samples_path: Path
+    model_path: Path
+    steps_per_table: int
+    histories: int
+    futures: int
+    batch_size: int  # sequences per language-model forward pass
 
 
 def table_columns(futures: torch.Tensor, header_token_ids: torch.Tensor) -> torch.Tensor:
@@ -41,6 +58,11 @@ def table_columns(futures: torch.Tensor, header_token_ids: torch.Tensor) -> torc
     return torch.cat(
         (futures[:, None, :].expand(-1, top_k, -1), header_token_ids[:, :, None]), dim=-1
     ).flatten(0, 1)
+
+
+def center_columns(matrix: np.ndarray) -> np.ndarray:
+    """Subtract from every column its mean over the rows."""
+    return (matrix - matrix.mean(axis=0, dtype=np.float64)).astype(np.float32)
 
 
 def load_table(
@@ -61,7 +83,7 @@ def load_table(
         saved = np.load(table_dir / "svd.npz")
         singular_values, left, right_t = saved["S"], saved["U"], saved["Vt"]
     else:
-        matrix = (matrix - matrix.mean(axis=0, dtype=np.float64)).astype(np.float32)
+        matrix = center_columns(matrix)
         svd = matrix_svd(matrix, device=device)
         singular_values, left, right_t = svd.S, svd.U[:, :SVD_RANK], svd.Vt[:SVD_RANK]
     return Table(
@@ -198,22 +220,42 @@ def train_exp4(
     centering: str = "none",
     eval_chunk: int = 2048,
     model: NestedLoRA | None = None,
+    switching: TableSwitching | None = None,
 ) -> dict:
     """Train on the training table; every eval_every steps compare both tables.
 
     Writes checkpoint.pt, eval_history.jsonl (one line per evaluation) and
     metadata.json to output_dir. An existing checkpoint with the same settings
     is continued up to `steps`; pass overwrite to start again. `centering`
-    is applied to both tables before training and comparison, see load_table.
+    is applied to every table before training and comparison, see load_table.
     `model` replaces the default svd_inference network.
+
+    With `switching` the steps draw from fresh tables instead of the stored
+    training table, and each evaluation records the current table's index. The
+    stored training table is still compared against; its histories and futures
+    can appear in the fresh tables, the validation table's cannot.
     """
     if not (inference_dir / "metadata.json").is_file():
         raise ValueError(f"no finished tables in {inference_dir}; run exp4 inference first")
     tables = {
         name: load_table(inference_dir / name, device, centering) for name in TABLE_NAMES
     }
-    train = tables["train"]
-    rows, columns = train.matrix.shape
+    fresh = None
+    if switching is None:
+        train = tables["train"]
+        rows, columns = train.matrix.shape
+    else:
+        # Loaded before the seed is set, so it cannot change the network's initial weights.
+        from .fresh_tables import FreshTables
+
+        fresh = FreshTables(
+            samples_path=switching.samples_path, model_path=switching.model_path,
+            inference_dir=inference_dir, device=device, histories=switching.histories,
+            futures=switching.futures, batch_size=switching.batch_size, seed=seed,
+            centering=centering,
+        )
+        train = None
+        rows, columns = switching.histories, switching.futures * fresh.top_k
     if history_batch > rows or column_batch > columns:
         raise ValueError(
             f"batch {history_batch} x {column_batch} exceeds the training table {rows} x {columns}"
@@ -224,6 +266,15 @@ def train_exp4(
         "column_batch": column_batch, "lr": lr, "seed": seed, "optimizer": "Adam",
         "centering": centering,
     }
+    if switching is not None:
+        # Added only here, so checkpoints of single-table runs keep matching.
+        config["switching"] = {
+            "samples_path": str(switching.samples_path),
+            "model_path": str(switching.model_path),
+            "steps_per_table": switching.steps_per_table,
+            "histories": switching.histories,
+            "futures": switching.futures,
+        }
     checkpoint_path = output_dir / "checkpoint.pt"
     history_path = output_dir / "eval_history.jsonl"
     if overwrite:
@@ -261,7 +312,9 @@ def train_exp4(
     write_atomic(output_dir / "metadata.json", lambda tmp: save_json(tmp, {
         **config,
         "device": device,
-        "sampling": "random distinct rows x random distinct columns of the training table",
+        "sampling": "random distinct rows x random distinct columns of the training table"
+        if switching is None else
+        "random distinct rows x random distinct columns of the current fresh table",
         "ranks": list(RANKS),
         "table_shapes": {name: list(table.matrix.shape) for name, table in tables.items()},
         "trainable_parameters": sum(
@@ -270,14 +323,21 @@ def train_exp4(
     }))
     print(
         f"Training on {device}: {rows} x {columns} table, "
-        f"{history_batch} x {column_batch} sub-table per step",
+        f"{history_batch} x {column_batch} sub-table per step"
+        + ("" if switching is None else f", a fresh table every {switching.steps_per_table} steps"),
         flush=True,
     )
 
     loss_sum = energy_sum = 0.0
     window = 0
+    table_index = None
     started = time.perf_counter()
     while step < steps:
+        if fresh is not None and step // switching.steps_per_table != table_index:
+            table_index = step // switching.steps_per_table
+            train = None  # release the previous table before the next one is built
+            print(f"Building training table {table_index} before step {step + 1}", flush=True)
+            train = fresh.build(table_index)
         model.train()
         h, column_tokens, kernel = sample_subtable(train, history_batch, column_batch, generator)
         optimizer.zero_grad()
@@ -299,6 +359,8 @@ def train_exp4(
                 "train_loss": loss_sum / window,
                 "kernel_energy": energy_sum / window,
             }
+            if table_index is not None:
+                record["table_index"] = table_index
             lines = [
                 f"step {step}: loss {record['train_loss']:.4f}  "
                 f"E[K^2] {record['kernel_energy']:.4f}  "

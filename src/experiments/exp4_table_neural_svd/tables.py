@@ -26,7 +26,7 @@ from . import SVD_RANK, TABLE_NAMES
 _TABLE_FILES = ("matrix.npy", "tokens.npz", "svd.npz")
 
 
-def _token_tensor(samples: list[Sample], group: str) -> torch.Tensor:
+def token_tensor(samples: list[Sample], group: str) -> torch.Tensor:
     lengths = sorted({len(sample.token_ids) for sample in samples})
     if len(lengths) != 1:
         raise ValueError(
@@ -79,7 +79,7 @@ def build_exp4_tables(
         "val": (histories[train_histories:], futures[train_futures:]),
     }
     token_tensors = {
-        name: (_token_tensor(rows, "history"), _token_tensor(columns, "future"))
+        name: (token_tensor(rows, "history"), token_tensor(columns, "future"))
         for name, (rows, columns) in splits.items()
     }
     inference = CausalLMInference(model_path, device)

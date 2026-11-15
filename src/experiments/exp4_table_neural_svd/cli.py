@@ -61,6 +61,23 @@ def main(argv: list[str] | None = None) -> None:
         help="column-mean subtracts each column's mean over the table's histories, "
              "which removes the leading mode; results go to train-column-mean/",
     )
+    train_parser.add_argument(
+        "--switch-every", type=positive_int, default=None, metavar="STEPS",
+        help="Train on a fresh table for every STEPS steps instead of on the stored "
+             "training table; the tables avoid the validation table's samples",
+    )
+    train_parser.add_argument(
+        "--table-histories", type=positive_int, default=512,
+        help="Histories per fresh table, with --switch-every",
+    )
+    train_parser.add_argument(
+        "--table-futures", type=positive_int, default=256,
+        help="Futures per fresh table, with --switch-every",
+    )
+    train_parser.add_argument(
+        "--batch-size", type=positive_int, default=1024,
+        help="Sequences per language-model forward pass, with --switch-every",
+    )
     for subparser in (inference_parser, train_parser):
         add_run_arguments(subparser)
         # 3072 histories and 1536 futures need more than the 512 + 512 default set.
@@ -72,13 +89,26 @@ def main(argv: list[str] | None = None) -> None:
     try:
         result_dir = run_dir(args.results_root, EXPERIMENT, args.dataset, args.model_path.name)
         if args.command == "train":
-            from .train import train_exp4
+            from .train import TableSwitching, train_exp4
 
+            name = TRAIN_DIR if args.centering == "none" else f"{TRAIN_DIR}-{args.centering}"
+            switching = None
+            if args.switch_every is not None:
+                switching = TableSwitching(
+                    samples_path=dataset_samples_path(args.dataset),
+                    model_path=args.model_path,
+                    steps_per_table=args.switch_every,
+                    histories=args.table_histories,
+                    futures=args.table_futures,
+                    batch_size=args.batch_size,
+                )
+                name += (
+                    f"-switch-{args.table_histories}x{args.table_futures}"
+                    f"-every{args.switch_every}"
+                )
             summary = train_exp4(
                 inference_dir=result_dir / INFERENCE_DIR,
-                output_dir=result_dir / (
-                    TRAIN_DIR if args.centering == "none" else f"{TRAIN_DIR}-{args.centering}"
-                ),
+                output_dir=result_dir / name,
                 device=args.device,
                 neigs=args.neigs,
                 history_batch=args.history_batch,
@@ -89,6 +119,7 @@ def main(argv: list[str] | None = None) -> None:
                 seed=args.seed,
                 overwrite=args.overwrite,
                 centering=args.centering,
+                switching=switching,
             )
             print(
                 f"output_dir: {summary['output_dir']}\n"

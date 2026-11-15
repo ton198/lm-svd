@@ -10,10 +10,12 @@ import torch
 from torch import nn
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from experiments.exp1_L_M_table.table import build_matrix
+from experiments.exp1_L_M_table.table import build_matrix, select_header_tokens
+from experiments.exp4_table_neural_svd.fresh_tables import FreshTables
 from experiments.exp4_table_neural_svd.tables import build_exp4_tables
 from experiments.exp4_table_neural_svd.train import (
     Table,
+    TableSwitching,
     compare_with_exact_svd,
     load_table,
     sample_subtable,
@@ -386,6 +388,136 @@ class TrainingTests(Exp4Fixture):
                 self.assertEqual(right.shape, (2 * TOP_K, 2))
                 torch.testing.assert_close(left, expected_left.double())
                 torch.testing.assert_close(right[:2], expected_right.double())
+
+
+class TableSwitchingTests(Exp4Fixture):
+    """The validation table holds histories 4-5 and futures 3-4; the rest is the pool."""
+
+    def setUp(self):
+        self.addCleanup(torch.set_rng_state, torch.get_rng_state())
+        self.addCleanup(torch.set_num_threads, torch.get_num_threads())
+        torch.set_num_threads(1)
+
+    def fresh(self, **changes) -> FreshTables:
+        options = dict(
+            samples_path=self.samples_path, model_path=self.model_path,
+            inference_dir=self.inference_dir, device="cpu", histories=3, futures=2,
+            batch_size=2, seed=5,
+        )
+        options.update(changes)
+        return FreshTables(**options)
+
+    def train(self, output_dir: Path, **changes) -> dict:
+        options = dict(
+            inference_dir=self.inference_dir, output_dir=output_dir, device="cpu", neigs=2,
+            history_batch=3, column_batch=5, steps=4, eval_every=2, lr=0.01, seed=5,
+            overwrite=False, model=NestedLoRA(_BagSingularNetwork(2), neigs=2),
+            switching=self.switching(),
+        )
+        options.update(changes)
+        return train_exp4(**options)
+
+    def switching(self, **changes) -> TableSwitching:
+        options = dict(
+            samples_path=self.samples_path, model_path=self.model_path, steps_per_table=3,
+            histories=3, futures=2, batch_size=2,
+        )
+        options.update(changes)
+        return TableSwitching(**options)
+
+    def test_fresh_tables_draw_from_outside_the_validation_table(self):
+        fresh = self.fresh()
+        inference = CausalLMInference(self.model_path, "cpu")
+        drawn = set()
+        for index in range(6):
+            table = fresh.build(index)
+            histories = table.histories.tolist()
+            futures = table.columns[::TOP_K, :-1].tolist()
+            self.assertEqual(len({tuple(row) for row in histories}), 3)
+            self.assertEqual(len({tuple(row) for row in futures}), 2)
+            for row in histories:
+                self.assertIn(row, HISTORIES[:4])
+            for row in futures:
+                self.assertIn(row, FUTURES[:3])
+            samples = [Sample(position, row) for position, row in enumerate(futures)]
+            header_token_ids, _ = select_header_tokens(inference, samples, TOP_K)
+            expected = build_matrix(
+                inference,
+                [Sample(position, row) for position, row in enumerate(histories)],
+                samples, header_token_ids,
+            )
+            np.testing.assert_allclose(table.matrix.numpy(), expected, rtol=0, atol=1e-5)
+            torch.testing.assert_close(
+                table.columns,
+                table_columns(torch.tensor(futures), torch.from_numpy(header_token_ids).long()),
+            )
+            drawn.add((tuple(map(tuple, histories)), tuple(map(tuple, futures))))
+        self.assertGreater(len(drawn), 1)
+
+    def test_a_table_index_always_gives_the_same_table(self):
+        first, again = self.fresh().build(3), self.fresh().build(3)
+        torch.testing.assert_close(first.histories, again.histories)
+        torch.testing.assert_close(first.columns, again.columns)
+        torch.testing.assert_close(first.matrix, again.matrix)
+
+    def test_fresh_tables_can_lose_their_column_means(self):
+        raw = self.fresh().build(1)
+        centered = self.fresh(centering="column-mean").build(1)
+        torch.testing.assert_close(centered.histories, raw.histories)
+        torch.testing.assert_close(
+            centered.matrix, raw.matrix - raw.matrix.mean(dim=0), rtol=0, atol=1e-6
+        )
+
+    def test_a_table_cannot_exceed_the_pool(self):
+        with self.assertRaisesRegex(ValueError, "5 history samples per table but only 4"):
+            self.fresh(histories=5)
+        with self.assertRaisesRegex(ValueError, "4 future samples per table but only 3"):
+            self.fresh(futures=4)
+
+    def test_training_moves_to_a_fresh_table_and_resumes_inside_one(self):
+        output_dir = self.root / "switch-run"
+        torch.manual_seed(0)
+        summary = self.train(output_dir)
+        self.assertEqual(summary, {"output_dir": str(output_dir), "step": 4, "evaluations": 2})
+        metadata = json.loads((output_dir / "metadata.json").read_text())
+        self.assertEqual(metadata["switching"]["steps_per_table"], 3)
+
+        # Step 4 is the first step on table 1, so the resumed run rebuilds that table.
+        self.train(output_dir, steps=8)
+        torch.manual_seed(0)
+        straight_dir = self.root / "switch-straight"
+        self.train(straight_dir, steps=8)
+        records = lambda path: [
+            json.loads(line) for line in (path / "eval_history.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual([record["step"] for record in records(output_dir)], [2, 4, 6, 8])
+        self.assertEqual([record["table_index"] for record in records(output_dir)], [0, 1, 1, 2])
+        for name in ("train", "val"):
+            np.testing.assert_allclose(
+                records(output_dir)[-1][name]["singular_values"],
+                records(straight_dir)[-1][name]["singular_values"], rtol=1e-5,
+            )
+
+        with self.assertRaisesRegex(ValueError, "--overwrite"):
+            self.train(output_dir, switching=self.switching(steps_per_table=2))
+
+    def test_switching_changes_what_the_model_learns(self):
+        torch.manual_seed(0)
+        self.train(self.root / "switch-a", steps=6, eval_every=6)
+        torch.manual_seed(0)
+        self.train(self.root / "switch-b", steps=6, eval_every=6, switching=None)
+        last = lambda name: json.loads(
+            (self.root / name / "eval_history.jsonl").read_text().splitlines()[-1]
+        )
+        self.assertNotIn("table_index", last("switch-b"))
+        self.assertFalse(np.allclose(
+            last("switch-a")["val"]["singular_values"],
+            last("switch-b")["val"]["singular_values"], rtol=1e-6,
+        ))
+
+    def test_batches_must_fit_the_fresh_table(self):
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            self.train(self.root / "switch-big", column_batch=7)
 
 
 if __name__ == "__main__":
