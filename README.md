@@ -446,6 +446,8 @@ The first mode holds almost all of the energy, so compare `energy` with `exact_e
 
 Outputs under `.../train/`: `eval_history.jsonl` (one line per evaluation, with the `train` and `val` comparisons), `checkpoint.pt` and `metadata.json`. Running `train` again with the same settings continues from the checkpoint up to `--steps`; `--overwrite` starts over. Batch sizes, rank and learning rate are set with `--history-batch`, `--column-batch`, `--neigs` and `--lr`.
 
+`train --centering column-mean` subtracts from every column its mean over the table's own histories, in both tables, and recomputes their exact SVDs before training. The leading mode of the stored table is close to a constant over histories times the column means and holds over 99% of the energy; this option removes it so that training and the comparison cover the modes after it. Results go to `.../train-column-mean/`, next to the uncentered run. The validation table is centered with its own column means, which a model would not have for new futures, so this option is a diagnostic rather than a deployable target.
+
 On BlueHive, submit `bluehive_run/exp4-inference.sbatch`, then `bluehive_run/exp4-train.sbatch`. Arguments after the script name are passed to the command.
 
 Small smoke run:

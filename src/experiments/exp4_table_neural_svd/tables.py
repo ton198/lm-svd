@@ -21,10 +21,8 @@ from utils.inference import CausalLMInference
 from utils.linalg import matrix_svd
 from utils.lm_table import read_source_metadata
 
-from . import TABLE_NAMES
+from . import SVD_RANK, TABLE_NAMES
 
-# Leading singular vectors kept per table; training compares at most this many modes.
-SVD_RANK = 256
 _TABLE_FILES = ("matrix.npy", "tokens.npz", "svd.npz")
 
 

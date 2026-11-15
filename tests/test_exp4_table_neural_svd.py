@@ -330,6 +330,45 @@ class TrainingTests(Exp4Fixture):
         restarted = self.train(output_dir, lr=0.02, overwrite=True)
         self.assertEqual(restarted["evaluations"], 2)
 
+    def test_column_mean_centering_removes_each_column_mean_and_refits_the_svd(self):
+        raw = load_table(self.inference_dir / "train", "cpu")
+        centered = load_table(self.inference_dir / "train", "cpu", "column-mean")
+        torch.testing.assert_close(
+            centered.matrix, raw.matrix - raw.matrix.mean(dim=0), rtol=0, atol=1e-6
+        )
+        torch.testing.assert_close(
+            centered.matrix.mean(dim=0), torch.zeros(3 * TOP_K), rtol=0, atol=1e-6
+        )
+        torch.testing.assert_close(centered.histories, raw.histories)
+        torch.testing.assert_close(centered.columns, raw.columns)
+        # Centering removes one direction, so the last singular value vanishes.
+        self.assertEqual(centered.singular_values.shape, (4,))
+        self.assertLess(centered.singular_values[-1].item(), 1e-4)
+        self.assertLess(centered.singular_values[0].item(), raw.singular_values[0].item())
+        torch.testing.assert_close(
+            (centered.left_vectors * centered.singular_values) @ centered.right_vectors.T,
+            centered.matrix.double(), rtol=0, atol=1e-6,
+        )
+        with self.assertRaisesRegex(ValueError, "centering"):
+            load_table(self.inference_dir / "train", "cpu", "row")
+
+    def test_centered_training_compares_with_the_centered_svd(self):
+        output_dir = self.root / "train-centered"
+        torch.manual_seed(0)
+        self.train(output_dir, centering="column-mean")
+        metadata = json.loads((output_dir / "metadata.json").read_text())
+        self.assertEqual(metadata["centering"], "column-mean")
+        record = json.loads((output_dir / "eval_history.jsonl").read_text().splitlines()[-1])
+        centered = load_table(self.inference_dir / "train", "cpu", "column-mean")
+        energy = centered.singular_values.square()
+        np.testing.assert_allclose(
+            record["train"]["exact_captured_energy"],
+            (energy.cumsum(0)[:2] / energy.sum()).tolist(), rtol=1e-5,
+        )
+        # The centering is part of the run's settings.
+        with self.assertRaisesRegex(ValueError, "--overwrite"):
+            self.train(output_dir)
+
     def test_rejects_missing_tables_and_oversized_batches(self):
         with self.assertRaisesRegex(ValueError, "exp4 inference"):
             self.train(self.root / "nowhere-train", inference_dir=self.root / "nowhere")

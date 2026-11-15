@@ -17,9 +17,10 @@ import numpy as np
 import torch
 
 from utils.common import save_json, write_atomic
+from utils.linalg import matrix_svd
 from utils.nestedlora import NestedLoRA
 
-from . import TABLE_NAMES
+from . import CENTERING_CHOICES, SVD_RANK, TABLE_NAMES
 
 RANKS = (1, 2, 4, 8, 16, 32, 64, 128)
 
@@ -42,19 +43,37 @@ def table_columns(futures: torch.Tensor, header_token_ids: torch.Tensor) -> torc
     ).flatten(0, 1)
 
 
-def load_table(table_dir: Path, device: str | torch.device) -> Table:
+def load_table(
+    table_dir: Path, device: str | torch.device, centering: str = "none"
+) -> Table:
+    """Load a table and its exact SVD.
+
+    With centering "column-mean", every column loses its mean over the table's
+    own histories. That removes the leading mode, which is close to a constant
+    over histories times the column means. The saved SVD belongs to the stored
+    matrix, so the centered matrix gets a fresh exact SVD here.
+    """
+    if centering not in CENTERING_CHOICES:
+        raise ValueError(f"centering must be one of {CENTERING_CHOICES}, got {centering!r}")
     tokens = np.load(table_dir / "tokens.npz")
-    svd = np.load(table_dir / "svd.npz")
+    matrix = np.load(table_dir / "matrix.npy")
+    if centering == "none":
+        saved = np.load(table_dir / "svd.npz")
+        singular_values, left, right_t = saved["S"], saved["U"], saved["Vt"]
+    else:
+        matrix = (matrix - matrix.mean(axis=0, dtype=np.float64)).astype(np.float32)
+        svd = matrix_svd(matrix, device=device)
+        singular_values, left, right_t = svd.S, svd.U[:, :SVD_RANK], svd.Vt[:SVD_RANK]
     return Table(
         histories=torch.from_numpy(tokens["histories"]).to(device),
         columns=table_columns(
             torch.from_numpy(tokens["futures"]),
             torch.from_numpy(tokens["header_token_ids"]).long(),
         ).to(device),
-        matrix=torch.from_numpy(np.load(table_dir / "matrix.npy")).to(device),
-        singular_values=torch.from_numpy(svd["S"]).to(device),
-        left_vectors=torch.from_numpy(svd["U"]).to(device),
-        right_vectors=torch.from_numpy(svd["Vt"].T.copy()).to(device),
+        matrix=torch.from_numpy(matrix).to(device),
+        singular_values=torch.from_numpy(singular_values).to(device),
+        left_vectors=torch.from_numpy(left).to(device),
+        right_vectors=torch.from_numpy(right_t.T.copy()).to(device),
     )
 
 
@@ -176,6 +195,7 @@ def train_exp4(
     lr: float,
     seed: int,
     overwrite: bool,
+    centering: str = "none",
     eval_chunk: int = 2048,
     model: NestedLoRA | None = None,
 ) -> dict:
@@ -183,12 +203,15 @@ def train_exp4(
 
     Writes checkpoint.pt, eval_history.jsonl (one line per evaluation) and
     metadata.json to output_dir. An existing checkpoint with the same settings
-    is continued up to `steps`; pass overwrite to start again. `model` replaces
-    the default svd_inference network.
+    is continued up to `steps`; pass overwrite to start again. `centering`
+    is applied to both tables before training and comparison, see load_table.
+    `model` replaces the default svd_inference network.
     """
     if not (inference_dir / "metadata.json").is_file():
         raise ValueError(f"no finished tables in {inference_dir}; run exp4 inference first")
-    tables = {name: load_table(inference_dir / name, device) for name in TABLE_NAMES}
+    tables = {
+        name: load_table(inference_dir / name, device, centering) for name in TABLE_NAMES
+    }
     train = tables["train"]
     rows, columns = train.matrix.shape
     if history_batch > rows or column_batch > columns:
@@ -199,6 +222,7 @@ def train_exp4(
     config = {
         "inference_dir": str(inference_dir), "neigs": neigs, "history_batch": history_batch,
         "column_batch": column_batch, "lr": lr, "seed": seed, "optimizer": "Adam",
+        "centering": centering,
     }
     checkpoint_path = output_dir / "checkpoint.pt"
     history_path = output_dir / "eval_history.jsonl"

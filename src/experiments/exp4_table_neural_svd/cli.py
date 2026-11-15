@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 from data_pipline.cli import positive_int
+from . import CENTERING_CHOICES
 from utils.experiment_paths import INFERENCE_DIR, add_run_arguments, dataset_samples_path, run_dir
 
 
@@ -55,6 +56,11 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--eval-every", type=positive_int, default=1000)
     train_parser.add_argument("--lr", type=positive_float, default=3e-4)
     train_parser.add_argument("--seed", type=int, default=42)
+    train_parser.add_argument(
+        "--centering", choices=CENTERING_CHOICES, default="none",
+        help="column-mean subtracts each column's mean over the table's histories, "
+             "which removes the leading mode; results go to train-column-mean/",
+    )
     for subparser in (inference_parser, train_parser):
         add_run_arguments(subparser)
         # 3072 histories and 1536 futures need more than the 512 + 512 default set.
@@ -70,7 +76,9 @@ def main(argv: list[str] | None = None) -> None:
 
             summary = train_exp4(
                 inference_dir=result_dir / INFERENCE_DIR,
-                output_dir=result_dir / TRAIN_DIR,
+                output_dir=result_dir / (
+                    TRAIN_DIR if args.centering == "none" else f"{TRAIN_DIR}-{args.centering}"
+                ),
                 device=args.device,
                 neigs=args.neigs,
                 history_batch=args.history_batch,
@@ -80,6 +88,7 @@ def main(argv: list[str] | None = None) -> None:
                 lr=args.lr,
                 seed=args.seed,
                 overwrite=args.overwrite,
+                centering=args.centering,
             )
             print(
                 f"output_dir: {summary['output_dir']}\n"
