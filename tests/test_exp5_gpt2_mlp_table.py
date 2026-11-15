@@ -30,9 +30,14 @@ from experiments.exp5_gpt2_mlp_table.features import (
     pair_targets,
 )
 from experiments.exp5_gpt2_mlp_table.loss import paired_loss
-from experiments.exp5_gpt2_mlp_table.model import Exp5Network, build_model
+from experiments.exp5_gpt2_mlp_table.model import (
+    Exp5Network,
+    build_model,
+    trainable_encoder,
+)
 from experiments.exp5_gpt2_mlp_table.tables import eval_features, load_eval_table
 from experiments.exp5_gpt2_mlp_table.train import (
+    MEMORIZING_RATIO,
     check_store,
     draw_pairs,
     sampler_seed,
@@ -182,6 +187,54 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(model.neigs, 4)
 
 
+class TrainableEncoderTests(Exp5Fixture):
+    def test_copy_is_trainable_and_leaves_the_model_alone(self):
+        encoder = trainable_encoder(self.inference)
+        original = self.inference.model.base_model
+        self.assertIsNot(encoder, original)
+        for (name, copied), (_, kept) in zip(
+            encoder.named_parameters(), original.named_parameters()
+        ):
+            self.assertTrue(copied.requires_grad, name)
+            self.assertIsNot(copied, kept)
+            torch.testing.assert_close(copied, kept)
+        before = [parameter.clone() for parameter in original.parameters()]
+        with torch.no_grad():
+            for parameter in encoder.parameters():
+                parameter.add_(1.0)
+        for parameter, kept in zip(original.parameters(), before):
+            torch.testing.assert_close(parameter, kept)
+
+    def test_dropout_is_off_in_training_mode(self):
+        encoder = trainable_encoder(self.inference).train()
+        ids = torch.tensor(FUTURES)
+        first = encoder(input_ids=ids).last_hidden_state
+        torch.testing.assert_close(encoder(input_ids=ids).last_hidden_state, first)
+
+    def test_right_side_reads_token_ids_through_the_encoder(self):
+        torch.manual_seed(0)
+        encoder = trainable_encoder(self.inference)
+        network = Exp5Network(
+            hidden_size=8, rank=4, top_k=TOP_K, mlp_width=16, right_encoder=encoder)
+        ids = torch.tensor(FUTURES)
+        right = network.right_features(ids)
+        self.assertEqual(right.shape, (len(FUTURES) * TOP_K, 4))
+        # Before any training the encoder is the model, so this is the frozen path.
+        hidden = last_hidden(self.inference, ids)
+        torch.testing.assert_close(right, network.right(hidden).reshape(-1, 4), atol=1e-6, rtol=0)
+        right.sum().backward()
+        self.assertTrue(all(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in encoder.wte.parameters()))
+        left, both = network(torch.randn(2, 8), ids)
+        self.assertEqual((left.shape, both.shape), ((2, 4), right.shape))
+
+    def test_a_network_without_an_encoder_has_no_encoder_weights(self):
+        network = Exp5Network(hidden_size=8, rank=4, top_k=TOP_K, mlp_width=16)
+        self.assertIsNone(network.right_encoder)
+        self.assertTrue(all(key.startswith(("left.", "right.")) for key in network.state_dict()))
+
+
 class PairedLossTests(unittest.TestCase):
     def reference(self, model, left, right, target):
         batch, top_k = target.shape
@@ -304,9 +357,26 @@ class EvalTableTests(Exp5Fixture):
             expected = model.model.right_features(loaded.future_hidden)
         torch.testing.assert_close(right.float(), expected, atol=1e-6, rtol=0)
         self.assertFalse(model.training)
+        self.assertEqual(loaded.future_ids.tolist(), self.stored("train")[1]["futures"].tolist())
         # exp4's comparison accepts the result unchanged.
         comparison = compare_with_exact_svd(left, right, loaded.table)
         self.assertEqual(comparison["ranks"], [1, 2, 4])
+
+    def test_features_of_an_unfrozen_right_side_come_from_its_encoder(self):
+        loaded = load_eval_table(self.inference_dir / "train", self.inference, "cpu")
+        torch.manual_seed(0)
+        encoder = trainable_encoder(self.inference)
+        with torch.no_grad():  # move the encoder away from the frozen model
+            encoder.wte.weight.add_(0.1 * torch.randn_like(encoder.wte.weight))
+        model = build_model(
+            hidden_size=8, rank=4, top_k=TOP_K, mlp_width=16, right_encoder=encoder)
+        left, right = eval_features(model, loaded, chunk=2)
+        with torch.no_grad():
+            expected = model.model.right_features(loaded.future_ids)
+            frozen = model.model.right(loaded.future_hidden).reshape(-1, 4)
+        torch.testing.assert_close(right.float(), expected, atol=1e-6, rtol=0)
+        self.assertGreater((expected - frozen).abs().max().item(), 1e-4)
+        self.assertEqual(left.shape, (4, 4))
 
 
 class TrainingTests(Exp5Fixture):
@@ -368,6 +438,87 @@ class TrainingTests(Exp5Fixture):
         # A fit of the table itself ends near -E[K^2]; far below it means the
         # network fits which history came with which future.
         self.assertGreater(records[-1]["train_loss"], -1.5 * records[-1]["kernel_energy"])
+
+    def test_best_checkpoint_follows_the_validation_energy(self):
+        output = self.root / "run-best"
+        self.train(output, steps=300, eval_every=100, batch_size=16)
+        records = self.records(output)
+        best_record = max(records, key=lambda record: record["val"]["captured_energy"][-1])
+        best = torch.load(output / "checkpoint-best.pt", weights_only=True)
+        self.assertEqual(best["step"], best_record["step"])
+        self.assertAlmostEqual(best["val_energy"], best_record["val"]["captured_energy"][-1])
+        self.assertEqual(set(best), {"model_state_dict", "step", "val_energy", "config"})
+        # A continued run keeps the earlier best unless it does better.
+        self.train(output, steps=400, eval_every=100, batch_size=16)
+        records = self.records(output)
+        best_record = max(records, key=lambda record: record["val"]["captured_energy"][-1])
+        best = torch.load(output / "checkpoint-best.pt", weights_only=True)
+        self.assertEqual(best["step"], best_record["step"])
+        self.assertTrue(all("memorizing" not in record for record in records))
+
+    def test_a_loss_far_below_the_energy_is_flagged(self):
+        # 24 pairs: the network can fit which history came with which future.
+        store = self.root / "store-few-pairs"
+        stream = self.root / "stream.npy"
+        with contextlib.redirect_stdout(io.StringIO()):
+            produce_blocks(
+                store_dir=store, model_path=self.model_path, stream_path=stream,
+                device="cpu", history_tokens=HISTORY_TOKENS, future_tokens=FUTURE_TOKENS,
+                samples_per_block=4,
+                max_bytes=8 * slot_bytes(4, HISTORY_TOKENS, FUTURE_TOKENS, VOCAB),
+                worker_id=0, seed=0, batch_size=2, max_blocks=6, log_every=100,
+                overwrite=False,
+            )
+        output = self.root / "run-memorizes"
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            train_exp5(
+                inference_dir=self.inference_dir, store_dir=store, model_path=self.model_path,
+                output_dir=output, device="cpu", neigs=2, mlp_width=16, batch_size=16,
+                steps=600, eval_every=200, lr=1e-2, seed=0, overwrite=False,
+            )
+        last = self.records(output)[-1]
+        self.assertLess(last["train_loss"], -MEMORIZING_RATIO * last["kernel_energy"])
+        self.assertIs(last["memorizing"], True)
+        self.assertIn("WARNING", log.getvalue())
+
+    def test_unfrozen_right_trains_the_encoder_copy(self):
+        output = self.root / "run-unfrozen"
+        summary = self.train(output, steps=300, eval_every=100, batch_size=16,
+                             unfreeze_right=True, encoder_lr=1e-3)
+        self.assertEqual(summary["evaluations"], 3)
+        checkpoint = torch.load(output / "checkpoint.pt", weights_only=True)
+        state = checkpoint["model_state_dict"]
+        self.assertTrue(any(key.startswith("model.right_encoder.") for key in state))
+        original = self.inference.model.base_model.state_dict()
+        moved = max(
+            (state[f"model.right_encoder.{key}"] - value).abs().max().item()
+            for key, value in original.items() if value.is_floating_point())
+        self.assertGreater(moved, 1e-4)
+        self.assertEqual(checkpoint["config"]["unfreeze_right"], True)
+        self.assertEqual(checkpoint["config"]["encoder_lr"], 1e-3)
+        metadata = json.loads((output / "metadata.json").read_text())
+        mlps = Exp5Network(hidden_size=8, rank=2, top_k=TOP_K, mlp_width=16)
+        self.assertEqual(
+            metadata["trainable_parameters"],
+            sum(p.numel() for p in mlps.parameters())
+            + sum(p.numel() for p in self.inference.model.base_model.parameters()))
+        records = self.records(output)
+        for name in ("train", "val"):
+            self.assertGreater(records[-1][name]["captured_energy"][0], 0.5)
+        # The settings are part of the run: a frozen run cannot continue it.
+        with self.assertRaisesRegex(ValueError, "--overwrite"):
+            self.train(output, steps=400, eval_every=100, batch_size=16)
+        self.assertEqual(
+            self.train(output, steps=400, eval_every=100, batch_size=16,
+                       unfreeze_right=True, encoder_lr=1e-3)["step"], 400)
+
+    def test_a_frozen_run_keeps_its_earlier_settings(self):
+        output = self.root / "run-frozen-config"
+        self.train(output)
+        config = torch.load(output / "checkpoint.pt", weights_only=True)["config"]
+        self.assertNotIn("unfreeze_right", config)
+        self.assertNotIn("encoder_lr", config)
 
     def test_resume_and_step_edge_cases(self):
         output = self.root / "run-resume"
@@ -482,10 +633,10 @@ class CLITests(Exp5Fixture):
         self.assertEqual(
             {key: options[key] for key in (
                 "neigs", "mlp_width", "batch_size", "steps", "eval_every", "lr", "seed",
-                "device", "overwrite")},
+                "device", "overwrite", "unfreeze_right", "encoder_lr")},
             {"neigs": 128, "mlp_width": 4096, "batch_size": 256, "steps": 100000,
              "eval_every": 1000, "lr": 3e-4, "seed": 42, "device": "cuda",
-             "overwrite": False})
+             "overwrite": False, "unfreeze_right": False, "encoder_lr": 2e-5})
         self.assertEqual(options["model_path"], Path("models/gpt2-small"))
         self.assertEqual(
             options["store_dir"],
@@ -494,6 +645,18 @@ class CLITests(Exp5Fixture):
             "data/experiment_results/exp4_table_neural_svd/wikitext-large__gpt2-small/inference"))
         self.assertEqual(options["output_dir"], Path(
             "data/experiment_results/exp5_gpt2_mlp_table/wikitext-large__gpt2-small/train"))
+
+    def test_unfreezing_the_right_side_gets_its_own_run_directory(self):
+        with patch("experiments.exp5_gpt2_mlp_table.train.train_exp5") as train:
+            train.return_value = {"output_dir": "x", "step": 0, "evaluations": 0}
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["train", "--unfreeze-right", "--encoder-lr", "1e-5"])
+        options = train.call_args.kwargs
+        self.assertIs(options["unfreeze_right"], True)
+        self.assertEqual(options["encoder_lr"], 1e-5)
+        self.assertEqual(options["output_dir"], Path(
+            "data/experiment_results/exp5_gpt2_mlp_table/wikitext-large__gpt2-small/"
+            "train-unfreeze-right"))
 
 
 if __name__ == "__main__":

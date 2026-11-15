@@ -36,6 +36,15 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--lr", type=positive_float, default=3e-4)
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument(
+        "--unfreeze-right", action="store_true",
+        help="Train a copy of the model's transformer as the right side's encoder; "
+             "results go to train-unfreeze-right/",
+    )
+    train_parser.add_argument(
+        "--encoder-lr", type=positive_float, default=2e-5,
+        help="Learning rate of that encoder, with --unfreeze-right",
+    )
+    train_parser.add_argument(
         "--store-dir", type=Path, default=DEFAULT_STORE_DIR,
         help="Sample store to draw training pairs from; it must come from --model-path",
     )
@@ -57,7 +66,7 @@ def main(argv: list[str] | None = None) -> None:
             store_dir=args.store_dir,
             model_path=args.model_path,
             output_dir=run_dir(args.results_root, EXPERIMENT, args.dataset, model_label)
-            / TRAIN_DIR,
+            / (f"{TRAIN_DIR}-unfreeze-right" if args.unfreeze_right else TRAIN_DIR),
             device=args.device,
             neigs=args.neigs,
             mlp_width=args.mlp_width,
@@ -67,6 +76,8 @@ def main(argv: list[str] | None = None) -> None:
             lr=args.lr,
             seed=args.seed,
             overwrite=args.overwrite,
+            unfreeze_right=args.unfreeze_right,
+            encoder_lr=args.encoder_lr,
         )
     except (ValueError, FileExistsError) as error:
         parser.error(str(error))

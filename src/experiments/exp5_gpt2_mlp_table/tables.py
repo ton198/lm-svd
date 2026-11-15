@@ -27,7 +27,8 @@ from .features import future_only_logits, last_hidden
 class EvalTable:
     table: Table  # the stored matrix minus g, with the exact SVD of that matrix
     history_hidden: torch.Tensor  # (N, hidden) float32
-    future_hidden: torch.Tensor  # (F, hidden) float32
+    future_hidden: torch.Tensor  # (F, hidden) float32, from the frozen model
+    future_ids: torch.Tensor  # (F, T) int64, for a right side with its own encoder
     residual_energy: float  # ||matrix - g||^2 / ||matrix||^2
     residual_top_mode: float  # leading squared singular value over ||matrix - g||^2
 
@@ -79,6 +80,7 @@ def load_eval_table(
         ),
         history_hidden=history_hidden.to(device),
         future_hidden=future_hidden.to(device),
+        future_ids=futures.to(device),
         residual_energy=residual_norm_sq / float(np.square(matrix, dtype=np.float64).sum()),
         residual_top_mode=float(svd.S[0]) ** 2 / residual_norm_sq,
     )
@@ -95,8 +97,9 @@ def eval_features(
         network.left_features(table.history_hidden[start:start + chunk]).double()
         for start in range(0, len(table.history_hidden), chunk)
     ])
+    future_input = table.future_hidden if network.right_encoder is None else table.future_ids
     right = torch.cat([
-        network.right_features(table.future_hidden[start:start + chunk]).double()
-        for start in range(0, len(table.future_hidden), chunk)
+        network.right_features(future_input[start:start + chunk]).double()
+        for start in range(0, len(future_input), chunk)
     ])
     return left, right

@@ -7,6 +7,10 @@ target of a pair is its table entry on those header tokens minus g, so the
 fixed first mode 1 x g never enters the loss. At each evaluation the learned
 features of both exp4 tables are compared with the exact SVD of that table
 minus g.
+
+With unfreeze_right the right side reads the future's tokens through a
+trainable copy of the model's transformer. The model itself stays frozen and
+still gives g, the header tokens and the history hidden states.
 """
 
 from __future__ import annotations
@@ -32,10 +36,14 @@ from utils.inference import CausalLMInference
 
 from .features import future_only_logits, header_tokens, last_hidden, pair_targets
 from .loss import paired_loss
-from .model import build_model
+from .model import build_model, trainable_encoder
 from .tables import eval_features, load_eval_table
 
 FIRST_MODE = "1 x centered future-only logit of the header token"
+# A fit of the table ends near -E[K^2]. A loss below this multiple of it means the
+# network is fitting which history came with which future, which happens when the
+# same store pairs are drawn many times.
+MEMORIZING_RATIO = 1.2
 
 
 def sampler_seed(seed: int, step: int) -> int:
@@ -95,16 +103,22 @@ def train_exp5(
     lr: float,
     seed: int,
     overwrite: bool,
+    unfreeze_right: bool = False,
+    encoder_lr: float = 2e-5,
     encode_batch: int = 1024,
     eval_chunk: int = 2048,
 ) -> dict:
     """Train on store pairs; every eval_every steps compare both exp4 tables.
 
-    Writes checkpoint.pt, eval_history.jsonl (one line per evaluation) and
-    metadata.json to output_dir. An existing checkpoint with the same settings
-    is continued up to `steps`; pass overwrite to start again. The store
-    changes while producers run, so a continued run draws other pairs than an
-    uninterrupted one would.
+    Writes checkpoint.pt, checkpoint-best.pt (the evaluation with the highest
+    validation energy at the largest rank), eval_history.jsonl (one line per
+    evaluation) and metadata.json to output_dir. An existing checkpoint with
+    the same settings is continued up to `steps`; pass overwrite to start
+    again. The store changes while producers run, so a continued run draws
+    other pairs than an uninterrupted one would.
+
+    unfreeze_right trains a copy of the model's transformer as the right
+    side's encoder, with learning rate encoder_lr.
     """
     if not (inference_dir / "metadata.json").is_file():
         raise ValueError(f"no finished tables in {inference_dir}; run exp4 inference first")
@@ -133,17 +147,29 @@ def train_exp5(
         "batch_size": batch_size, "lr": lr, "seed": seed, "optimizer": "Adam",
         "first_mode": FIRST_MODE,
     }
+    if unfreeze_right:
+        # Added only here, so checkpoints of frozen runs keep matching.
+        config.update(unfreeze_right=True, encoder_lr=encoder_lr)
     checkpoint_path = output_dir / "checkpoint.pt"
+    best_path = output_dir / "checkpoint-best.pt"
     history_path = output_dir / "eval_history.jsonl"
     if overwrite:
-        for path in (checkpoint_path, history_path):
+        for path in (checkpoint_path, best_path, history_path):
             path.unlink(missing_ok=True)
 
     torch.manual_seed(seed)
-    model = build_model(hidden_size, neigs, top_k, mlp_width).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model = build_model(
+        hidden_size, neigs, top_k, mlp_width,
+        right_encoder=trainable_encoder(inference) if unfreeze_right else None,
+    ).to(device)
+    network = model.model
+    groups = [{"params": [*network.left.parameters(), *network.right.parameters()], "lr": lr}]
+    if unfreeze_right:
+        groups.append({"params": list(network.right_encoder.parameters()), "lr": encoder_lr})
+    optimizer = torch.optim.Adam(groups)
     step = 0
     history: list[dict] = []
+    best_energy = None
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         if checkpoint["config"] != config:
@@ -154,6 +180,7 @@ def train_exp5(
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         step, history = checkpoint["step"], checkpoint["history"]
+        best_energy = checkpoint.get("best_val_energy")
         print(f"Resuming from step {step}", flush=True)
     elif history_path.exists():
         raise FileExistsError(
@@ -168,6 +195,8 @@ def train_exp5(
         "hidden_size": hidden_size,
         "hidden_state": "final layer after ln_f at the last token; "
                         "history and future are encoded separately",
+        "right_encoder": "trainable copy of the model's transformer, dropout off"
+        if unfreeze_right else "the frozen model",
         "value": "logit(token | history + future) - mean(logits over full vocabulary) "
                  "- centered logit(token | future)",
         "sampling": "independent (history, future) pairs from the sample store; "
@@ -212,7 +241,9 @@ def train_exp5(
         target = pair_targets(pair_logits.to(device), header_ids, g)
 
         optimizer.zero_grad()
-        left, right = model(history_hidden, future_hidden)
+        left, right = model(
+            history_hidden, futures.to(device) if unfreeze_right else future_hidden
+        )
         loss = paired_loss(model, left, right, target)
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss at step {step + 1}")
@@ -242,16 +273,33 @@ def train_exp5(
                     *eval_features(model, table, eval_chunk), table.table
                 )
                 lines.append(format_comparison(name, record[name]))
+            if record["train_loss"] < -MEMORIZING_RATIO * record["kernel_energy"]:
+                record["memorizing"] = True
+                lines.append(
+                    f"WARNING: loss {record['train_loss']:.4f} is below "
+                    f"{-MEMORIZING_RATIO:.1f} x E[K^2]; the network is fitting which history "
+                    "came with which future. The store is probably not being refreshed."
+                )
             print("\n".join(lines), flush=True)
             history.append(record)
             loss_sum = energy_sum = 0.0
             window = 0
+            val_energy = record["val"]["captured_energy"][-1]
+            if best_energy is None or val_energy > best_energy:
+                best_energy = val_energy
+                write_atomic(best_path, lambda tmp: torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "step": step,
+                    "val_energy": val_energy,
+                    "config": config,
+                }, tmp))
             write_atomic(checkpoint_path, lambda tmp: torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "step": step,
                 "history": history,
                 "config": config,
+                "best_val_energy": best_energy,
             }, tmp))
             write_atomic(history_path, lambda tmp: _write_history(tmp, history))
             window_started = time.perf_counter()
