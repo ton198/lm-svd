@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ from data_pipline.sample_store.producer import produce_blocks
 from data_pipline.sample_store.store import slot_bytes
 from experiments.exp1_L_M_table.table import centered_logits, select_header_tokens
 from experiments.exp4_table_neural_svd.tables import build_exp4_tables
+from experiments.exp4_table_neural_svd.train import compare_with_exact_svd
 from experiments.exp5_gpt2_mlp_table.features import (
     future_only_logits,
     header_tokens,
@@ -24,6 +26,7 @@ from experiments.exp5_gpt2_mlp_table.features import (
 )
 from experiments.exp5_gpt2_mlp_table.loss import paired_loss
 from experiments.exp5_gpt2_mlp_table.model import Exp5Network, build_model
+from experiments.exp5_gpt2_mlp_table.tables import eval_features, load_eval_table
 from utils.common import Sample
 from utils.inference import CausalLMInference
 from utils.nestedlora import NestedLoRA
@@ -200,6 +203,91 @@ class PairedLossTests(unittest.TestCase):
             paired_loss(model, torch.zeros(2, 4), torch.zeros(5, 4), torch.zeros(2, 3))
         with self.assertRaises(ValueError):
             paired_loss(model, torch.zeros(3, 4), torch.zeros(6, 4), torch.zeros(2, 3))
+
+
+class EvalTableTests(Exp5Fixture):
+    def stored(self, name):
+        directory = self.inference_dir / name
+        return np.load(directory / "matrix.npy"), dict(np.load(directory / "tokens.npz"))
+
+    def expected_g(self, tokens):
+        centered = future_only_logits(
+            self.inference, last_hidden(self.inference, torch.from_numpy(tokens["futures"])))
+        return centered.gather(1, torch.from_numpy(tokens["header_token_ids"]).long())
+
+    def test_matrix_loses_g_and_the_svd_belongs_to_the_result(self):
+        for name in ("train", "val"):
+            with self.subTest(table=name):
+                matrix, tokens = self.stored(name)
+                loaded = load_eval_table(self.inference_dir / name, self.inference, "cpu")
+                g = self.expected_g(tokens).reshape(-1).numpy()
+                np.testing.assert_allclose(loaded.table.matrix.numpy(), matrix - g, atol=1e-5)
+                table = loaded.table
+                rebuilt = (
+                    table.left_vectors * table.singular_values[: table.left_vectors.shape[1]]
+                ) @ table.right_vectors.T
+                np.testing.assert_allclose(rebuilt.numpy(), matrix - g, atol=1e-4)
+                residual = np.square(matrix - g).sum()
+                self.assertAlmostEqual(
+                    loaded.residual_energy, residual / np.square(matrix).sum(), places=5)
+                self.assertAlmostEqual(
+                    loaded.residual_top_mode,
+                    table.singular_values[0].item() ** 2 / residual, places=5)
+                self.assertEqual(table.histories.tolist(), tokens["histories"].tolist())
+                self.assertEqual(table.columns.shape, (matrix.shape[1], FUTURE_TOKENS + 1))
+
+    def test_hidden_states_are_cached_for_every_history_and_future(self):
+        _, tokens = self.stored("train")
+        loaded = load_eval_table(
+            self.inference_dir / "train", self.inference, "cpu", batch_size=2)
+        for cached, ids in ((loaded.history_hidden, tokens["histories"]),
+                            (loaded.future_hidden, tokens["futures"])):
+            expected = self.inference.final_hidden_states(torch.from_numpy(ids))[:, -1]
+            torch.testing.assert_close(cached, expected, rtol=0, atol=1e-6)
+
+    def copy_table(self, name):
+        target = self.root / f"copy-{self.id().rsplit('.', 1)[-1]}"
+        shutil.copytree(self.inference_dir / name, target)
+        return target
+
+    def test_reordered_headers_load_and_g_follows_the_stored_order(self):
+        directory = self.copy_table("train")
+        matrix = np.load(directory / "matrix.npy")
+        tokens = dict(np.load(directory / "tokens.npz"))
+        # Swap slots 0 and 1 of the first future, in the header ids and the matrix columns.
+        tokens["header_token_ids"][0, [0, 1]] = tokens["header_token_ids"][0, [1, 0]]
+        matrix[:, [0, 1]] = matrix[:, [1, 0]]
+        np.save(directory / "matrix.npy", matrix)
+        np.savez(directory / "tokens.npz", **tokens)
+        loaded = load_eval_table(directory, self.inference, "cpu")
+        g = self.expected_g(tokens).reshape(-1).numpy()
+        np.testing.assert_allclose(loaded.table.matrix.numpy(), matrix - g, atol=1e-5)
+
+    def test_a_header_outside_the_top_k_is_rejected(self):
+        directory = self.copy_table("train")
+        tokens = dict(np.load(directory / "tokens.npz"))
+        centered = future_only_logits(
+            self.inference, last_hidden(self.inference, torch.from_numpy(tokens["futures"])))
+        tokens["header_token_ids"][0, -1] = centered[0].argmin().item()
+        np.savez(directory / "tokens.npz", **tokens)
+        with self.assertRaisesRegex(ValueError, "1 future"):
+            load_eval_table(directory, self.inference, "cpu")
+
+    def test_features_cover_every_row_and_column_in_table_order(self):
+        loaded = load_eval_table(self.inference_dir / "train", self.inference, "cpu")
+        torch.manual_seed(0)
+        model = build_model(hidden_size=8, rank=4, top_k=TOP_K, mlp_width=16)
+        left, right = eval_features(model, loaded, chunk=2)
+        self.assertEqual((left.dtype, right.dtype), (torch.float64, torch.float64))
+        self.assertEqual(left.shape, (4, 4))
+        self.assertEqual(right.shape, (3 * TOP_K, 4))
+        with torch.no_grad():
+            expected = model.model.right_features(loaded.future_hidden)
+        torch.testing.assert_close(right.float(), expected, atol=1e-6, rtol=0)
+        self.assertFalse(model.training)
+        # exp4's comparison accepts the result unchanged.
+        comparison = compare_with_exact_svd(left, right, loaded.table)
+        self.assertEqual(comparison["ranks"], [1, 2, 4])
 
 
 if __name__ == "__main__":
