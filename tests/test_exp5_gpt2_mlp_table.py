@@ -22,8 +22,10 @@ from experiments.exp5_gpt2_mlp_table.features import (
     last_hidden,
     pair_targets,
 )
+from experiments.exp5_gpt2_mlp_table.model import Exp5Network, build_model
 from utils.common import Sample
 from utils.inference import CausalLMInference
+from utils.nestedlora import NestedLoRA
 
 VOCAB, HISTORY_TOKENS, FUTURE_TOKENS, TOP_K = 17, 3, 2, 3
 HISTORIES = [[row, (row + 1) % VOCAB, (row + 4) % VOCAB] for row in range(6)]
@@ -122,6 +124,39 @@ class FeatureTests(Exp5Fixture):
         for i in range(2):
             entries = centered_logits(raw[i])[ids[i]]
             torch.testing.assert_close(target[i], entries - g[i], rtol=0, atol=1e-5)
+
+
+class ModelTests(unittest.TestCase):
+    def test_shapes_and_column_order(self):
+        torch.manual_seed(0)
+        network = Exp5Network(hidden_size=8, rank=4, top_k=3, mlp_width=16)
+        left, right = network(torch.randn(5, 8), torch.randn(2, 8))
+        self.assertEqual(left.shape, (5, 4))
+        self.assertEqual(right.shape, (2 * 3, 4))
+        # Row f * top_k + j is slot j of future f: a future's block depends only on it.
+        hidden = torch.randn(2, 8)
+        both = network.right_features(hidden)
+        torch.testing.assert_close(both[3:], network.right_features(hidden[1:]))
+        # Slot j of one future is the j-th row of the final layer's (top_k, rank) output.
+        raw = network.right[-1](network.right[:-1](hidden[:1])).reshape(3, 4)
+        torch.testing.assert_close(both[:3], raw)
+
+    def test_layers_and_parameter_count(self):
+        network = Exp5Network(hidden_size=8, rank=4, top_k=3, mlp_width=16)
+        for side, out in ((network.left, 4), (network.right, 12)):
+            self.assertEqual(
+                [type(layer).__name__ for layer in side],
+                ["LayerNorm", "Linear", "GELU", "Linear"],
+            )
+            self.assertEqual((side[1].in_features, side[1].out_features), (8, 16))
+            self.assertEqual((side[3].in_features, side[3].out_features), (16, out))
+            self.assertFalse(side[0].elementwise_affine)
+
+    def test_build_model_wraps_the_network_with_joint_nesting(self):
+        model = build_model(hidden_size=8, rank=4, top_k=3, mlp_width=16)
+        self.assertIsInstance(model, NestedLoRA)
+        self.assertFalse(model.sequential)
+        self.assertEqual(model.neigs, 4)
 
 
 if __name__ == "__main__":
