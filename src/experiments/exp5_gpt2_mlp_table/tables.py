@@ -95,7 +95,7 @@ def eval_features(
     model.eval()
     network = model.model
     if isinstance(network, Exp5FinetuneNetwork):
-        return _finetune_features(network, table, chunk)
+        return token_features(model, table, chunk)
     left = torch.cat([
         network.left_features(table.history_hidden[start:start + chunk]).double()
         for start in range(0, len(table.history_hidden), chunk)
@@ -108,10 +108,17 @@ def eval_features(
     return left, right
 
 
-def _finetune_features(
-    network: Exp5FinetuneNetwork, table: EvalTable, chunk: int
+@torch.no_grad()
+def token_features(
+    model: NestedLoRA, table: EvalTable, chunk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Left features from the history ids, right features from future + header token."""
+    """Features (N, L) and (C, L), in float64, of a network that reads token ids.
+
+    Its left_features takes history ids and its right_features takes future ids
+    with the header tokens of each future. chunk is the sequences per pass.
+    """
+    model.eval()
+    network = model.model
     histories = table.table.histories
     futures = table.future_ids
     header_ids = table.table.columns[:, -1].reshape(len(futures), -1)

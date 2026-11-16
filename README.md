@@ -11,13 +11,14 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp3` | Difference between two centered-logit matrices using model A's future-specific headers | histories × (futures × top-k) | `matrix.npy` |
 | `exp4` | Same entry as `exp1`, in a training table and a disjoint validation table | histories × (futures × top-k), twice | `train/matrix.npy`, `val/matrix.npy` |
 | `exp5` | Same entry as `exp1` minus the header token's centered logit after the future alone, one (history, future) pair at a time | no stored matrix; evaluated on the `exp4` tables | — |
+| `exp6` | Same entry and pairs as `exp5`; the right network is bilinear in the header token's unembedding row | no stored matrix; evaluated on the `exp4` tables | — |
 
-Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead runs `inference` → `train`: it builds two tables with their exact SVDs, trains NeuralSVD on the training table, and compares the learned modes with both exact SVDs during training. **exp5** has only `train`: it trains two MLPs on frozen GPT-2 hidden states with pairs from the sample store and compares them with the exact SVDs of the exp4 tables.
+Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead runs `inference` → `train`: it builds two tables with their exact SVDs, trains NeuralSVD on the training table, and compares the learned modes with both exact SVDs during training. **exp5** has only `train`: it trains two MLPs on frozen GPT-2 hidden states with pairs from the sample store and compares them with the exact SVDs of the exp4 tables. **exp6** also has only `train`: the same pairs and target as exp5, with a trainable copy of GPT-2 on each side and a right side that is bilinear in the header token's unembedding row.
 
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
-- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs) · [exp4](#experiment-4-neuralsvd-on-an-explicit-table) · [exp5](#experiment-5-gpt-2-hidden-states-and-mlps-on-the-l_m-table)
+- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs) · [exp4](#experiment-4-neuralsvd-on-an-explicit-table) · [exp5](#experiment-5-gpt-2-hidden-states-and-mlps-on-the-l_m-table) · [exp6](#experiment-6-a-right-side-bilinear-in-the-header-token)
 - [Python inference API](#python-inference-api) · [Tests](#tests)
 
 ## Project layout
@@ -516,6 +517,10 @@ Things to keep in mind when reading the numbers:
 
 The reason for this option is a probe on the exp4 training table (`scripts/probe_right_function.py`): with the exact left basis, regressing each column's exact coordinates on frozen future-only hidden states reaches about half of the attainable energy on held-out futures (0.47–0.50 of 0.94 at rank 128, with the header token's embedding given as an input), and more training futures do not raise it.
 
+### Training a copy of GPT-2 on each side
+
+`train --finetune` replaces both MLPs: each side is its own trainable copy of the model's transformer (learning rate `--encoder-lr`, dropout off) with a `LayerNorm → Linear` head on its last hidden state. The left copy reads the history. The right copy reads a column as its future followed by the header token, so the token is part of the input; the header tokens of one future share one sequence, in which each sees the future and itself only and sits at the position after the future. `--mlp-width` is unused. The frozen model still gives the header tokens and `g`. Results go to `.../train-finetune/`. A step with `--batch-size 128` needs about 23 GB of GPU memory.
+
 On BlueHive, submit `bluehive_run/exp5-train.sbatch` after `exp4-inference.sbatch`, with `sample-store-produce.sbatch` running or its store already filled. Arguments after the script name are passed to the command.
 
 Small smoke run on CPU, after the commands above have produced the tables and at least one block:
@@ -528,6 +533,31 @@ ln -s "$PWD/data/experiment_results/exp4_table_neural_svd/wikitext-large__gpt2-s
 uv run exp5 train --results-root "$RESULTS_ROOT" --device cpu \
   --steps 20 --eval-every 10 --neigs 8 --mlp-width 64 --batch-size 16
 ```
+
+## Experiment 6: a right side bilinear in the header token
+
+exp6 keeps exp5's pairs, target, loss and evaluation and changes the network. It follows from what the target is. With `s(x)` the final hidden state after `x` and `e_z` the unembedding row of token `z` minus the mean row,
+
+```text
+A[history, (future, z)] − g(future, z) = ⟨s(history + future) − s(future), e_z⟩
+```
+
+so every right singular function of exp5's target has the form `⟨w_l(future), e_z⟩`: a vector that depends on the future, meeting the header token only through an inner product with its unembedding row. exp5's right networks do not have that form. The MLPs are not told which token a slot holds, and `--finetune` reads the token as one more input token and puts a linear head on the result. In the `--finetune` run the energy at rank 128 stayed next to the energy at rank 1 (validation table, step 15,000: 0.433 and 0.448, where the exact SVD has 0.654 and 0.946).
+
+```text
+left:   history -> trainable GPT-2 copy -> last hidden state -> LayerNorm -> Linear -> (rank,)
+right:  future  -> trainable GPT-2 copy -> last hidden state -> LayerNorm -> Linear -> B(future), (rank, d)
+        header token z -> e_z -> P e_z, (d,)
+        right(future, z)[l] = ⟨B_l(future), P e_z⟩ / sqrt(d)
+```
+
+A head that gave `w_l(future)` directly would need rank × hidden outputs (75 M weights for GPT-2 Small at rank 128). It is factorised as `w_l(future) = B_l(future) P`: `P` is one trained `d × hidden` projection of the unembedding rows, shared by all modes and futures, and the head only gives the `rank × d` matrix `B(future)`. `d` is `--head-rank` (default 128, 12.8 M weights). A future has top-k header tokens, so any `d ≥ top-k` can still reach every value on them; what `d` limits is how `B(future)` may vary with the future. `e_z` comes from the frozen model, divided by the root mean square of all its entries, and is neither trained nor saved. The right copy reads the future alone, so a step is lighter than exp5's `--finetune`: about 16 GB of GPU memory at the default `--batch-size 128` (extrapolated from smaller batches).
+
+```bash
+uv run exp6 train
+```
+
+It needs what exp5 needs: the exp4 tables and a sample store from the same model. The heads and `P` use `--lr` (default 3e-4), the two copies `--encoder-lr` (default 2e-5). Outputs go to `<results-root>/exp6_gpt2_bilinear_table/<dataset>__<model>/train/`, with the same files and the same columns as exp5, so its numbers compare directly with exp5's (both are measured on the tables minus `g`). On BlueHive, submit `bluehive_run/exp6-train.sbatch`.
 
 ## Training sample generation and sampling
 

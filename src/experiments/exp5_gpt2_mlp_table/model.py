@@ -98,7 +98,8 @@ def build_model(
     )
 
 
-def _head(hidden_size: int, rank: int) -> nn.Sequential:
+def linear_head(hidden_size: int, rank: int) -> nn.Sequential:
+    """LayerNorm without weights, then one linear layer to `rank` outputs."""
     return nn.Sequential(
         nn.LayerNorm(hidden_size, elementwise_affine=False), nn.Linear(hidden_size, rank)
     )
@@ -139,8 +140,8 @@ class Exp5FinetuneNetwork(nn.Module):
         self.rank = rank
         self.left_encoder = left_encoder
         self.right_encoder = right_encoder
-        self.left_head = _head(hidden_size, rank)
-        self.right_head = _head(hidden_size, rank)
+        self.left_head = linear_head(hidden_size, rank)
+        self.right_head = linear_head(hidden_size, rank)
 
     def left_features(self, history_ids: torch.Tensor) -> torch.Tensor:
         """(B, H) token ids -> (B, rank)."""
