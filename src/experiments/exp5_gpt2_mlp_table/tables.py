@@ -21,6 +21,7 @@ from utils.nestedlora import NestedLoRA
 
 from . import HEADER_TOLERANCE
 from .features import future_only_logits, last_hidden
+from .model import Exp5FinetuneNetwork
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,8 @@ def eval_features(
     """Learned features of every row (N, L) and every column (C, L), in float64."""
     model.eval()
     network = model.model
+    if isinstance(network, Exp5FinetuneNetwork):
+        return _finetune_features(network, table, chunk)
     left = torch.cat([
         network.left_features(table.history_hidden[start:start + chunk]).double()
         for start in range(0, len(table.history_hidden), chunk)
@@ -101,5 +104,24 @@ def eval_features(
     right = torch.cat([
         network.right_features(future_input[start:start + chunk]).double()
         for start in range(0, len(future_input), chunk)
+    ])
+    return left, right
+
+
+def _finetune_features(
+    network: Exp5FinetuneNetwork, table: EvalTable, chunk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Left features from the history ids, right features from future + header token."""
+    histories = table.table.histories
+    futures = table.future_ids
+    header_ids = table.table.columns[:, -1].reshape(len(futures), -1)
+    left = torch.cat([
+        network.left_features(histories[start:start + chunk]).double()
+        for start in range(0, len(histories), chunk)
+    ])
+    right = torch.cat([
+        network.right_features(futures[start:start + chunk], header_ids[start:start + chunk])
+        .double()
+        for start in range(0, len(futures), chunk)
     ])
     return left, right

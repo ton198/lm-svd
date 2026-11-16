@@ -35,14 +35,21 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--eval-every", type=positive_int, default=1000)
     train_parser.add_argument("--lr", type=positive_float, default=3e-4)
     train_parser.add_argument("--seed", type=int, default=42)
-    train_parser.add_argument(
+    encoders = train_parser.add_mutually_exclusive_group()
+    encoders.add_argument(
         "--unfreeze-right", action="store_true",
         help="Train a copy of the model's transformer as the right side's encoder; "
              "results go to train-unfreeze-right/",
     )
+    encoders.add_argument(
+        "--finetune", action="store_true",
+        help="Train a copy of the model's transformer per side with a linear head; the "
+             "right side reads the future followed by each header token; --mlp-width is "
+             "unused; results go to train-finetune/",
+    )
     train_parser.add_argument(
         "--encoder-lr", type=positive_float, default=2e-5,
-        help="Learning rate of that encoder, with --unfreeze-right",
+        help="Learning rate of the trainable encoders, with --unfreeze-right or --finetune",
     )
     train_parser.add_argument(
         "--store-dir", type=Path, default=DEFAULT_STORE_DIR,
@@ -66,7 +73,11 @@ def main(argv: list[str] | None = None) -> None:
             store_dir=args.store_dir,
             model_path=args.model_path,
             output_dir=run_dir(args.results_root, EXPERIMENT, args.dataset, model_label)
-            / (f"{TRAIN_DIR}-unfreeze-right" if args.unfreeze_right else TRAIN_DIR),
+            / (
+                f"{TRAIN_DIR}-unfreeze-right" if args.unfreeze_right
+                else f"{TRAIN_DIR}-finetune" if args.finetune
+                else TRAIN_DIR
+            ),
             device=args.device,
             neigs=args.neigs,
             mlp_width=args.mlp_width,
@@ -77,6 +88,7 @@ def main(argv: list[str] | None = None) -> None:
             seed=args.seed,
             overwrite=args.overwrite,
             unfreeze_right=args.unfreeze_right,
+            finetune=args.finetune,
             encoder_lr=args.encoder_lr,
         )
     except (ValueError, FileExistsError) as error:

@@ -31,8 +31,11 @@ from experiments.exp5_gpt2_mlp_table.features import (
 )
 from experiments.exp5_gpt2_mlp_table.loss import paired_loss
 from experiments.exp5_gpt2_mlp_table.model import (
+    Exp5FinetuneNetwork,
     Exp5Network,
+    build_finetune_model,
     build_model,
+    header_attention,
     trainable_encoder,
 )
 from experiments.exp5_gpt2_mlp_table.tables import eval_features, load_eval_table
@@ -235,6 +238,78 @@ class TrainableEncoderTests(Exp5Fixture):
         self.assertTrue(all(key.startswith(("left.", "right.")) for key in network.state_dict()))
 
 
+class FinetuneNetworkTests(Exp5Fixture):
+    HEADER = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 16]])
+
+    def network(self):
+        torch.manual_seed(0)
+        return Exp5FinetuneNetwork(
+            trainable_encoder(self.inference), trainable_encoder(self.inference),
+            hidden_size=8, rank=4)
+
+    def test_attention_lets_each_header_token_see_the_future_and_itself(self):
+        mask, position = header_attention(future_tokens=2, top_k=3, batch=2)
+        self.assertEqual(mask.shape, (2, 1, 5, 5))
+        self.assertEqual(position.tolist(), [[0, 1, 2, 2, 2]] * 2)
+        allowed = (mask[0, 0] == 0).int().tolist()
+        self.assertEqual(allowed, [
+            [1, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0],
+            [1, 1, 1, 0, 0],
+            [1, 1, 0, 1, 0],
+            [1, 1, 0, 0, 1],
+        ])
+
+    def test_batched_header_tokens_match_one_forward_per_column(self):
+        network = self.network()
+        futures = torch.tensor(FUTURES)
+        with torch.no_grad():
+            right = network.right_features(futures, self.HEADER)
+        self.assertEqual(right.shape, (len(FUTURES) * TOP_K, 4))
+        # Row f * top_k + j is f followed by its j-th header token.
+        for f in range(len(FUTURES)):
+            for j in range(TOP_K):
+                ids = torch.cat([futures[f], self.HEADER[f, j:j + 1]])[None]
+                with torch.no_grad():
+                    hidden = network.right_encoder(input_ids=ids).last_hidden_state[:, -1]
+                    expected = network.right_head(hidden)[0]
+                torch.testing.assert_close(right[f * TOP_K + j], expected, atol=1e-5, rtol=0)
+
+    def test_left_side_reads_history_ids_through_its_own_encoder(self):
+        network = self.network()
+        self.assertIsNot(network.left_encoder, network.right_encoder)
+        ids = torch.tensor(HISTORIES)
+        left = network.left_features(ids)
+        self.assertEqual(left.shape, (len(HISTORIES), 4))
+        # Before any training the encoder is the model.
+        hidden = last_hidden(self.inference, ids)
+        torch.testing.assert_close(left, network.left_head(hidden), atol=1e-6, rtol=0)
+        left_out, right_out = network(ids, torch.tensor(FUTURES), self.HEADER)
+        (left_out.sum() + right_out.sum()).backward()
+        for encoder in (network.left_encoder, network.right_encoder):
+            self.assertTrue(all(
+                parameter.grad is not None and parameter.grad.abs().sum() > 0
+                for parameter in encoder.wte.parameters()))
+
+    def test_heads_are_linear_on_normalised_hidden_states(self):
+        network = self.network()
+        for head in (network.left_head, network.right_head):
+            self.assertEqual([type(layer).__name__ for layer in head], ["LayerNorm", "Linear"])
+            self.assertFalse(head[0].elementwise_affine)
+            self.assertEqual((head[1].in_features, head[1].out_features), (8, 4))
+
+    def test_build_finetune_model_copies_the_transformer_twice(self):
+        model = build_finetune_model(self.inference, rank=4)
+        self.assertIsInstance(model, NestedLoRA)
+        self.assertFalse(model.sequential)
+        self.assertEqual(model.neigs, 4)
+        network = model.model
+        original = self.inference.model.base_model
+        for encoder in (network.left_encoder, network.right_encoder):
+            self.assertIsNot(encoder, original)
+            self.assertTrue(all(parameter.requires_grad for parameter in encoder.parameters()))
+
+
 class PairedLossTests(unittest.TestCase):
     def reference(self, model, left, right, target):
         batch, top_k = target.shape
@@ -379,6 +454,27 @@ class EvalTableTests(Exp5Fixture):
         self.assertEqual(left.shape, (4, 4))
 
 
+    def test_features_of_a_finetuned_network_read_histories_and_columns(self):
+        loaded = load_eval_table(self.inference_dir / "train", self.inference, "cpu")
+        torch.manual_seed(0)
+        model = build_finetune_model(self.inference, rank=4)
+        with torch.no_grad():  # move both encoders away from the frozen model
+            for encoder in (model.model.left_encoder, model.model.right_encoder):
+                encoder.wte.weight.add_(0.1 * torch.randn_like(encoder.wte.weight))
+        left, right = eval_features(model, loaded, chunk=2)
+        self.assertEqual((left.dtype, right.dtype), (torch.float64, torch.float64))
+        futures = len(loaded.future_ids)
+        columns = loaded.table.columns.reshape(futures, TOP_K, -1)
+        self.assertTrue(torch.equal(columns[:, 0, :-1], loaded.future_ids))
+        with torch.no_grad():
+            expected_left = model.model.left_features(loaded.table.histories)
+            expected_right = model.model.right_features(loaded.future_ids, columns[..., -1])
+        torch.testing.assert_close(left.float(), expected_left, atol=1e-6, rtol=0)
+        torch.testing.assert_close(right.float(), expected_right, atol=1e-6, rtol=0)
+        self.assertFalse(model.training)
+        self.assertEqual(compare_with_exact_svd(left, right, loaded.table)["ranks"], [1, 2, 4])
+
+
 class TrainingTests(Exp5Fixture):
     def train(self, output_dir, **changes):
         options = dict(
@@ -513,6 +609,42 @@ class TrainingTests(Exp5Fixture):
             self.train(output, steps=400, eval_every=100, batch_size=16,
                        unfreeze_right=True, encoder_lr=1e-3)["step"], 400)
 
+    def test_finetune_trains_both_encoder_copies(self):
+        output = self.root / "run-finetune"
+        summary = self.train(output, steps=300, eval_every=100, batch_size=16,
+                             finetune=True, encoder_lr=1e-3)
+        self.assertEqual(summary["evaluations"], 3)
+        checkpoint = torch.load(output / "checkpoint.pt", weights_only=True)
+        state = checkpoint["model_state_dict"]
+        original = self.inference.model.base_model.state_dict()
+        for side in ("left_encoder", "right_encoder"):
+            moved = max(
+                (state[f"model.{side}.{key}"] - value).abs().max().item()
+                for key, value in original.items() if value.is_floating_point())
+            self.assertGreater(moved, 1e-4, side)
+        self.assertEqual(checkpoint["config"]["finetune"], True)
+        self.assertEqual(checkpoint["config"]["encoder_lr"], 1e-3)
+        self.assertNotIn("mlp_width", checkpoint["config"])
+        metadata = json.loads((output / "metadata.json").read_text())
+        heads = 2 * (8 * 2 + 2)
+        self.assertEqual(
+            metadata["trainable_parameters"],
+            heads + 2 * sum(p.numel() for p in self.inference.model.base_model.parameters()))
+        self.assertIn("each header token", metadata["right_encoder"])
+        records = self.records(output)
+        for name in ("train", "val"):
+            self.assertGreater(records[-1][name]["captured_energy"][0], 0.5)
+        with self.assertRaisesRegex(ValueError, "--overwrite"):
+            self.train(output, steps=400, eval_every=100, batch_size=16,
+                       unfreeze_right=True, encoder_lr=1e-3)
+        self.assertEqual(
+            self.train(output, steps=400, eval_every=100, batch_size=16,
+                       finetune=True, encoder_lr=1e-3)["step"], 400)
+
+    def test_finetune_and_unfreeze_right_are_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "finetune"):
+            self.train(self.root / "run-both", finetune=True, unfreeze_right=True)
+
     def test_a_frozen_run_keeps_its_earlier_settings(self):
         output = self.root / "run-frozen-config"
         self.train(output)
@@ -633,10 +765,11 @@ class CLITests(Exp5Fixture):
         self.assertEqual(
             {key: options[key] for key in (
                 "neigs", "mlp_width", "batch_size", "steps", "eval_every", "lr", "seed",
-                "device", "overwrite", "unfreeze_right", "encoder_lr")},
+                "device", "overwrite", "unfreeze_right", "finetune", "encoder_lr")},
             {"neigs": 128, "mlp_width": 4096, "batch_size": 256, "steps": 100000,
              "eval_every": 1000, "lr": 3e-4, "seed": 42, "device": "cuda",
-             "overwrite": False, "unfreeze_right": False, "encoder_lr": 2e-5})
+             "overwrite": False, "unfreeze_right": False, "finetune": False,
+             "encoder_lr": 2e-5})
         self.assertEqual(options["model_path"], Path("models/gpt2-small"))
         self.assertEqual(
             options["store_dir"],
@@ -657,6 +790,24 @@ class CLITests(Exp5Fixture):
         self.assertEqual(options["output_dir"], Path(
             "data/experiment_results/exp5_gpt2_mlp_table/wikitext-large__gpt2-small/"
             "train-unfreeze-right"))
+
+
+    def test_finetuning_gets_its_own_run_directory(self):
+        with patch("experiments.exp5_gpt2_mlp_table.train.train_exp5") as train:
+            train.return_value = {"output_dir": "x", "step": 0, "evaluations": 0}
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["train", "--finetune"])
+        options = train.call_args.kwargs
+        self.assertIs(options["finetune"], True)
+        self.assertIs(options["unfreeze_right"], False)
+        self.assertEqual(options["output_dir"], Path(
+            "data/experiment_results/exp5_gpt2_mlp_table/wikitext-large__gpt2-small/"
+            "train-finetune"))
+
+    def test_finetune_and_unfreeze_right_cannot_be_combined(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            main(["train", "--finetune", "--unfreeze-right"])
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,10 @@ minus g.
 With unfreeze_right the right side reads the future's tokens through a
 trainable copy of the model's transformer. The model itself stays frozen and
 still gives g, the header tokens and the history hidden states.
+
+With finetune each side is its own trainable copy of the transformer with a
+linear head: the left reads the history, the right reads the future followed
+by each header token. The frozen model still gives g and the header tokens.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ from utils.inference import CausalLMInference
 
 from .features import future_only_logits, header_tokens, last_hidden, pair_targets
 from .loss import paired_loss
-from .model import build_model, trainable_encoder
+from .model import build_finetune_model, build_model, trainable_encoder
 from .tables import eval_features, load_eval_table
 
 FIRST_MODE = "1 x centered future-only logit of the header token"
@@ -44,6 +48,8 @@ FIRST_MODE = "1 x centered future-only logit of the header token"
 # network is fitting which history came with which future, which happens when the
 # same store pairs are drawn many times.
 MEMORIZING_RATIO = 1.2
+# Sequences per encoder pass when a finetuned network is evaluated on the tables.
+FINETUNE_EVAL_CHUNK = 256
 
 
 def sampler_seed(seed: int, step: int) -> int:
@@ -104,6 +110,7 @@ def train_exp5(
     seed: int,
     overwrite: bool,
     unfreeze_right: bool = False,
+    finetune: bool = False,
     encoder_lr: float = 2e-5,
     encode_batch: int = 1024,
     eval_chunk: int = 2048,
@@ -118,12 +125,18 @@ def train_exp5(
     other pairs than an uninterrupted one would.
 
     unfreeze_right trains a copy of the model's transformer as the right
-    side's encoder, with learning rate encoder_lr.
+    side's encoder, with learning rate encoder_lr. finetune trains one copy per
+    side, each with a linear head; its encoders also use encoder_lr.
     """
     if not (inference_dir / "metadata.json").is_file():
         raise ValueError(f"no finished tables in {inference_dir}; run exp4 inference first")
     if seed < 0:
         raise ValueError("seed must be non-negative")
+    if finetune and unfreeze_right:
+        raise ValueError(
+            "finetune already trains the right side's encoder; pass finetune or "
+            "unfreeze_right, not both"
+        )
     store_config = read_store_config(Path(store_dir))
 
     inference = CausalLMInference(model_path, device)
@@ -150,6 +163,9 @@ def train_exp5(
     if unfreeze_right:
         # Added only here, so checkpoints of frozen runs keep matching.
         config.update(unfreeze_right=True, encoder_lr=encoder_lr)
+    if finetune:
+        del config["mlp_width"]  # linear heads
+        config.update(finetune=True, encoder_lr=encoder_lr)
     checkpoint_path = output_dir / "checkpoint.pt"
     best_path = output_dir / "checkpoint-best.pt"
     history_path = output_dir / "eval_history.jsonl"
@@ -158,14 +174,26 @@ def train_exp5(
             path.unlink(missing_ok=True)
 
     torch.manual_seed(seed)
-    model = build_model(
-        hidden_size, neigs, top_k, mlp_width,
-        right_encoder=trainable_encoder(inference) if unfreeze_right else None,
-    ).to(device)
-    network = model.model
-    groups = [{"params": [*network.left.parameters(), *network.right.parameters()], "lr": lr}]
-    if unfreeze_right:
-        groups.append({"params": list(network.right_encoder.parameters()), "lr": encoder_lr})
+    if finetune:
+        model = build_finetune_model(inference, neigs).to(device)
+        network = model.model
+        groups = [
+            {"params": [*network.left_head.parameters(), *network.right_head.parameters()],
+             "lr": lr},
+            {"params": [*network.left_encoder.parameters(),
+                        *network.right_encoder.parameters()], "lr": encoder_lr},
+        ]
+    else:
+        model = build_model(
+            hidden_size, neigs, top_k, mlp_width,
+            right_encoder=trainable_encoder(inference) if unfreeze_right else None,
+        ).to(device)
+        network = model.model
+        groups = [
+            {"params": [*network.left.parameters(), *network.right.parameters()], "lr": lr}
+        ]
+        if unfreeze_right:
+            groups.append({"params": list(network.right_encoder.parameters()), "lr": encoder_lr})
     optimizer = torch.optim.Adam(groups)
     step = 0
     history: list[dict] = []
@@ -195,8 +223,17 @@ def train_exp5(
         "hidden_size": hidden_size,
         "hidden_state": "final layer after ln_f at the last token; "
                         "history and future are encoded separately",
-        "right_encoder": "trainable copy of the model's transformer, dropout off"
-        if unfreeze_right else "the frozen model",
+        **({
+            "left_encoder": "trainable copy of the model's transformer, dropout off, "
+                            "reading the history; LayerNorm + linear head",
+            "right_encoder": "trainable copy of the model's transformer, dropout off, "
+                             "reading the future followed by each header token in one "
+                             "sequence (each header token sees the future and itself, at "
+                             "position |future|); LayerNorm + linear head",
+        } if finetune else {
+            "right_encoder": "trainable copy of the model's transformer, dropout off"
+            if unfreeze_right else "the frozen model",
+        }),
         "value": "logit(token | history + future) - mean(logits over full vocabulary) "
                  "- centered logit(token | future)",
         "sampling": "independent (history, future) pairs from the sample store; "
@@ -235,15 +272,18 @@ def train_exp5(
     while step < steps:
         model.train()
         histories, futures, pair_logits = draw_pairs(sampler, batch_size)
-        history_hidden = last_hidden(inference, histories, encode_batch)
         future_hidden = last_hidden(inference, futures, encode_batch)
         header_ids, g = header_tokens(future_only_logits(inference, future_hidden), top_k)
         target = pair_targets(pair_logits.to(device), header_ids, g)
 
         optimizer.zero_grad()
-        left, right = model(
-            history_hidden, futures.to(device) if unfreeze_right else future_hidden
-        )
+        if finetune:
+            left, right = model(histories.to(device), futures.to(device), header_ids)
+        else:
+            history_hidden = last_hidden(inference, histories, encode_batch)
+            left, right = model(
+                history_hidden, futures.to(device) if unfreeze_right else future_hidden
+            )
         loss = paired_loss(model, left, right, target)
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss at step {step + 1}")
@@ -270,7 +310,10 @@ def train_exp5(
             ]
             for name, table in tables.items():
                 record[name] = compare_with_exact_svd(
-                    *eval_features(model, table, eval_chunk), table.table
+                    *eval_features(
+                        model, table, FINETUNE_EVAL_CHUNK if finetune else eval_chunk
+                    ),
+                    table.table,
                 )
                 lines.append(format_comparison(name, record[name]))
             if record["train_loss"] < -MEMORIZING_RATIO * record["kernel_energy"]:
