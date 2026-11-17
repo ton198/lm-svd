@@ -19,7 +19,7 @@ Experiments **exp1–exp3** have two subcommands, run in order: `inference` buil
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
-- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs) · [exp4](#experiment-4-neuralsvd-on-an-explicit-table) · [exp5](#experiment-5-gpt-2-hidden-states-and-mlps-on-the-l_m-table) · [exp6](#experiment-6-a-right-side-bilinear-in-the-header-token) · [exp7](#experiment-7-an-independent-sub-network-per-singular-function)
+- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs) · [exp4](#experiment-4-neuralsvd-on-an-explicit-table) · [exp5](#experiment-5-gpt-2-hidden-states-and-mlps-on-the-l_m-table) · [exp6](#experiment-6-a-right-side-bilinear-in-the-header-token) · [exp7](#experiment-7-an-independent-sub-network-per-singular-function) · [exp8](#experiment-8-the-mean-of-the-columns-and-the-modes-behind-it)
 - [Python inference API](#python-inference-api) · [Tests](#tests)
 
 ## Project layout
@@ -771,6 +771,170 @@ uv run exp7 train --results-root "$RESULTS_ROOT" --device cpu --subnet scratch \
   --align-pairs 64 --scratch-layers 1 --scratch-width 64 --scratch-heads 2 --batch-size 16
 # The same command with --modes 2 adds a second stage in the same directory.
 ```
+
+## Experiment 8: the mean of the columns, and the modes behind it
+
+exp8 is a set of studies on one question: why do exp5–exp7 stay at 0.37–0.51 of the energy of the exp4 tables minus `g`, at any rank and with any encoder, when the exact SVD has 0.65 at rank 1 and 0.95 at rank 128?
+
+After `g` is removed, the leading mode of both tables has a left function that is nearly constant over the histories (overlap 0.98 with a constant). Its right function is therefore the mean of each column over the histories, minus `g`, and it holds 65% of the energy. The four studies separate that mode from the rest:
+
+| Study | Command | Question |
+| --- | --- | --- |
+| A | `exp8 spectrum` | Are the modes behind the column means properties of histories and futures in general, or of one table? No training. |
+| B | `exp8 center` | Can networks learn those modes once the column means are taken out of the target? |
+| C | `exp8 mean` | How well can a network predict the column means from the future alone, and what does it need? |
+| D | `exp8 center --layout landmark` / `prototype` | What if a right function is the model's own response to a few (fixed or trained) histories? |
+
+Studies B–D do not use the sample store. At every step the frozen model computes fresh table entries from windows of the token stream, drawn like the store's (uniformly, histories and futures independently). Each history is read once and its attention cache is shared by the futures behind it, in half precision on a GPU; on a 32 × 16 grid of the stored table this changes the entries (about 11 in size) by under 0.03 and the energy of the centered grid by 2e-5.
+
+### Study A: do the modes carry over?
+
+```bash
+uv run exp8 spectrum
+```
+
+For each exp4 table as stored, minus `g`, and minus its column means, the histories and the futures are each split into two random halves, and three numbers are reported per rank next to the best that rank can do on the held-out part:
+
+| Printed column | Meaning |
+| --- | --- |
+| `spectrum` | Energy share of the leading modes of the whole table |
+| `left` | The leading left vectors of one half of the futures, applied to the other half: `‖U_kᵀ A₂‖² / ‖A₂‖²` |
+| `right` | The leading right vectors of one half of the histories, applied to the other half |
+| `block` | Bi-cross-validation (Owen and Perry 2009): the rank-`k` SVD of one block of histories × futures predicts the opposite block through the two blocks they share. It turns negative once further modes are noise. |
+
+With the column means removed, each half is centered with its own means. Output: `<results-root>/exp8_hypotheses/<dataset>__<model>/spectrum/spectrum.json`.
+
+### Study B: NeuralSVD without the column means
+
+A stored (history, future) pair gives one history per column, so a column's mean over the histories is unknown and cannot be removed; exp4's `--centering column-mean` could remove it only inside a fixed table. Here each step is a full grid of `--history-batch` × `--future-batch` (default 32 × 16) fresh windows, and
+
+- every column of the grid loses its mean over the batch's histories, which also removes `g` (it is constant over the histories);
+- the left features lose their batch mean, so a constant left function is worth exactly nothing;
+- the NestedLoRA loss is taken on what is left. Both of its terms then estimate the centered table's loss times `(N − 1) / N`.
+
+Evaluation is on both exp4 tables minus their own column means, against the exact SVD of that matrix, with the left features minus their mean over the table's histories. The printed columns are exp4's, plus `span energy left/right`: the energy within reach of the first `k` left (right) features if the other side were ideal, `‖Q_kᵀ A‖² / ‖A‖²`. It separates a side that learned nothing from one whose partner failed.
+
+| Option | Choices |
+| --- | --- |
+| `--layout` | `shared` (default): one encoder per side, mode `l` is output `l` of each head, the right head giving `w_l(future)` for `⟨w_l(future), v_z⟩ / sqrt(E)` as in exp7. `independent`: every mode is an exp7 `Mode` with its own two encoders. |
+| `--encoder` | exp7's kinds: `gpt2` (default, a copy of the model read at the last token), `roberta` (`--roberta-path`, default MiniLMv2-L6-H384), `scratch`; and `gpt2-mean`, the copy averaged over its positions. `--right-encoder` gives the right side of `shared` another pretrained kind. |
+| `--nesting` | `joint` (default) or `sequential`. With `independent`, `sequential` is exp7's scheme with all stages trained at once: mode `l` is fitted to what the modes before it leave. |
+| `--modes`, `--steps` | Default 32 and 30000. The learning rate warms up over 1000 steps and decays along a cosine to a tenth. |
+| `--target minus-g` | The control: the same grids and networks on exp5–exp7's target, nothing centered, compared with the tables minus `g`. The run directory starts with `minus-g-`. |
+
+### Study C: the column means themselves
+
+```bash
+uv run exp8 mean                     # a copy of the model with 64 trainable prefix vectors
+uv run exp8 mean --prefix-tokens 0   # the copy reads the future alone
+uv run exp8 mean --generic gpt2      # control: exp7's right sub-network
+```
+
+Predicting the column means is a regression: from the future alone, give the header-token entries averaged over every history that could stand before it. The student is trained on independent pairs with a squared error, whose minimum is that average.
+
+- The default student is a trainable copy of the model's transformer that **keeps the frozen unembedding**: its prediction for token `z` is `⟨s'(future), W_z − mean row⟩`. Before training it equals the frozen model's own entries, so training only has to learn a correction.
+- `--prefix-tokens P` puts `P` trainable vectors in front of the future, started at the embeddings of one real window. The future then sits where it sits behind a real history.
+- `--generic KIND` is the control: exp7's right sub-network (an encoder of that kind, LayerNorm, a linear head giving `w(future)`), trained on the same regression. It reuses nothing of the model's output layer.
+
+Printed per table (minus `g`): `energy = 1 − ‖A − 1 × prediction‖² / ‖A‖²`; `ceiling`, the same with the table's own column means; `exact rank 1`; and `mean R2`, the share of the column means' variation that the prediction explains.
+
+### Study D: right functions made of the model's own rows
+
+`--layout landmark` takes `--landmarks M` fixed histories from the stream. The response of a column to landmark `m` is its entry behind that history minus the mean over the landmarks, and right function `l` is a trained mix `Σ_m mix[l, m] · response_m`. The frozen model computes the responses for any future (M passes per future), so the right side has nothing to generalise; only `mix` and the left encoder and head are trained. This is LinGen (Golowich, Liu and Shetty 2025) with the coefficients predicted from the history by a network instead of fitted by least squares per history.
+
+`--layout prototype` trains the landmarks: each becomes its token embeddings as free vectors, read in front of the future by a copy of the model (frozen unless `--train-copy`). At the start it is the same function as `landmark`; afterwards the right side is a network that never calls the frozen model. The loss gains `--mean-weight` × the squared error between the mean of the prototype rows and the grid's column means, so the same prototypes also give the first mode.
+
+Both layouts print one more line per table, the energy on the table **minus `g`** (exp5–exp7's measure) of `1 × (mean of the landmark rows − g) + the centered modes`, next to the exact energy at one rank more:
+
+```text
+energy(k + 1) = mean_energy + centered_share × centered energy(k)
+```
+
+where `centered_share = ‖A − column means‖² / ‖A‖²` (0.36 on the report table). The same formula combines a study C run with a study B run.
+
+### Run and outputs
+
+```bash
+uv run exp4 inference                 # the two tables, once
+uv run data-pipline build-token-stream
+uv run exp8 center --encoder gpt2 --modes 32
+uv run exp8 center --layout prototype --landmarks 32 --encoder gpt2-mean --modes 32
+```
+
+On BlueHive: `sbatch -J <name> bluehive_run/exp8.sbatch <exp8 arguments>` from the repository root. Run directories are `<results-root>/exp8_hypotheses/<dataset>__<model>/<study>-<settings>[--tag]`, each with `metadata.json`, `eval_history.jsonl` (one line per evaluation, with the `train` and `val` comparisons) and `checkpoint.pt`. Repeating a command continues its run from the last evaluation, which is what a requeued job does; other settings in the same directory are refused, and `--overwrite` starts over. A finished run's checkpoint may be reduced to its weights.
+
+Things to keep in mind when reading the numbers:
+
+- **Two measures.** Study B's `energy` is a share of the table minus its column means; exp5–exp7's is a share of the table minus `g`. Only `minus_g_energy`, study C's `energy` and the `--target minus-g` control compare with exp5–exp7.
+- **The centered tables use their own column means**, which a model does not have for a new future. Study B's comparison therefore says how well the modes are learned, and the column means have to come from study C or D.
+- **Windows are not excluded from the tables**, as in exp5–exp7. With the defaults about 0.4% of the report table's futures and 0.8% of its histories are also drawn as training windows in a `center` run, and about 2% of its futures in a `mean` run.
+- A prototype run's `train_loss` includes the `--mean-weight` term. `mean R2` equals `energy / ceiling`.
+
+### Results (wikitext-large, GPT-2 Small; report table, snapshot of 2026-11-17 04:20)
+
+Runs marked with their step were still training when the numbers were read. Every number is the last line of the run's `eval_history.jsonl` at that time.
+
+**A. The modes behind the column means are real.** Report table minus its column means, two random splits:
+
+| Rank | Whole table | Left transfer (optimum) | Right transfer (optimum) | Block prediction (optimum) |
+| ---: | ---: | --- | --- | --- |
+| 4 | 0.291 | 0.24–0.28 (0.30–0.31) | 0.28–0.29 (0.30) | 0.24–0.28 (0.31–0.32) |
+| 16 | 0.567 | 0.54–0.55 (0.58–0.59) | 0.54 (0.58) | 0.52–0.53 (0.59–0.60) |
+| 32 | 0.682 | 0.65–0.66 (0.69–0.70) | 0.65 (0.70) | 0.62 (0.71–0.72) |
+| 128 | 0.849 | 0.80–0.81 (0.86–0.87) | 0.77 (0.88) | 0.72 (0.89) |
+
+Half of the histories and half of the futures (512 × 256) predict the other block at 0.62 of its energy at rank 32, where its own SVD has 0.72. exp4's `--centering column-mean` runs reached 0.03 on this table, so the modes were there and the training missed them. The leading left vectors are topics of the history (film and music against military history, sport against philosophy, video games against politics), and one is its layout (a history ending in a list or heading).
+
+**C. The column means need the model's own output layer, not a prefix.** Ceiling 0.642, exact rank 1 0.654:
+
+| Student | Energy |
+| --- | ---: |
+| Copy of the model with the frozen unembedding, future alone (`--prefix-tokens 0`), 20,000 steps | 0.611 |
+| The same after 1,000 steps | 0.570 |
+| The same with 64 prefix vectors, step 9,000 of 20,000 | 0.593 |
+| exp7's right sub-network, GPT-2 copy (`--generic gpt2`), 10,000 steps | 0.512 |
+| exp7's right sub-network, MiniLMv2 (`--generic roberta`), 10,000 steps | 0.435 |
+| Mean of 32 trained prototype rows (study D) | 0.640 |
+| exp7's first stage, for reference (RoBERTa-base / MiniLMv2 / scratch) | 0.42 / 0.40 / 0.37 |
+
+**B and D. With the column means out of the target, the modes are learned and carry over.** Energy of the report table minus its column means, by rank (exact: 0.101, 0.173, 0.291, 0.431, 0.567, 0.682, 0.774, 0.849 at ranks 1, 2, 4, …, 128):
+
+| Run | 1 | 4 | 8 | 16 | 32 | 64 | 128 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| exp4 `train-column-mean-switch-1024x512-every10000`, 100,000 steps | 0.00 | 0.03 | 0.02 | 0.01 | 0.00 | | |
+| `shared`, `scratch` | 0.045 | 0.135 | 0.189 | 0.231 | 0.257 | | |
+| `shared`, MiniLMv2 | 0.057 | 0.181 | 0.246 | 0.308 | 0.352 | | |
+| `independent`, MiniLMv2, `sequential`, 8 modes (step 27,000 of 30,000) | 0.062 | 0.181 | 0.245 | | | | |
+| `shared`, `gpt2-mean` | 0.048 | 0.195 | 0.268 | 0.341 | 0.397 | | |
+| `shared`, `gpt2` | 0.057 | 0.195 | 0.283 | 0.362 | 0.421 | | |
+| `shared`, `gpt2`, 128 modes (step 27,000 of 30,000) | 0.034 | 0.169 | 0.266 | 0.347 | 0.413 | 0.457 | 0.479 |
+| `landmark`, 64 fixed histories (step 17,000 of 30,000) | 0.075 | 0.232 | 0.352 | 0.438 | 0.490 | | |
+| `prototype`, 32 trained (20,000 steps) | 0.076 | 0.249 | 0.386 | 0.499 | 0.560 | | |
+| `prototype`, 64 trained (step 7,000 of 20,000) | 0.062 | 0.237 | 0.377 | 0.483 | 0.570 | 0.600 | |
+| `prototype`, 128 trained (step 3,000 of 12,000) | 0.056 | 0.174 | 0.307 | 0.419 | 0.507 | 0.555 | 0.577 |
+
+The selection table gives the same picture, 0.01–0.02 higher. A second seed of the 32-prototype run agrees with the first at the same step (0.523 and 0.524 at step 6,000). Training the copy's weights as well (`--train-copy`) was behind at step 10,000 (0.527 against 0.542) and lost the first mode (0.567 against 0.640).
+
+**On exp5–exp7's measure** (report table minus `g`; exact 0.654 at rank 1, 0.887 at rank 33, 0.919 at rank 65):
+
+| Model | Modes | Energy |
+| --- | ---: | ---: |
+| exp5, exp6 (any rank up to 128) | 128 | 0.47–0.51 |
+| exp7, first stage | 1 | 0.37–0.42 |
+| Control: `shared`, `gpt2`, `--target minus-g` (step 13,000 of 30,000) | 32 | 0.582 |
+| Study C copy + `shared` `gpt2` modes, by the formula above | 1 + 32 | 0.762 |
+| `landmark`, 64 fixed histories (step 17,000 of 30,000) | 1 + 32 | 0.812 |
+| `prototype`, 32 trained | 1 + 32 | 0.841 |
+| `prototype`, 64 trained (step 7,000 of 20,000) | 1 + 64 | 0.855 |
+
+The 0.841 was recomputed from the checkpoint by building the full prediction of the table minus `g`, without the centered bookkeeping, and came out the same (0.8407).
+
+What the comparisons say:
+
+- **The control separates two effects.** Fresh grids alone lift exp6's layout from 0.47–0.51 to 0.58 and rising, so a part of exp5–exp7's shortfall came from training on stored pairs. Its first mode stays at 0.49, the level of `--generic gpt2`, and its 31 further modes add 0.09, a quarter of the centered energy; the same network trained on the centered target gets 0.42 of it.
+- **What a right side needs is the model's own computation.** On both the column means and the modes, a right side that starts as the frozen model (the study C copy, the prototypes) is far ahead of an encoder with a fresh head, and among fresh heads the GPT-2 copy is ahead of MiniLMv2 and `scratch`.
+- **Independent sub-networks are no better than outputs of a shared one**: 8 modes with 16 MiniLMv2 encoders reach 0.245, the shared MiniLMv2 run 0.246 at rank 8. Under the centered target their left encoders no longer collapse.
+- **Pooling matters little once the encoder is trained.** A ridge regression on frozen states prefers the mean over positions for the history side (0.46 against 0.39 of 0.56 at rank 16 on held-out histories), but the trained `gpt2` and `gpt2-mean` runs end at 0.42 and 0.40, and mean pooling on the left with the last token on the right at 0.42.
 
 ## Training sample generation and sampling
 
