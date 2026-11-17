@@ -182,6 +182,9 @@ def roberta_encoder(roberta_path: Path, model_path: Path, vocab_size: int) -> Me
         raise ValueError(
             f"the RoBERTa checkpoint in {roberta_path} lacks encoder weights: "
             f"{', '.join(sorted(info['missing_keys']))}")
+    # A checkpoint stored in half precision (MiniLMv2) loads as float16, and Adam on
+    # float16 parameters gives NaN: every kind is trained in float32.
+    transformer.float()
     config = transformer.config
     # Its embeddings read the config's pad id as padding (padding_idx): the positions
     # of the tokens after it would shift.

@@ -94,13 +94,14 @@ def parameter_ids(module: torch.nn.Module) -> set[int]:
 
 def save_roberta(
     path: Path, *, positions: int = 12, missing: tuple[str, ...] = (), pad: str = "<pad>",
-    pad_id: int = 1, masked_lm: bool = False,
+    pad_id: int = 1, masked_lm: bool = False, half: bool = False,
 ) -> Path:
     """A tiny random RoBERTa whose vocabulary holds the teacher's token strings reversed.
 
     missing leaves teacher tokens out of its vocabulary; pad names the tokenizer's
     pad token and pad_id the model config's pad id. masked_lm saves it as the real
     checkpoint is stored: a RobertaForMaskedLM, keys under roberta. and an lm_head.
+    half saves the weights in half precision, as the MiniLMv2 checkpoint is stored.
     """
     words = [word for word in reversed(TEACHER_TOKENS) if word not in missing]
     vocab = {"<s>": 0, "<pad>": 1, "</s>": 2, "<unk>": 3,
@@ -114,6 +115,8 @@ def save_roberta(
     # prints no report of unexpected weights.
     model = RobertaForMaskedLM(config) if masked_lm else RobertaModel(
         config, add_pooling_layer=False)
+    if half:
+        model.half()
     model.save_pretrained(path)
     tokenizer = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
     tokenizer.pre_tokenizer = WhitespaceSplit()
@@ -369,6 +372,19 @@ class ModeTests(Exp7Fixture):
         # while the config's pad id stays 1 is accepted.
         path = save_roberta(self.root / "roberta-pad-token", pad="7")
         self.assertEqual(roberta_encoder(path, self.model_path, VOCAB).width, 8)
+
+    def test_a_half_precision_checkpoint_is_trained_in_float32(self):
+        # MiniLMv2's weights are stored as float16; Adam on float16 parameters gives NaN.
+        path = save_roberta(self.root / "roberta-half", half=True)
+        stored = load_file(path / "model.safetensors")
+        self.assertEqual({value.dtype for value in stored.values()}, {torch.float16})
+        encoder = roberta_encoder(path, self.model_path, VOCAB)
+        self.assertEqual({p.dtype for p in encoder.parameters()}, {torch.float32})
+        state = encoder.transformer.transformer.state_dict()
+        for key, value in stored.items():
+            torch.testing.assert_close(state[key], value.float(), rtol=0, atol=0)
+        mode = build_mode(self.inference, "roberta", **SCRATCH, roberta_path=path)
+        self.assertEqual({p.dtype for p in mode.parameters()}, {torch.float32})
 
     def test_a_masked_lm_checkpoint_loads_its_encoder_weights_quietly(self):
         # The real RoBERTa-base is a RobertaForMaskedLM checkpoint: its keys carry the
@@ -1046,6 +1062,15 @@ class TrainingTests(TrainingHelpers, Exp7Fixture):
             return states[-1]
 
         return patch.object(StagedRun, "start_stage", recording_start), states
+
+    def test_a_half_precision_roberta_checkpoint_trains_in_float32(self):
+        path = save_roberta(self.root / "roberta-half-run", half=True)
+        output = self.root / "exp7-half"
+        self.train(output, subnet="roberta", modes=1, roberta_path=path)
+        frozen = torch.load(output / "modes" / "mode-01.pt", weights_only=True)["state_dict"]
+        self.assertEqual({value.dtype for value in frozen.values()
+                          if value.is_floating_point()}, {torch.float32})
+        self.assertTrue(all(math.isfinite(r["train_loss"]) for r in self.records(output)))
 
     def test_roberta_modes_share_nothing_and_train(self):
         modes = [self.build("roberta") for _ in range(2)]
