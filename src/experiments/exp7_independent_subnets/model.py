@@ -17,6 +17,7 @@ import torch
 from torch import nn
 from transformers import GPT2Config, GPT2Model
 
+from experiments.exp7_independent_subnets import SUBNETS
 from experiments.exp5_gpt2_mlp_table.model import linear_head, trainable_encoder
 from utils.inference import CausalLMInference
 
@@ -84,10 +85,12 @@ def build_mode(
     scratch_heads: int,
 ) -> Mode:
     """One mode: `gpt2` copies the teacher's transformer per side, `scratch` starts at random."""
+    if subnet not in SUBNETS:
+        raise ValueError(f"subnet must be one of {SUBNETS}, got {subnet!r}")
     if subnet == "gpt2":
         left_encoder, right_encoder = trainable_encoder(inference), trainable_encoder(inference)
         width = inference.model.config.hidden_size
-    elif subnet == "scratch":
+    else:
         left_encoder, right_encoder = (
             scratch_encoder(
                 inference.vocab_size, inference.max_length,
@@ -95,7 +98,5 @@ def build_mode(
             for _ in range(2)
         )
         width = scratch_width
-    else:
-        raise ValueError(f"subnet must be 'gpt2' or 'scratch', got {subnet!r}")
     embedding = inference.model.get_output_embeddings().weight.shape[1]
     return Mode(left_encoder, right_encoder, linear_head(width, 1), linear_head(width, embedding))
