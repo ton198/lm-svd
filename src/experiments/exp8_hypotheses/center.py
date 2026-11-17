@@ -289,8 +289,11 @@ def train_centered(
         print(f"Resuming at step {step}", flush=True)
     files.write_metadata({
         **config, "device": device, "top_k": top_k,
-        "target_description": "logit(token | history + future) - vocabulary mean, minus the mean of that "
-                  "over the histories of the batch (training) or of the table (evaluation)",
+        "target_description": (
+            "logit(token | history + future) - vocabulary mean, minus the mean of that "
+            "over the histories of the batch (training) or of the table (evaluation)"
+            if centered else
+            "logit(token | history + future) - vocabulary mean - centered logit(token | future)"),
         "sampling": "a fresh grid of history_batch x future_batch stream windows per step, "
                     "computed by the frozen model",
         "ranks": list(ranks),

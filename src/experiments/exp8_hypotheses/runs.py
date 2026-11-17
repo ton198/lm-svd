@@ -61,6 +61,10 @@ class RunFiles:
             raise ValueError(
                 f"{self.output_dir} was trained with other settings ({', '.join(changed)}); "
                 "pass --overwrite to start over")
+        if "optimizer" not in state and state["step"] < self.config["steps"]:
+            raise ValueError(
+                f"{self.checkpoint_path} holds weights only but its run is unfinished "
+                f"(step {state['step']} of {self.config['steps']}); pass --overwrite to start over")
         self.history = state["history"]
         return state
 

@@ -249,6 +249,18 @@ class CenterTests(Exp8Fixture):
         lines = (self.root / "center-stopped" / "eval_history.jsonl").read_text().splitlines()
         self.assertEqual([json.loads(line)["step"] for line in lines], [2, 4])
 
+    def test_a_weight_only_checkpoint_loads_when_finished_and_is_refused_when_not(self):
+        self.run_center("center-weights", steps=4)
+        files = RunFiles(self.root / "center-weights", {}, overwrite=False)
+        state = torch.load(files.checkpoint_path, weights_only=False)
+        del state["optimizer"], state["scheduler"]
+        torch.save(state, files.checkpoint_path)
+        self.assertEqual(self.run_center("center-weights", steps=4)["step"], 4)
+        state["step"] = 2
+        torch.save(state, files.checkpoint_path)
+        with self.assertRaisesRegex(ValueError, "weights only but its run is unfinished"):
+            self.run_center("center-weights", steps=4)
+
     def test_independent_sequential_training_runs_and_bad_settings_are_rejected(self):
         summary = self.run_center(
             "center-independent", layout="independent", nesting="sequential", steps=2)
