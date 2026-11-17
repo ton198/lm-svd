@@ -1,6 +1,11 @@
+import unittest
+
 import torch
 
+from experiments.exp5_gpt2_mlp_table.loss import paired_loss
 from experiments.exp7_independent_subnets.model import build_mode, token_vectors
+from experiments.exp7_independent_subnets.stage import Selection, residual_target, stage_loss
+from utils.nestedlora import NestedLoRA
 from test_exp5_gpt2_mlp_table import FUTURES, HISTORIES, TOP_K, VOCAB, Exp5Fixture
 
 SCRATCH = dict(scratch_layers=1, scratch_width=4, scratch_heads=2)
@@ -106,3 +111,85 @@ class ModeTests(Exp5Fixture):
     def test_unknown_subnet_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "subnet"):
             build_mode(self.inference, "mlp", **SCRATCH)
+
+
+class StageTests(unittest.TestCase):
+    def test_residual_removes_the_frozen_modes(self):
+        generator = torch.Generator().manual_seed(0)
+        target = torch.randn(4, 3, generator=generator)
+        empty = residual_target(target, torch.zeros(4, 0), torch.zeros(4, 3, 0))
+        torch.testing.assert_close(empty, target, atol=0, rtol=0)
+        left, right = torch.randn(4, 2, generator=generator), torch.randn(4, 3, 2, generator=generator)
+        expected = target.clone()
+        for b in range(4):
+            for j in range(3):
+                for i in range(2):
+                    expected[b, j] -= left[b, i] * right[b, j, i]
+        residual = residual_target(target, left, right)
+        self.assertEqual(residual.shape, (4, 3))
+        torch.testing.assert_close(residual, expected, atol=1e-6, rtol=0)
+
+    def test_stage_loss_is_the_rank_one_paired_loss(self):
+        generator = torch.Generator().manual_seed(1)
+        batch, top_k = 4, 3
+        left = torch.randn(batch, generator=generator).requires_grad_()
+        right = torch.randn(batch, top_k, generator=generator).requires_grad_()
+        target = torch.randn(batch, top_k, generator=generator)
+        ours = stage_loss(left, right, target)
+        ours.backward()
+        left_ref = left.detach().clone()[:, None].requires_grad_()
+        right_ref = right.detach().clone().reshape(-1, 1).requires_grad_()
+        model = NestedLoRA(torch.nn.Identity(), neigs=1)
+        ref = paired_loss(model, left_ref, right_ref, target)
+        ref.backward()
+        torch.testing.assert_close(ours.detach(), ref.detach(), atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(left.grad, left_ref.grad[:, 0], atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(right.grad, right_ref.grad.reshape(batch, top_k), atol=1e-6, rtol=1e-5)
+
+    def test_stage_gradient_is_the_sequentially_nested_one(self):
+        generator = torch.Generator().manual_seed(2)
+        modes, top_k = 3, 5
+        left = torch.randn(1, modes, generator=generator).requires_grad_()
+        right = torch.randn(top_k, modes, generator=generator).requires_grad_()
+        target = torch.randn(1, top_k, generator=generator)
+        model = NestedLoRA(torch.nn.Identity(), neigs=modes, sequential=True)
+        paired_loss(model, left, right, target).backward()
+        for l in range(modes):
+            left_l = left.detach().clone().requires_grad_()
+            right_l = right.detach().clone().requires_grad_()
+            residual = residual_target(target, left_l[:, :l], right_l[None, :, :l])
+            stage_loss(left_l[:, l], right_l[:, l][None], residual).backward()
+            torch.testing.assert_close(left.grad[:, l], left_l.grad[:, l], atol=1e-6, rtol=0)
+            torch.testing.assert_close(right.grad[:, l], right_l.grad[:, l], atol=1e-6, rtol=0)
+
+    def test_single_pair_and_single_header_are_finite(self):
+        left = torch.tensor([0.7], requires_grad=True)
+        right = torch.tensor([[-1.3]], requires_grad=True)
+        loss = stage_loss(left, right, torch.tensor([[0.4]]))
+        loss.backward()
+        for value in (loss, left.grad, right.grad):
+            self.assertTrue(torch.isfinite(value).all())
+
+    def test_selection_keeps_the_best_and_counts_stale_evaluations(self):
+        s = Selection(max_steps=100, min_steps=30, patience=2)
+        self.assertEqual([s.record(m, t) for m, t in ((0.5, 10), (0.9, 20), (0.1, 30), (0.1, 40))],
+                         [True, True, False, False])
+        self.assertEqual((s.best, s.best_step, s.stale), (0.9, 20, 2))
+        self.assertEqual(s.reason(40), "patience")
+
+    def test_selection_waits_for_min_steps_and_stops_at_max_steps(self):
+        s = Selection(max_steps=100, min_steps=50, patience=1)
+        s.record(0.9, 10)
+        s.record(0.1, 20)
+        self.assertEqual(s.stale, 1)
+        self.assertIsNone(s.reason(49))
+        self.assertEqual(s.reason(50), "patience")
+        self.assertTrue(s.record(0.95, 99))
+        self.assertIsNone(s.reason(99))
+        self.assertEqual(s.reason(100), "steps")
+
+    def test_patience_zero_is_a_fixed_number_of_steps(self):
+        s = Selection(max_steps=4, min_steps=0, patience=0)
+        self.assertFalse(s.keeps_best)
+        self.assertFalse(s.record(0.9, 2))
+        self.assertEqual((s.reason(2), s.reason(4)), (None, "steps"))
