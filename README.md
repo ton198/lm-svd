@@ -693,10 +693,16 @@ Things to keep in mind when reading the records:
 
 - **Ranks are listed one by one, 1..l**, not 1, 2, 4, 8, … as in exp5 and exp6, so that every stage has a value at its own rank `l`.
 - **The numbers compare directly with exp5's and exp6's**: all three are measured on the tables minus `g`.
+- **Two kinds of singular values.** `singular_values` in `stages.jsonl` is `S` of the alignment. Its moments are means over pairs and columns, so `S` is per entry. The `singular_values` inside a table comparison (`selection`, `report`, `aligned`) are norms over the whole table, so they are larger by `sqrt(N·C)` of that table (`N` rows, `C` columns).
+- **Two kinds of `residual_energy`.** In `metadata.json`, `tables.*.residual_energy` is exp5's energy of the table left after removing `g`. The `residual_energy` field of `eval_history.jsonl` is something else: the mean square of the stage's residual target on the training pairs.
+- **An aligned rank `k < l` uses all `l` pairs of networks**, because each aligned function is a combination of all the learned ones. It is therefore not comparable with exp6's rank `k`, which uses `k` outputs.
+- **`aligned` can be slightly below the unaligned value.** The alignment is estimated from `--align-pairs` sampled pairs, not from the table.
 
 ### How to read the first stage
 
 Reference values on the report table (exp4's `val` table, minus `g`): the shared networks of exp5 and exp6 reach 0.45–0.47 at rank 1 and at best 0.51 at any rank; the exact SVD has 0.654 at rank 1.
+
+Read the table below on the **unaligned** `report` captured energy at rank 1, from `eval_history.jsonl` or `stages.jsonl`. With one mode the alignment only rescales, so `aligned` should agree up to estimation noise.
 
 | Stage 1 result (report table, energy at rank 1) | Meaning | Next step |
 | --- | --- | --- |
@@ -712,6 +718,7 @@ With several stages, look also at the difference between the energy before and a
 
 - `gpt2`: a step needs the same gradient memory as exp6 (about 16 GB at batch 128). Each frozen mode adds about 1 GB of weights and two forward-only GPT-2 passes, so stage 8 needs about 23 GB and a step takes about two to three times as long as in stage 1.
 - `scratch` (default size): each encoder has about 30 million parameters, about 19 million of them in the token embedding.
+- Disk: every evaluation rewrites the whole checkpoint (the current mode, its best weights and the optimizer state). For `gpt2`, a run directory with 8 modes is estimated at about 16 GB, including the checkpoint's temporary file. This is an estimate, not a measurement.
 
 ### Small smoke run
 

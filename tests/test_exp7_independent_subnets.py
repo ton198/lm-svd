@@ -32,6 +32,7 @@ from experiments.exp7_independent_subnets.train import (
     train_exp7,
     train_step,
 )
+from utils.common import write_atomic
 from utils.nestedlora import NestedLoRA
 from test_exp5_gpt2_mlp_table import FUTURES, HISTORIES, TOP_K, VOCAB, Exp5Fixture
 
@@ -650,6 +651,94 @@ class TrainingTests(TrainingHelpers, Exp5Fixture):
             self.train(self.root / "exp7-release", modes=3, patience=2)
         self.assertEqual(released, [[], [True, True], [True, True, True, True]])
 
+    def test_aligned_numbers_are_the_modes_times_t_f_on_the_left_and_t_g_on_the_right(self):
+        output = self.root / "exp7-aligned"
+        self.train(output)
+        aligned = self.stages(output)[-1]["aligned"]
+        transforms = torch.load(output / "alignment.pt", weights_only=True)
+        T_f, T_g = transforms["T_f"], transforms["T_g"]
+        self.assertFalse(torch.allclose(T_f, T_g))
+        modes = [self.load_mode(output / "modes" / f"mode-0{stage}.pt") for stage in (1, 2)]
+        vectors = self.vectors()
+        for exp4_name, key in (("train", "selection"), ("val", "report")):
+            table = load_eval_table(self.inference_dir / exp4_name, self.inference, "cpu")
+            features = [mode_table_features(mode, table, vectors, chunk=256) for mode in modes]
+            left = torch.stack([f[0] for f in features], dim=1)
+            right = torch.stack([f[1] for f in features], dim=1)
+            expected = compare_with_exact_svd(
+                left @ T_f.double(), right @ T_g.double(), table.table, ranks=(1, 2))
+            swapped = compare_with_exact_svd(
+                left @ T_g.double(), right @ T_f.double(), table.table, ranks=(1, 2))
+            self.assertEqual(set(expected), set(aligned[key]))
+            for name, values in expected.items():
+                np.testing.assert_allclose(aligned[key][name], values, rtol=1e-6, atol=1e-6)
+            self.assertFalse(np.allclose(
+                aligned[key]["singular_values"], swapped["singular_values"], rtol=1e-3, atol=0))
+
+    def test_learning_rates_of_the_parameter_groups(self):
+        states = []
+        start_stage = StagedRun.start_stage
+
+        def recording_start(run, stage, *args, **kwargs):
+            states.append(start_stage(run, stage, *args, **kwargs))
+            return states[-1]
+
+        for subnet in SUBNETS:
+            states.clear()
+            with patch.object(StagedRun, "start_stage", recording_start):
+                self.train(self.root / f"exp7-lr-{subnet}", subnet=subnet, modes=1,
+                           stage_steps=2, lr=1e-2, encoder_lr=1e-3)
+            mode, groups = states[0].mode, states[0].optimizer.param_groups
+            with self.subTest(subnet=subnet):
+                if subnet == "gpt2":
+                    heads = parameter_ids(mode.left_head) | parameter_ids(mode.right_head)
+                    encoders = (
+                        parameter_ids(mode.left_encoder) | parameter_ids(mode.right_encoder))
+                    self.assertEqual(
+                        [(group["lr"], {id(p) for p in group["params"]}) for group in groups],
+                        [(1e-2, heads), (1e-3, encoders)])
+                else:
+                    # The warmup scales the current rate; initial_lr is the rate it scales.
+                    self.assertEqual(
+                        [(group["initial_lr"], {id(p) for p in group["params"]})
+                         for group in groups],
+                        [(1e-2, parameter_ids(mode))])
+
+    def test_a_non_finite_selection_metric_stops_the_run_before_it_is_recorded(self):
+        for metrics, kept in (([float("nan")], 0), ([0.5, float("nan")], 1)):
+            output = self.root / f"exp7-nan-{kept}"
+            with self.subTest(kept=kept), \
+                    patch("experiments.exp7_independent_subnets.train.selection_energy",
+                          side_effect=metrics), \
+                    self.assertRaisesRegex(RuntimeError, f"stage 1 step {2 * kept + 2}"):
+                self.train(output, modes=1, patience=2)
+            if kept == 0:
+                self.assertFalse((output / "eval_history.jsonl").exists())
+                self.assertFalse((output / "checkpoint.pt").exists())
+            else:
+                self.assertEqual([r["step"] for r in self.records(output)], [2])
+                checkpoint = torch.load(output / "checkpoint.pt", weights_only=True)
+                self.assertEqual([r["step"] for r in checkpoint["history"]], [2])
+
+    def test_modes_may_not_exceed_the_exact_singular_vectors_of_the_selection_table(self):
+        # The fixture's selection table (exp4 train) is 4 x 9: its exact SVD has 4 vectors.
+        output = self.root / "exp7-too-many"
+        with self.assertRaisesRegex(
+                ValueError, "--modes 5 exceeds the 4 exact singular vectors"):
+            self.train(output, modes=5)
+        self.assertFalse(output.exists())
+
+    def test_invalid_scratch_sizes_leave_an_existing_directory_untouched(self):
+        output = self.root / "exp7-scratch-sizes"
+        self.train(output, subnet="scratch", modes=1, stage_steps=2)
+        before = {path: path.stat().st_mtime_ns for path in output.rglob("*")}
+        for change in ({"scratch_width": 6, "scratch_heads": 4}, {"scratch_layers": 0},
+                       {"scratch_width": 0}, {"scratch_heads": 0}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.train(output, subnet="scratch", modes=1, stage_steps=2, overwrite=True,
+                           **{**SCRATCH, **change})
+        self.assertEqual({path: path.stat().st_mtime_ns for path in output.rglob("*")}, before)
+
 
 class ResumeTests(TrainingHelpers, Exp5Fixture):
     def interrupted(self, output_dir, records):
@@ -679,6 +768,72 @@ class ResumeTests(TrainingHelpers, Exp5Fixture):
 
     def mtimes(self, output_dir):
         return {path: path.stat().st_mtime_ns for path in output_dir.rglob("*")}
+
+    def killed_in_write(self, name, call):
+        """Raise KeyboardInterrupt in place of the call-th write of the output file `name`.
+
+        write_atomic leaves the previous file in place, as a kill during the write would.
+        """
+        calls = 0
+
+        def write(path, writer):
+            nonlocal calls
+            if Path(path).name == name:
+                calls += 1
+                if calls == call:
+                    raise KeyboardInterrupt
+            write_atomic(path, writer)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            patch("experiments.exp7_independent_subnets.train.write_atomic", side_effect=write))
+        stack.enter_context(self.assertRaises(KeyboardInterrupt))
+        return stack
+
+    def assert_history_not_ahead_of_the_checkpoint(self, output_dir):
+        """eval_history.jsonl holds no record that checkpoint.pt does not hold."""
+        history = output_dir / "eval_history.jsonl"
+        records = self.records(output_dir) if history.exists() else []
+        if not (output_dir / "checkpoint.pt").exists():
+            self.assertEqual(records, [])
+            return
+        saved = torch.load(output_dir / "checkpoint.pt", weights_only=True)["history"]
+        self.assertEqual(records, saved[:len(records)])
+
+    def test_a_kill_between_the_checkpoint_and_the_history_is_recovered(self):
+        # (file killed in, its call, modes of the killed run): modes=1 evaluates at steps
+        # 2 (first) and 4 (final); "added" first finishes --modes 1, then kills a --modes 2
+        # run at stage 2's first evaluation.
+        cases = {
+            "fresh-checkpoint": ("checkpoint.pt", 1, 1),
+            "fresh-history": ("eval_history.jsonl", 1, 1),
+            "final-checkpoint": ("checkpoint.pt", 2, 1),
+            "final-history": ("eval_history.jsonl", 2, 1),
+            "added-checkpoint": ("checkpoint.pt", 1, 2),
+            "added-history": ("eval_history.jsonl", 1, 2),
+        }
+        for case, (name, call, modes) in cases.items():
+            with self.subTest(case=case):
+                output = self.root / f"exp7-kill-{case}"
+                if modes == 2:
+                    self.train(output, modes=1)
+                with self.killed_in_write(name, call):
+                    self.train(output, modes=modes)
+                self.assert_history_not_ahead_of_the_checkpoint(output)
+                if modes == 2:
+                    # Asking for the finished mode alone leaves no stage-2 record behind.
+                    with contextlib.suppress(ValueError):
+                        self.train(output, modes=1)
+                    self.assert_history_not_ahead_of_the_checkpoint(output)
+                summary = self.train(output, modes=modes)
+                steps = [2, 4] if modes == 1 else [2, 4, 6, 8]
+                self.assertEqual(summary["step"], steps[-1])
+                self.assertEqual([r["step"] for r in self.records(output)], steps)
+                checkpoint = torch.load(output / "checkpoint.pt", weights_only=True)
+                self.assertEqual(checkpoint["history"], self.records(output))
+                self.assertEqual(checkpoint["stage"], None)
+                self.assertEqual([s["stage"] for s in self.stages(output)],
+                                 list(range(1, modes + 1)))
 
     def test_resume_in_the_middle_of_a_stage(self):
         output = self.root / "exp7-resume-middle"
@@ -812,7 +967,9 @@ class ResumeTests(TrainingHelpers, Exp5Fixture):
         with self.interrupted(output, 3):
             self.train(output, modes=2)
         before = self.mtimes(output)
-        with self.assertRaisesRegex(ValueError, "stage 2 is in progress.*--modes 2"):
+        with self.assertRaisesRegex(
+                ValueError, "stage 2 is in progress.*the 1 finished mode\\(s\\) are intact.*"
+                            "--modes 2 or more continues.*--overwrite starts again from nothing"):
             self.train(output, modes=1)
         self.assertEqual(self.mtimes(output), before)
 

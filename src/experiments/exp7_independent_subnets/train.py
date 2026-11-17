@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import gc
 import json
+import math
 import shutil
 import time
 from dataclasses import dataclass
@@ -188,8 +189,9 @@ def _read_checkpoint(output_dir: Path, config: dict, modes: int) -> dict | None:
             f"--modes {modes} (pass --overwrite to start over)")
     if modes == completed and checkpoint["stage"] is not None:
         raise ValueError(
-            f"stage {completed + 1} is in progress in {output_dir}; pass --modes "
-            f"{completed + 1} or more to finish it, or --overwrite to start over")
+            f"stage {completed + 1} is in progress in {output_dir}; the {completed} finished "
+            f"mode(s) are intact and --modes {completed + 1} or more continues the stage; "
+            "--overwrite starts again from nothing")
     for stage in range(1, completed + 1):
         if not _mode_path(output_dir, stage).is_file():
             raise ValueError(
@@ -291,9 +293,18 @@ class StagedRun:
             stage, mode, optimizer, scheduler, Selection(**saved["selection"]),
             stage_step=saved["stage_step"], best_state_dict=saved["best_state_dict"])
 
+    def write_history(self) -> None:
+        write_atomic(
+            self.output_dir / "eval_history.jsonl", lambda tmp: _write_lines(tmp, self.history))
+
     def resume(self, checkpoint: dict) -> StageState:
-        """Load the frozen modes and the progress of checkpoint.pt; the stage to run next."""
+        """Load the frozen modes and the progress of checkpoint.pt; the stage to run next.
+
+        eval_history.jsonl is rewritten from the checkpoint: a run killed after the
+        checkpoint and before the history was written left it a record short.
+        """
         self.step, self.history = checkpoint["step"], checkpoint["history"]
+        self.write_history()
         for stage in range(1, checkpoint["completed_modes"] + 1):
             mode = self.new_mode()
             mode.load_state_dict(torch.load(
@@ -404,6 +415,11 @@ class StagedRun:
                 "seconds_per_step": (now - window_started) / window,
                 **self.compare(state.mode),
             }
+            metric = selection_energy(record)
+            if not math.isfinite(metric):
+                raise RuntimeError(
+                    f"non-finite selection metric {metric} at stage {state.stage} step "
+                    f"{state.stage_step} (step {self.step})")
             lines = [
                 f"stage {state.stage} step {state.stage_step} (step {self.step}): "
                 f"loss {record['train_loss']:.4f}  E[K^2] {record['kernel_energy']:.4f}  "
@@ -413,14 +429,14 @@ class StagedRun:
             lines.extend(format_comparison(key, record[key]) for key in TABLE_KEYS.values())
             print("\n".join(lines), flush=True)
             self.history.append(record)
-            write_atomic(
-                self.output_dir / "eval_history.jsonl",
-                lambda tmp: _write_lines(tmp, self.history))
-            if state.selection.record(selection_energy(record), state.stage_step):
+            if state.selection.record(metric, state.stage_step):
                 state.best_state_dict = {
                     key: value.detach().to("cpu", copy=True)
                     for key, value in state.mode.state_dict().items()}
+            # The checkpoint first: eval_history.jsonl never holds a record that the
+            # checkpoint does not, and a resumed run rewrites it from the checkpoint.
             self.write_checkpoint(state)
+            self.write_history()
             reason = state.selection.reason(state.stage_step)
             if reason is not None:
                 self.finish_stage(state, reason)
@@ -551,6 +567,15 @@ def train_exp7(
     ):
         if value < smallest:
             raise ValueError(f"{name} must be at least {smallest}, got {value}")
+    if subnet == "scratch":
+        for name, value in (("scratch_layers", scratch_layers), ("scratch_width", scratch_width),
+                            ("scratch_heads", scratch_heads)):
+            if value < 1:
+                raise ValueError(f"{name} must be at least 1, got {value}")
+        if scratch_width % scratch_heads:
+            raise ValueError(
+                f"scratch_width must be divisible by scratch_heads, got {scratch_width} "
+                f"and {scratch_heads}")
     config = {
         "inference_dir": str(inference_dir), "store_dir": str(store_dir),
         "model_path": str(model_path), "subnet": subnet, "stage_steps": stage_steps,
@@ -579,6 +604,15 @@ def train_exp7(
         inference_dir=inference_dir, store_dir=store_dir, model_path=model_path,
         device=device, seed=seed, encode_batch=encode_batch,
     )
+    # compare_with_exact_svd drops ranks above the exact singular vectors the table
+    # holds, so beyond them the selection metric would not depend on the current mode.
+    selection_name = next(name for name, key in TABLE_KEYS.items() if key == "selection")
+    exact = tables[selection_name].table
+    exact_modes = min(exact.left_vectors.shape[1], exact.right_vectors.shape[1])
+    if modes > exact_modes:
+        raise ValueError(
+            f"--modes {modes} exceeds the {exact_modes} exact singular vectors of the "
+            f"selection table (exp4 {selection_name!r} in {inference_dir})")
     if overwrite:
         for name in ("checkpoint.pt", "eval_history.jsonl", "stages.jsonl", "alignment.pt"):
             (output_dir / name).unlink(missing_ok=True)
