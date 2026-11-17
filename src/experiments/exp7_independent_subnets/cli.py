@@ -29,9 +29,12 @@ def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     train_parser.add_argument(
-        "--subnet", choices=SUBNETS, default="gpt2",
-        help="gpt2: each side of a mode is a trainable copy of the model's transformer; "
-             "scratch: each side is a randomly initialised GPT-2 transformer",
+        # roberta is offered once its encoder exists.
+        "--subnet", choices=[kind for kind in SUBNETS if kind != "roberta"], default="scratch",
+        help="Encoders of each side of a mode. scratch: a randomly initialised bidirectional "
+             "BERT transformer reading the model's token ids, mean-pooled over all positions; "
+             "roberta: not available yet; gpt2 (kept, not in the planned runs): a trainable "
+             "copy of the model's causal transformer, read at the last token",
     )
     train_parser.add_argument(
         "--modes", type=positive_int, default=8,

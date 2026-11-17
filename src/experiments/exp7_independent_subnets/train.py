@@ -47,7 +47,7 @@ from experiments.exp5_gpt2_mlp_table.train import (
 from utils.common import save_json, write_atomic
 from utils.inference import CausalLMInference
 
-from . import SUBNETS, TABLE_KEYS, WARMUP_STEPS
+from . import PRETRAINED, SUBNETS, TABLE_KEYS, WARMUP_STEPS
 from .align import Moments, alignment, max_correlation
 from .model import Mode, build_mode, token_vectors
 from .stage import Selection, residual_target, stage_loss
@@ -55,6 +55,14 @@ from .stage import Selection, residual_target, stage_loss
 # Added to the stage number when seeding the weights of a new mode, so the seeds
 # of the modes never meet the sampler's seeds, which use the global step.
 MODE_SEED_OFFSET = 10**9
+# metadata.json's description of each encoder of a mode, per kind.
+ENCODERS = {
+    "scratch": "a randomly initialised BERT transformer (bidirectional attention, no pooler, "
+               "dropout 0) with its own token and position embeddings, reading the model's "
+               "token ids; pooled vector: the mean of its last hidden state over all positions",
+    "gpt2": "a trainable copy of the model's transformer (causal attention, dropout off); "
+            "pooled vector: the hidden state of the last position",
+}
 
 
 def frozen_outputs(
@@ -269,7 +277,7 @@ class StagedRun:
         if saved is None:
             torch.manual_seed(sampler_seed(config["seed"], MODE_SEED_OFFSET + stage))
         mode = self.new_mode()
-        if config["subnet"] == "gpt2":
+        if config["subnet"] in PRETRAINED:
             optimizer = torch.optim.Adam([
                 {"params": [*mode.left_head.parameters(), *mode.right_head.parameters()],
                  "lr": config["lr"]},
@@ -544,9 +552,9 @@ def train_exp7(
     ends after stage_steps steps or, with patience > 0, once past
     min_stage_steps the selection metric has not improved for `patience`
     evaluations; it then freezes the weights of its best evaluation (its last
-    with patience 0). gpt2 modes train their encoders with encoder_lr and
-    their heads with lr; scratch modes train everything with lr after a linear
-    warmup.
+    with patience 0). Modes of a pretrained kind (PRETRAINED) train their
+    encoders with encoder_lr and their heads with lr; scratch modes train
+    everything with lr after a linear warmup.
 
     Writes eval_history.jsonl (one line per evaluation), stages.jsonl (one
     line per finished stage), modes/mode-XX.pt, alignment.pt (the latest
@@ -650,13 +658,15 @@ def train_exp7(
     write_atomic(output_dir / "metadata.json", lambda tmp: save_json(tmp, {
         **config,
         "modes": modes,
-        "warmup_steps": WARMUP_STEPS if subnet == "scratch" else 0,
-        "left_side": "per mode: its own encoder reading the history; LayerNorm + linear head "
-                     "to one number",
-        "right_side": "per mode: its own encoder reading the future; LayerNorm + linear head "
-                      "to w(future), the unembedding width E; feature <w(future), v_z> / "
-                      "sqrt(E) with v_z the frozen model's centered unembedding row of the "
-                      "header token over the root mean square of all entries",
+        "warmup_steps": 0 if subnet in PRETRAINED else WARMUP_STEPS,
+        "encoder": ENCODERS[subnet],
+        "left_side": "per mode: its own encoder reading the history, pooled to one vector; "
+                     "LayerNorm + linear head to one number",
+        "right_side": "per mode: its own encoder reading the future, pooled to one vector; "
+                      "LayerNorm + linear head to w(future), the unembedding width E; "
+                      "feature <w(future), v_z> / sqrt(E) with v_z the frozen model's "
+                      "centered unembedding row of the header token over the root mean "
+                      "square of all entries",
         "trainable_parameters_of": "one mode; no two modes share a trainable parameter",
         **shared,
     }))
@@ -664,12 +674,14 @@ def train_exp7(
     print(f"Waiting for the first sample block in {store_dir}", flush=True)
     run.sampler.wait_until_ready()
     if subnet == "gpt2":
-        rates = f"copies of the model's transformer; heads lr {lr}, encoders lr {encoder_lr}"
+        rates = (
+            f"copies of the model's transformer read at the last token; heads lr {lr}, "
+            f"encoders lr {encoder_lr}")
     else:
         rates = (
-            f"scratch transformers of {scratch_layers} layers, width {scratch_width}, "
-            f"{scratch_heads} heads; lr {lr} with a linear warmup over the first "
-            f"{WARMUP_STEPS} steps of each stage")
+            f"bidirectional scratch transformers of {scratch_layers} layers, width "
+            f"{scratch_width}, {scratch_heads} heads, mean-pooled; lr {lr} with a linear "
+            f"warmup over the first {WARMUP_STEPS} steps of each stage")
     print(
         f"Training {modes} modes on {device}: {batch_size} pairs x {top_k} header tokens "
         f"per step, up to {stage_steps} steps per stage, {rates}",

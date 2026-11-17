@@ -575,22 +575,22 @@ This is a staged form of the sequential nesting of the NeuralSVD paper (arXiv:24
 ### One mode
 
 ```text
-left u_l:   history (64 tokens) -> encoder_l^L -> last hidden state
+left u_l:   history (64 tokens) -> encoder_l^L -> pooled vector
                                 -> LayerNorm (no affine) -> Linear(·, 1) -> a number
 
-right v_l:  future (32 tokens)  -> encoder_l^R -> last hidden state
+right v_l:  future (32 tokens)  -> encoder_l^R -> pooled vector
                                 -> LayerNorm (no affine) -> Linear(·, E) -> w_l(future), (E,)
             v_l(future, z) = ⟨w_l(future), e_z⟩ / sqrt(E)
 ```
 
 `E` is the width of the frozen model's unembedding (768 for GPT-2 Small). `e_z` is the unembedding row of token `z` minus the mean row, divided by the root mean square of all entries, as in exp6; it is neither trained nor saved. The right side has this form because the target itself is `⟨s(history + future) − s(future), e_z − ē⟩` (see [exp6](#experiment-6-a-right-side-bilinear-in-the-header-token)), so every right singular function is the inner product of a vector that depends only on the future with `e_z`.
 
-`--subnet` selects the encoders:
+`--subnet` selects the encoders. Every encoder turns a sequence of tokens into one vector, the pooled vector. Sequences have a fixed length (history 64, future 32) and no padding, so no attention mask is needed.
 
-| `--subnet` | Each encoder | Learning rates |
-| --- | --- | --- |
-| `gpt2` (default) | A trainable copy of the model's transformer, dropout off: exp6's encoder, so only "independent or shared" changes | encoders `--encoder-lr` (default 2e-5), heads `--lr` (default 3e-4) |
-| `scratch` | A randomly initialised GPT-2 transformer with its own token and position embeddings and the model's vocabulary, dropout 0; `--scratch-layers` 6, `--scratch-width` 384, `--scratch-heads` 6 by default | everything `--lr`, with a linear warmup over the first 1000 steps of each stage |
+| `--subnet` | Each encoder | Pooled vector | Learning rates |
+| --- | --- | --- | --- |
+| `scratch` (default) | A randomly initialised BERT transformer (`transformers.BertModel` without its pooler), bidirectional, trained from scratch, dropout 0, with its own token and position embeddings; it reads the model's token ids directly; `--scratch-layers` 6, `--scratch-width` 384, `--scratch-heads` 6 by default | The mean of the last hidden state over all positions | everything `--lr` (default 3e-4), with a linear warmup over the first 1000 steps of each stage |
+| `gpt2` (kept, not used in the planned runs) | A trainable copy of the model's transformer, causal, dropout off: exp6's encoder, so only "independent or shared" changes | The hidden state of the last position | encoders `--encoder-lr` (default 2e-5), heads `--lr` (default 3e-4) |
 
 Each stage starts a new Adam optimizer.
 
@@ -636,15 +636,14 @@ M = Λ_f^{-1/2} C Λ_g^{-1/2} = P S Qᵀ        T_f = Λ_f^{-1/2} P S^{1/2}     
 
 ### Run
 
-exp7 needs what exp5 and exp6 need: the exp4 tables and a sample store from the same model. The first step runs stage 1 alone, once with each kind of sub-network; a larger `--modes` then continues in the same directory:
+exp7 needs what exp5 and exp6 need: the exp4 tables and a sample store from the same model. The first step runs stage 1 alone; a larger `--modes` then continues in the same directory:
 
 ```bash
-uv run exp7 train --subnet gpt2 --modes 1
-uv run exp7 train --subnet scratch --modes 1
-uv run exp7 train --subnet gpt2 --modes 8     # continues the same directory
+uv run exp7 train --modes 1     # --subnet scratch, the default
+uv run exp7 train --modes 8     # continues the same directory
 ```
 
-Outputs go to `<results-root>/exp7_independent_subnets/<dataset>__<model>/train-<subnet>/`, so the two kinds have separate directories. On BlueHive, submit `bluehive_run/exp7-train.sbatch`; arguments after the script name are passed to the command, and resubmitting continues the current stage.
+Outputs go to `<results-root>/exp7_independent_subnets/<dataset>__<model>/train-<subnet>/`, so each kind has its own directory. On BlueHive, submit `bluehive_run/exp7-train.sbatch`; arguments after the script name are passed to the command, and resubmitting continues the current stage.
 
 Running the same command again continues: the frozen modes are loaded from `modes/`, and an interrupted stage continues at its last evaluation with its best weights and its count of evaluations without a new best. The sampler is reseeded from `--seed` and the global step, so a continued run draws other pairs. Between runs of one directory:
 
@@ -661,7 +660,7 @@ Running the same command again continues: the frozen modes are loaded from `mode
 | `modes/mode-XX.pt` | The frozen mode `XX` (two encoders and two heads): `state_dict`, `stage`, `best_step` |
 | `alignment.pt` | The latest alignment: `T_f`, `T_g`, `S` and `modes`, the number of modes it covers |
 | `checkpoint.pt` | `config` (the settings a continued run must repeat), `completed_modes`, the global `step`, the evaluation `history`, and `stage`: empty between stages, otherwise the stage step, the current mode's weights, its best weights, the optimizer, the warmup schedule of a `scratch` mode and the state of the stopping rule (best value, its step, evaluations since) |
-| `metadata.json` | All settings, `modes`, `warmup_steps`, descriptions of the two sides, and exp5's run metadata; `trainable_parameters` counts one mode, `tables` and `table_shapes` use the keys `selection` and `report`, and `ranks` reads `1..l at stage l` |
+| `metadata.json` | All settings, `modes`, `warmup_steps`, descriptions of the `encoder` and of the two sides, and exp5's run metadata; `trainable_parameters` counts one mode, `tables` and `table_shapes` use the keys `selection` and `report`, and `ranks` reads `1..l at stage l` |
 
 `eval_history.jsonl`:
 
@@ -717,7 +716,7 @@ With several stages, look also at the difference between the energy before and a
 ### Resources (estimated, not measured)
 
 - `gpt2`: a step needs the same gradient memory as exp6 (about 16 GB at batch 128). Each frozen mode adds about 1 GB of weights and two forward-only GPT-2 passes, so stage 8 needs about 23 GB and a step takes about two to three times as long as in stage 1.
-- `scratch` (default size): each encoder has about 30 million parameters, about 19 million of them in the token embedding.
+- `scratch` (default size, a 6-layer BERT of width 384): each encoder has about 30 million parameters, about 19 million of them in the token embedding of GPT-2's 50257 tokens.
 - Disk: every evaluation rewrites the whole checkpoint (the current mode, its best weights and the optimizer state). For `gpt2`, a run directory with 8 modes is estimated at about 16 GB, including the checkpoint's temporary file. This is an estimate, not a measurement.
 
 ### Small smoke run

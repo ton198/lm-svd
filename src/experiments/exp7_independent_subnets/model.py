@@ -9,13 +9,16 @@ the unembedding width E, which meets the header token z only in the inner produc
 
 with v_z the unembedding row of z minus the mean row, at unit scale. No
 parameter is shared between the two sides or between two modes.
+
+An encoder maps token ids (B, T) to one pooled vector per sequence (B, width).
+Sequences have a fixed length and no padding, so no attention mask is needed.
 """
 
 from __future__ import annotations
 
 import torch
 from torch import nn
-from transformers import GPT2Config, GPT2Model
+from transformers import BertConfig, BertModel
 
 from experiments.exp7_independent_subnets import SUBNETS
 from experiments.exp5_gpt2_mlp_table.model import linear_head, trainable_encoder
@@ -30,19 +33,45 @@ def token_vectors(unembedding: torch.Tensor) -> torch.Tensor:
     return centered / centered.square().mean().sqrt()
 
 
+class LastToken(nn.Module):
+    """A causal transformer read at its last position."""
+
+    def __init__(self, transformer: nn.Module, width: int) -> None:
+        super().__init__()
+        self.transformer = transformer
+        self.width = width
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        """(B, T) token ids -> (B, width)."""
+        return self.transformer(input_ids=ids, use_cache=False).last_hidden_state[:, -1].float()
+
+
+class MeanPool(nn.Module):
+    """A transformer's last hidden state averaged over all positions."""
+
+    def __init__(self, transformer: nn.Module, width: int) -> None:
+        super().__init__()
+        self.transformer = transformer
+        self.width = width
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        """(B, T) token ids -> (B, width)."""
+        return self.transformer(input_ids=ids).last_hidden_state.mean(dim=1).float()
+
+
 def scratch_encoder(
     vocab_size: int, positions: int, layers: int, width: int, heads: int
-) -> nn.Module:
-    """A randomly initialised GPT-2 transformer, with dropout off."""
-    return GPT2Model(GPT2Config(
-        vocab_size=vocab_size, n_positions=positions, n_embd=width, n_layer=layers,
-        n_head=heads, resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0,
-        bos_token_id=None, eos_token_id=None,
-    ))
+) -> MeanPool:
+    """A randomly initialised bidirectional BERT transformer, dropout off, mean-pooled.
 
-
-def _last_hidden(encoder: nn.Module, ids: torch.Tensor) -> torch.Tensor:
-    return encoder(input_ids=ids, use_cache=False).last_hidden_state[:, -1].float()
+    It reads GPT-2 token ids directly; BERT's own pooler is left out.
+    """
+    return MeanPool(BertModel(BertConfig(
+        vocab_size=vocab_size, hidden_size=width, num_hidden_layers=layers,
+        num_attention_heads=heads, intermediate_size=4 * width,
+        max_position_embeddings=positions, type_vocab_size=1,
+        hidden_dropout_prob=0.0, attention_probs_dropout_prob=0.0,
+    ), add_pooling_layer=False), width)
 
 
 class Mode(nn.Module):
@@ -61,11 +90,11 @@ class Mode(nn.Module):
 
     def left_features(self, history_ids: torch.Tensor) -> torch.Tensor:
         """(B, H) token ids -> (B,)."""
-        return self.left_head(_last_hidden(self.left_encoder, history_ids)).squeeze(-1)
+        return self.left_head(self.left_encoder(history_ids)).squeeze(-1)
 
     def right_vectors(self, future_ids: torch.Tensor) -> torch.Tensor:
         """w(future): (F, T) token ids -> (F, E)."""
-        return self.right_head(_last_hidden(self.right_encoder, future_ids))
+        return self.right_head(self.right_encoder(future_ids))
 
     def right_features(
         self, future_ids: torch.Tensor, header_ids: torch.Tensor, vectors: torch.Tensor
@@ -84,19 +113,27 @@ def build_mode(
     scratch_width: int,
     scratch_heads: int,
 ) -> Mode:
-    """One mode: `gpt2` copies the teacher's transformer per side, `scratch` starts at random."""
+    """One mode with two encoders of kind `subnet` and their two heads.
+
+    `scratch` starts each side at a random BERT transformer, `gpt2` at a copy of
+    the teacher's transformer.
+    """
     if subnet not in SUBNETS:
         raise ValueError(f"subnet must be one of {SUBNETS}, got {subnet!r}")
-    if subnet == "gpt2":
-        left_encoder, right_encoder = trainable_encoder(inference), trainable_encoder(inference)
-        width = inference.model.config.hidden_size
-    else:
+    if subnet == "scratch":
         left_encoder, right_encoder = (
             scratch_encoder(
                 inference.vocab_size, inference.max_length,
                 scratch_layers, scratch_width, scratch_heads)
             for _ in range(2)
         )
-        width = scratch_width
+    elif subnet == "gpt2":
+        width = inference.model.config.hidden_size
+        left_encoder, right_encoder = (
+            LastToken(trainable_encoder(inference), width) for _ in range(2))
+    else:
+        raise ValueError(f"subnet {subnet!r} cannot be built yet")
     embedding = inference.model.get_output_embeddings().weight.shape[1]
-    return Mode(left_encoder, right_encoder, linear_head(width, 1), linear_head(width, embedding))
+    return Mode(
+        left_encoder, right_encoder,
+        linear_head(left_encoder.width, 1), linear_head(right_encoder.width, embedding))

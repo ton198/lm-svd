@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from transformers import BertModel, GPT2Model
 
 from experiments.exp4_table_neural_svd.train import compare_with_exact_svd
 from experiments.exp5_gpt2_mlp_table.features import (
@@ -23,7 +24,12 @@ from experiments.exp5_gpt2_mlp_table.train import draw_pairs
 from experiments.exp5_gpt2_mlp_table.tables import load_eval_table
 from experiments.exp7_independent_subnets.align import Moments, alignment, max_correlation
 from experiments.exp7_independent_subnets.cli import main
-from experiments.exp7_independent_subnets.model import build_mode, token_vectors
+from experiments.exp7_independent_subnets.model import (
+    LastToken,
+    MeanPool,
+    build_mode,
+    token_vectors,
+)
 from experiments.exp7_independent_subnets.stage import Selection, residual_target, stage_loss
 from experiments.exp7_independent_subnets.train import (
     StagedRun,
@@ -79,26 +85,81 @@ class ModeTests(Exp5Fixture):
                 input_ids=histories, use_cache=False).last_hidden_state[:, -1]
             gpt2 = build_mode(self.inference, "gpt2", **SCRATCH)
             for encoder in (gpt2.left_encoder, gpt2.right_encoder):
-                hidden = encoder(input_ids=histories, use_cache=False).last_hidden_state[:, -1]
-                torch.testing.assert_close(hidden, teacher, atol=1e-6, rtol=0)
+                torch.testing.assert_close(encoder(histories), teacher, atol=1e-6, rtol=0)
             scratch = build_mode(self.inference, "scratch", **SCRATCH)
         teacher_ids = parameter_ids(self.inference.model)
+        teacher_tokens = self.inference.model.base_model.wte.weight
         for encoder in (scratch.left_encoder, scratch.right_encoder):
-            self.assertEqual(encoder.config.n_embd, 4)
-            self.assertEqual(encoder.config.n_layer, 1)
-            self.assertEqual(encoder.config.n_head, 2)
-            self.assertEqual(encoder.config.vocab_size, VOCAB)
-            self.assertEqual(encoder.config.n_positions, 8)
+            config = encoder.transformer.config
+            self.assertEqual(config.hidden_size, 4)
+            self.assertEqual(config.num_hidden_layers, 1)
+            self.assertEqual(config.num_attention_heads, 2)
+            self.assertEqual(config.vocab_size, VOCAB)
+            self.assertEqual(config.max_position_embeddings, 8)
             self.assertEqual(
-                (encoder.config.resid_pdrop, encoder.config.embd_pdrop, encoder.config.attn_pdrop),
-                (0.0, 0.0, 0.0))
+                (config.hidden_dropout_prob, config.attention_probs_dropout_prob), (0.0, 0.0))
             self.assertFalse(parameter_ids(encoder) & teacher_ids)
-            self.assertEqual(
-                encoder.wte.weight.shape, self.inference.model.base_model.wte.weight.shape[:1] + (4,))
-            self.assertFalse(torch.equal(
-                encoder.wte.weight[:, :4], self.inference.model.base_model.wte.weight[:, :4]))
+            tokens = encoder.transformer.embeddings.word_embeddings.weight
+            self.assertEqual(tokens.shape, teacher_tokens.shape[:1] + (4,))
+            self.assertFalse(torch.equal(tokens[:, :4], teacher_tokens[:, :4]))
         self.assertEqual(scratch.left_head[1].in_features, 4)
         self.assertEqual(scratch.right_head[1].out_features, 8)
+
+    @staticmethod
+    def last_token_changed(ids: torch.Tensor) -> torch.Tensor:
+        changed = ids.clone()
+        changed[:, -1] = (changed[:, -1] + 1) % VOCAB
+        return changed
+
+    def test_scratch_is_bidirectional_and_mean_pooled(self):
+        encoder = build_mode(self.inference, "scratch", **SCRATCH).left_encoder
+        self.assertIsInstance(encoder, MeanPool)
+        self.assertIsInstance(encoder.transformer, BertModel)
+        self.assertIsNone(encoder.transformer.pooler)
+        config = encoder.transformer.config
+        self.assertEqual(
+            (config.hidden_size, config.num_hidden_layers, config.num_attention_heads,
+             config.hidden_dropout_prob, config.attention_probs_dropout_prob,
+             config.vocab_size, config.max_position_embeddings),
+            (4, 1, 2, 0.0, 0.0, self.inference.vocab_size, self.inference.max_length))
+        ids = torch.tensor(HISTORIES)
+        with torch.no_grad():
+            pooled = encoder(ids)
+            hidden = encoder.transformer(input_ids=ids).last_hidden_state
+            changed = encoder.transformer(input_ids=self.last_token_changed(ids)).last_hidden_state
+        torch.testing.assert_close(pooled, hidden.mean(dim=1), atol=1e-6, rtol=0)
+        # A causal model's first position does not see the last token.
+        self.assertFalse(torch.allclose(changed[:, 0], hidden[:, 0], atol=1e-4))
+        self.assertFalse(torch.allclose(pooled, hidden[:, -1], atol=1e-4))
+        self.assertFalse(torch.allclose(pooled, hidden[:, 0], atol=1e-4))
+
+    def test_gpt2_is_causal_and_reads_the_last_token(self):
+        encoder = build_mode(self.inference, "gpt2", **SCRATCH).left_encoder
+        self.assertIsInstance(encoder, LastToken)
+        self.assertIsInstance(encoder.transformer, GPT2Model)
+        ids = torch.tensor(HISTORIES)
+        with torch.no_grad():
+            teacher = self.inference.model.base_model(
+                input_ids=ids, use_cache=False).last_hidden_state[:, -1]
+            hidden = encoder.transformer(input_ids=ids, use_cache=False).last_hidden_state
+            changed = encoder.transformer(
+                input_ids=self.last_token_changed(ids), use_cache=False).last_hidden_state
+            torch.testing.assert_close(encoder(ids), teacher, atol=1e-6, rtol=0)
+        torch.testing.assert_close(changed[:, 0], hidden[:, 0], atol=0, rtol=0)
+        self.assertFalse(torch.allclose(changed[:, -1], hidden[:, -1], atol=1e-4))
+
+    def test_every_kind_gives_one_vector_per_sequence(self):
+        widths = {"scratch": 4, "gpt2": self.inference.model.config.hidden_size}
+        for subnet in SUBNETS:
+            mode = build_mode(self.inference, subnet, **SCRATCH)
+            for encoder in (mode.left_encoder, mode.right_encoder):
+                self.assertEqual(encoder.width, widths[subnet])
+                self.assertEqual(encoder.width, encoder.transformer.config.hidden_size)
+                for ids in (HISTORIES, FUTURES):
+                    with self.subTest(subnet=subnet, length=len(ids[0])), torch.no_grad():
+                        pooled = encoder(torch.tensor(ids))
+                        self.assertEqual(pooled.shape, (len(ids), encoder.width))
+                        self.assertEqual(pooled.dtype, torch.float32)
 
     def test_the_four_parts_of_a_mode_and_two_modes_share_no_parameter(self):
         for subnet in SUBNETS:
@@ -139,6 +200,9 @@ class ModeTests(Exp5Fixture):
     def test_unknown_subnet_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "subnet"):
             build_mode(self.inference, "mlp", **SCRATCH)
+        # A known kind whose encoder does not exist yet.
+        with self.assertRaisesRegex(ValueError, "roberta"):
+            build_mode(self.inference, "roberta", **SCRATCH)
 
 
 class StageTests(unittest.TestCase):
@@ -581,8 +645,12 @@ class TrainingTests(TrainingHelpers, Exp5Fixture):
                          [(1, "steps"), (2, "steps")])
         state = torch.load(output / "modes" / "mode-01.pt", weights_only=True)["state_dict"]
         for side in ("left_encoder", "right_encoder"):
-            self.assertEqual(state[f"{side}.wte.weight"].shape, (VOCAB, 4))
-            self.assertEqual(state[f"{side}.wpe.weight"].shape[1], 4)
+            embeddings = f"{side}.transformer.embeddings"
+            self.assertEqual(state[f"{embeddings}.word_embeddings.weight"].shape, (VOCAB, 4))
+            self.assertEqual(state[f"{embeddings}.position_embeddings.weight"].shape[1], 4)
+            # The BERT structure: its blocks are encoder.layer.i, not GPT-2's h.i.
+            self.assertTrue(any(
+                key.startswith(f"{side}.transformer.encoder.layer.") for key in state))
         self.assertEqual(state["left_head.1.weight"].shape, (1, 4))
         self.assertEqual(state["right_head.1.weight"].shape, (8, 4))
         metadata = json.loads((output / "metadata.json").read_text())
@@ -590,6 +658,8 @@ class TrainingTests(TrainingHelpers, Exp5Fixture):
             {key: metadata[key] for key in (
                 "subnet", "scratch_layers", "scratch_width", "scratch_heads")},
             {"subnet": "scratch", "scratch_layers": 1, "scratch_width": 4, "scratch_heads": 2})
+        self.assertEqual(metadata["warmup_steps"], 1000)
+        self.assertIn("BERT", metadata["encoder"])
         self.assertIn("linear warmup over the first 1000 steps", self.log)
 
     def test_two_stages_learn_and_the_second_starts_from_a_smaller_residual(self):
@@ -1047,7 +1117,7 @@ class CLITests(Exp5Fixture):
                 "subnet", "modes", "stage_steps", "min_stage_steps", "patience", "align_pairs",
                 "scratch_layers", "scratch_width", "scratch_heads", "batch_size", "eval_every",
                 "lr", "encoder_lr", "seed", "device", "overwrite")},
-            {"subnet": "gpt2", "modes": 8, "stage_steps": 30000, "min_stage_steps": 5000,
+            {"subnet": "scratch", "modes": 8, "stage_steps": 30000, "min_stage_steps": 5000,
              "patience": 5, "align_pairs": 16384, "scratch_layers": 6, "scratch_width": 384,
              "scratch_heads": 6, "batch_size": 128, "eval_every": 1000, "lr": 3e-4,
              "encoder_lr": 2e-5, "seed": 42, "device": "cuda", "overwrite": False})
@@ -1059,10 +1129,11 @@ class CLITests(Exp5Fixture):
             "data/experiment_results/exp4_table_neural_svd/wikitext-large__gpt2-small/inference"))
         self.assertEqual(options["output_dir"], Path(
             "data/experiment_results/exp7_independent_subnets/wikitext-large__gpt2-small"
-            "/train-gpt2"))
+            "/train-scratch"))
 
     def test_usage_errors(self):
-        for arguments in (["--subnet", "mlp"], ["--modes", "0"], ["--patience", "-1"],
+        # roberta is not offered before its encoder exists.
+        for arguments in (["--subnet", "mlp"], ["--subnet", "roberta"], ["--modes", "0"], ["--patience", "-1"],
                           ["--min-stage-steps", "10", "--stage-steps", "5"]):
             with self.subTest(arguments=arguments), \
                     patch("experiments.exp7_independent_subnets.train.train_exp7") as train, \
