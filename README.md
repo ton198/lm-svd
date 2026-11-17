@@ -870,9 +870,9 @@ Things to keep in mind when reading the numbers:
 - **Windows are not excluded from the tables**, as in exp5–exp7. With the defaults about 0.4% of the report table's futures and 0.8% of its histories are also drawn as training windows in a `center` run, and about 2% of its futures in a `mean` run.
 - A prototype run's `train_loss` includes the `--mean-weight` term. `mean R2` equals `energy / ceiling`.
 
-### Results (wikitext-large, GPT-2 Small; report table, snapshot of 2026-11-17 04:20)
+### Results (wikitext-large, GPT-2 Small; report table)
 
-Runs marked with their step were still training when the numbers were read. Every number is the last line of the run's `eval_history.jsonl` at that time.
+Every number is the last line of the run's `eval_history.jsonl`. All runs finished, except the `landmark` run with 128 histories, which reached its six-hour limit at step 23,000 of 30,000.
 
 **A. The modes behind the column means are real.** Report table minus its column means, two random splits:
 
@@ -885,55 +885,68 @@ Runs marked with their step were still training when the numbers were read. Ever
 
 Half of the histories and half of the futures (512 × 256) predict the other block at 0.62 of its energy at rank 32, where its own SVD has 0.72. exp4's `--centering column-mean` runs reached 0.03 on this table, so the modes were there and the training missed them. The leading left vectors are topics of the history (film and music against military history, sport against philosophy, video games against politics), and one is its layout (a history ending in a list or heading).
 
-**C. The column means need the model's own output layer, not a prefix.** Ceiling 0.642, exact rank 1 0.654:
+**C. The column means need the model's own output layer; a prefix adds little.** Ceiling 0.642, exact rank 1 0.654:
 
 | Student | Energy |
 | --- | ---: |
 | Copy of the model with the frozen unembedding, future alone (`--prefix-tokens 0`), 20,000 steps | 0.611 |
 | The same after 1,000 steps | 0.570 |
-| The same with 64 prefix vectors, step 9,000 of 20,000 | 0.593 |
+| The same with 64 prefix vectors, 20,000 steps | 0.618 |
 | exp7's right sub-network, GPT-2 copy (`--generic gpt2`), 10,000 steps | 0.512 |
 | exp7's right sub-network, MiniLMv2 (`--generic roberta`), 10,000 steps | 0.435 |
 | Mean of 32 trained prototype rows (study D) | 0.640 |
 | exp7's first stage, for reference (RoBERTa-base / MiniLMv2 / scratch) | 0.42 / 0.40 / 0.37 |
 
-**B and D. With the column means out of the target, the modes are learned and carry over.** Energy of the report table minus its column means, by rank (exact: 0.101, 0.173, 0.291, 0.431, 0.567, 0.682, 0.774, 0.849 at ranks 1, 2, 4, …, 128):
+**B and D. With the column means out of the target, the modes are learned and carry over.** Energy of the report table minus its column means, by rank (exact: 0.101, 0.173, 0.291, 0.431, 0.567, 0.682, 0.774, 0.849 at ranks 1, 2, 4, …, 128). Runs have 32 modes and 30,000 steps (`shared`, `landmark`) or 20,000 steps (`prototype`) unless the row says otherwise:
 
 | Run | 1 | 4 | 8 | 16 | 32 | 64 | 128 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | exp4 `train-column-mean-switch-1024x512-every10000`, 100,000 steps | 0.00 | 0.03 | 0.02 | 0.01 | 0.00 | | |
 | `shared`, `scratch` | 0.045 | 0.135 | 0.189 | 0.231 | 0.257 | | |
 | `shared`, MiniLMv2 | 0.057 | 0.181 | 0.246 | 0.308 | 0.352 | | |
-| `independent`, MiniLMv2, `sequential`, 8 modes (step 27,000 of 30,000) | 0.062 | 0.181 | 0.245 | | | | |
+| `independent`, MiniLMv2, `sequential`, 8 modes | 0.062 | 0.182 | 0.246 | | | | |
 | `shared`, `gpt2-mean` | 0.048 | 0.195 | 0.268 | 0.341 | 0.397 | | |
+| `shared`, `gpt2-mean` with `--right-encoder gpt2` | 0.049 | 0.199 | 0.279 | 0.359 | 0.420 | | |
 | `shared`, `gpt2` | 0.057 | 0.195 | 0.283 | 0.362 | 0.421 | | |
-| `shared`, `gpt2`, 128 modes (step 27,000 of 30,000) | 0.034 | 0.169 | 0.266 | 0.347 | 0.413 | 0.457 | 0.479 |
-| `landmark`, 64 fixed histories (step 17,000 of 30,000) | 0.075 | 0.232 | 0.352 | 0.438 | 0.490 | | |
-| `prototype`, 32 trained (20,000 steps) | 0.076 | 0.249 | 0.386 | 0.499 | 0.560 | | |
-| `prototype`, 64 trained (step 7,000 of 20,000) | 0.062 | 0.237 | 0.377 | 0.483 | 0.570 | 0.600 | |
-| `prototype`, 128 trained (step 3,000 of 12,000) | 0.056 | 0.174 | 0.307 | 0.419 | 0.507 | 0.555 | 0.577 |
+| `shared`, `gpt2`, 64 × 32 grids, 15,000 steps | 0.064 | 0.189 | 0.283 | 0.362 | 0.423 | | |
+| `shared`, `gpt2`, 128 modes | 0.034 | 0.169 | 0.267 | 0.348 | 0.415 | 0.460 | 0.482 |
+| `landmark`, 32 fixed histories, 15,000 steps | 0.058 | 0.209 | 0.299 | 0.366 | 0.400 | | |
+| `landmark`, 64 fixed histories | 0.078 | 0.236 | 0.356 | 0.443 | 0.497 | | |
+| `landmark`, 128 fixed histories, 64 modes (step 23,000 of 30,000) | 0.084 | 0.244 | 0.383 | 0.488 | 0.565 | 0.604 | |
+| `prototype`, 32 trained | 0.076 | 0.249 | 0.386 | 0.499 | 0.560 | | |
+| `prototype`, 32 trained, seed 1 | 0.095 | 0.251 | 0.376 | 0.497 | 0.561 | | |
+| `prototype`, 32 trained, `sequential` | 0.094 | 0.266 | 0.384 | 0.494 | 0.561 | | |
+| `prototype`, 32 trained, `--train-copy` | 0.074 | 0.247 | 0.384 | 0.495 | 0.557 | | |
+| `prototype`, 64 trained, 64 modes | 0.070 | 0.249 | 0.391 | 0.502 | 0.598 | 0.634 | |
+| `prototype`, 128 trained, 128 modes, 12,000 steps | 0.068 | 0.202 | 0.361 | 0.481 | 0.580 | 0.634 | 0.656 |
 
-The selection table gives the same picture, 0.01–0.02 higher. A second seed of the 32-prototype run agrees with the first at the same step (0.523 and 0.524 at step 6,000). Training the copy's weights as well (`--train-copy`) was behind at step 10,000 (0.527 against 0.542) and lost the first mode (0.567 against 0.640).
+The selection table gives the same picture, 0.01–0.02 higher. The two seeds of the 32-prototype run end at 0.560 and 0.561, and `sequential` nesting at 0.561. Training the copy's weights as well (`--train-copy`) leaves the modes where they were (0.557) and loses a part of the first mode (0.601 against 0.640). Grids of 64 × 32 reach in 15,000 steps what grids of 32 × 16 reach in 30,000, at twice the computation.
 
-**On exp5–exp7's measure** (report table minus `g`; exact 0.654 at rank 1, 0.887 at rank 33, 0.919 at rank 65):
+**On exp5–exp7's measure** (report table minus `g`; exact 0.654 at rank 1, 0.887 at rank 33, 0.919 at rank 65, 0.946 at rank 129):
 
 | Model | Modes | Energy |
 | --- | ---: | ---: |
 | exp5, exp6 (any rank up to 128) | 128 | 0.47–0.51 |
 | exp7, first stage | 1 | 0.37–0.42 |
-| Control: `shared`, `gpt2`, `--target minus-g` (step 13,000 of 30,000) | 32 | 0.582 |
+| Control: `shared`, `gpt2`, `--target minus-g` | 32 | 0.647 |
 | Study C copy + `shared` `gpt2` modes, by the formula above | 1 + 32 | 0.762 |
-| `landmark`, 64 fixed histories (step 17,000 of 30,000) | 1 + 32 | 0.812 |
+| Study C copy + `shared` `gpt2` modes, by the formula above | 1 + 128 | 0.784 |
+| `landmark`, 32 fixed histories | 1 + 32 | 0.776 |
+| `landmark`, 64 fixed histories | 1 + 32 | 0.814 |
+| `landmark`, 128 fixed histories (step 23,000 of 30,000) | 1 + 64 | 0.856 |
+| `prototype`, 32 trained, `--train-copy` | 1 + 32 | 0.800 |
 | `prototype`, 32 trained | 1 + 32 | 0.841 |
-| `prototype`, 64 trained (step 7,000 of 20,000) | 1 + 64 | 0.855 |
+| `prototype`, 64 trained | 1 + 64 | 0.868 |
+| `prototype`, 128 trained | 1 + 128 | 0.876 |
 
-The 0.841 was recomputed from the checkpoint by building the full prediction of the table minus `g`, without the centered bookkeeping, and came out the same (0.8407).
+The 0.841 was recomputed from the checkpoint by building the full prediction of the table minus `g`, without the centered bookkeeping, and came out the same (0.8407). The two rows "by the formula" join two separately trained networks and were not measured directly.
 
 What the comparisons say:
 
-- **The control separates two effects.** Fresh grids alone lift exp6's layout from 0.47–0.51 to 0.58 and rising, so a part of exp5–exp7's shortfall came from training on stored pairs. Its first mode stays at 0.49, the level of `--generic gpt2`, and its 31 further modes add 0.09, a quarter of the centered energy; the same network trained on the centered target gets 0.42 of it.
+- **The control separates three effects.** Fresh grids alone lift exp6's layout from 0.47–0.51 to 0.65, so the larger part of exp5–exp7's shortfall came from training on stored pairs. From there to the 0.76 of the two-network combination, 0.08 is the first mode (0.53 in the control, the level of `--generic gpt2`, against 0.61 for the study C copy) and 0.03 is the later modes (the control's 31 further modes add 0.12, a third of the centered energy; the same network on the centered target gets 0.42 of it). In the control the left side spans 0.87 of the table and the right side 0.66: the right side is what holds it back.
 - **What a right side needs is the model's own computation.** On both the column means and the modes, a right side that starts as the frozen model (the study C copy, the prototypes) is far ahead of an encoder with a fresh head, and among fresh heads the GPT-2 copy is ahead of MiniLMv2 and `scratch`.
-- **Independent sub-networks are no better than outputs of a shared one**: 8 modes with 16 MiniLMv2 encoders reach 0.245, the shared MiniLMv2 run 0.246 at rank 8. Under the centered target their left encoders no longer collapse.
+- **Trained prototypes beat real histories, with shrinking returns.** 32 fixed histories give 0.400 and 32 trained prototypes 0.560 of the centered energy; 64 fixed histories give 0.497. On the table minus `g`, 32, 64 and 128 trained prototypes give 0.841, 0.868 and 0.876, while the exact values at those ranks rise from 0.887 to 0.946.
+- **Independent sub-networks are no better than outputs of a shared one**: 8 modes with 16 MiniLMv2 encoders reach 0.246, the shared MiniLMv2 run 0.246 at rank 8. Under the centered target their left encoders no longer collapse.
 - **Pooling matters little once the encoder is trained.** A ridge regression on frozen states prefers the mean over positions for the history side (0.46 against 0.39 of 0.56 at rank 16 on held-out histories), but the trained `gpt2` and `gpt2-mean` runs end at 0.42 and 0.40, and mean pooling on the left with the last token on the right at 0.42.
 
 ## Training sample generation and sampling
