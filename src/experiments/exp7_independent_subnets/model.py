@@ -95,8 +95,8 @@ def _tokenizer(path: Path) -> PreTrainedTokenizerBase:
 def token_id_map(model_path: Path, roberta_path: Path, vocab_size: int) -> torch.Tensor:
     """(vocab_size,) int64: entry i is RoBERTa's id of the string of token i of model_path.
 
-    Rejects a missing RoBERTa directory, model tokens missing from RoBERTa's
-    vocabulary and a model token that is RoBERTa's pad token.
+    Rejects a missing RoBERTa directory and model tokens missing from RoBERTa's
+    vocabulary.
     """
     if not Path(roberta_path).is_dir():
         raise ValueError(
@@ -108,20 +108,23 @@ def token_id_map(model_path: Path, roberta_path: Path, vocab_size: int) -> torch
         raise ValueError(
             f"the tokenizer of {model_path} has no token of id {absent[0]} "
             f"(the model has {vocab_size} ids)")
-    roberta = _tokenizer(roberta_path)
-    vocab = roberta.get_vocab()
+    vocab = _tokenizer(roberta_path).get_vocab()
     missing = [strings[i] for i in range(vocab_size) if strings[i] not in vocab]
     if missing:
         raise ValueError(
             f"{len(missing)} of the {vocab_size} tokens of {model_path} are not in the "
             f"vocabulary of {roberta_path}, for example {missing[0]!r}")
-    id_map = torch.tensor([vocab[strings[i]] for i in range(vocab_size)], dtype=torch.int64)
-    # RoBERTa reads its pad id as padding: the positions after it would shift.
-    if roberta.pad_token_id is not None and (id_map == roberta.pad_token_id).any():
-        raise ValueError(
-            f"the token {roberta.pad_token!r} of {model_path} is the pad token of "
-            f"{roberta_path}")
-    return id_map
+    return torch.tensor([vocab[strings[i]] for i in range(vocab_size)], dtype=torch.int64)
+
+
+class _PretrainedRoberta(RobertaModel):
+    """RobertaModel loaded from a RobertaForMaskedLM checkpoint, as RoBERTa-base is stored.
+
+    The checkpoint's masked-LM head (lm_head.*) is not part of the encoder, so it
+    is not reported; any other unexpected weight still is.
+    """
+
+    _keys_to_ignore_on_load_unexpected = [r"^lm_head\."]
 
 
 class RobertaInput(nn.Module):
@@ -163,16 +166,30 @@ def roberta_encoder(roberta_path: Path, model_path: Path, vocab_size: int) -> Me
     """A trainable copy of the pretrained RoBERTa at roberta_path, dropout off, mean-pooled.
 
     It reads the token ids of the model at model_path; the mean is over all
-    positions, <s> and </s> included. RoBERTa's own pooler is left out.
+    positions, <s> and </s> included. RoBERTa's own pooler is left out. Rejects
+    a checkpoint that lacks an encoder weight and a model token mapped to the
+    pad id of RoBERTa's config.
     """
     id_map = token_id_map(model_path, roberta_path, vocab_size)
     try:
-        transformer = RobertaModel.from_pretrained(
+        transformer, info = _PretrainedRoberta.from_pretrained(
             roberta_path, add_pooling_layer=False, hidden_dropout_prob=0.0,
-            attention_probs_dropout_prob=0.0, local_files_only=True)
+            attention_probs_dropout_prob=0.0, local_files_only=True, output_loading_info=True)
     except OSError as error:
         raise ValueError(f"cannot load the local RoBERTa from {roberta_path}: {error}") from error
+    if info["missing_keys"]:
+        # from_pretrained would start them at random weights.
+        raise ValueError(
+            f"the RoBERTa checkpoint in {roberta_path} lacks encoder weights: "
+            f"{', '.join(sorted(info['missing_keys']))}")
     config = transformer.config
+    # Its embeddings read the config's pad id as padding (padding_idx): the positions
+    # of the tokens after it would shift.
+    padded = (id_map == config.pad_token_id).nonzero().flatten().tolist()
+    if padded:
+        raise ValueError(
+            f"token id {padded[0]} of {model_path} maps to {config.pad_token_id}, the pad "
+            f"id of the RoBERTa in {roberta_path}")
     return MeanPool(
         RobertaInput(transformer, id_map, config.bos_token_id, config.eos_token_id),
         config.hidden_size,

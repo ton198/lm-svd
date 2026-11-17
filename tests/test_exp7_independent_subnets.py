@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from huggingface_hub.utils import are_progress_bars_disabled
+from safetensors.torch import load_file, save_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
@@ -22,8 +24,10 @@ from transformers import (
     GPT2Model,
     PreTrainedTokenizerFast,
     RobertaConfig,
+    RobertaForMaskedLM,
     RobertaModel,
 )
+from transformers.utils import logging as transformers_logging
 
 from experiments.exp4_table_neural_svd.train import compare_with_exact_svd
 from experiments.exp5_gpt2_mlp_table.features import (
@@ -66,27 +70,49 @@ SCRATCH = dict(scratch_layers=1, scratch_width=4, scratch_heads=2)
 TEACHER_TOKENS = ["[UNK]", *map(str, range(1, VOCAB))]
 
 
+def setUpModule() -> None:
+    # transformers' and huggingface_hub's progress bars of every save and load, off for
+    # these tests and restored after them.
+    bars = transformers_logging.is_progress_bar_enabled(), not are_progress_bars_disabled()
+    transformers_logging.disable_progress_bar()
+    unittest.addModuleCleanup(restore_progress_bars, *bars)
+
+
+def restore_progress_bars(transformers_bars: bool, hub_bars: bool) -> None:
+    if transformers_bars:
+        transformers_logging.enable_progress_bar()  # turns huggingface_hub's on too
+    if not hub_bars:
+        from huggingface_hub.utils import disable_progress_bars
+        disable_progress_bars()
+
+
 def parameter_ids(module: torch.nn.Module) -> set[int]:
     return {id(p) for p in module.parameters()}
 
 
 def save_roberta(
-    path: Path, *, positions: int = 12, missing: tuple[str, ...] = (), pad: str = "<pad>"
+    path: Path, *, positions: int = 12, missing: tuple[str, ...] = (), pad: str = "<pad>",
+    pad_id: int = 1, masked_lm: bool = False,
 ) -> Path:
     """A tiny random RoBERTa whose vocabulary holds the teacher's token strings reversed.
 
-    missing leaves teacher tokens out of its vocabulary; pad names its pad token.
+    missing leaves teacher tokens out of its vocabulary; pad names the tokenizer's
+    pad token and pad_id the model config's pad id. masked_lm saves it as the real
+    checkpoint is stored: a RobertaForMaskedLM, keys under roberta. and an lm_head.
     """
     words = [word for word in reversed(TEACHER_TOKENS) if word not in missing]
     vocab = {"<s>": 0, "<pad>": 1, "</s>": 2, "<unk>": 3,
              **{word: 4 + i for i, word in enumerate(words)}}
+    config = RobertaConfig(
+        vocab_size=VOCAB + 4, hidden_size=8, num_hidden_layers=1, num_attention_heads=2,
+        intermediate_size=16, max_position_embeddings=positions, pad_token_id=pad_id,
+        bos_token_id=0, eos_token_id=2,
+    )
     # Without its pooler, like the real checkpoint (which has none), so loading it
     # prints no report of unexpected weights.
-    RobertaModel(RobertaConfig(
-        vocab_size=VOCAB + 4, hidden_size=8, num_hidden_layers=1, num_attention_heads=2,
-        intermediate_size=16, max_position_embeddings=positions, pad_token_id=1,
-        bos_token_id=0, eos_token_id=2,
-    ), add_pooling_layer=False).save_pretrained(path)
+    model = RobertaForMaskedLM(config) if masked_lm else RobertaModel(
+        config, add_pooling_layer=False)
+    model.save_pretrained(path)
     tokenizer = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
     tokenizer.pre_tokenizer = WhitespaceSplit()
     PreTrainedTokenizerFast(
@@ -328,11 +354,43 @@ class ModeTests(Exp7Fixture):
         with self.assertRaisesRegex(ValueError, "2 of the 17 tokens"):
             self.build("roberta", path)
 
-    def test_a_teacher_token_that_is_robertas_pad_token_is_rejected(self):
-        # RoBERTa reads its pad id as padding and would shift the positions after it.
-        path = save_roberta(self.root / "roberta-pad", pad="7")
-        with self.assertRaisesRegex(ValueError, "'7'.*pad"):
-            token_id_map(self.model_path, path, VOCAB)
+    def test_a_teacher_token_mapped_to_robertas_pad_id_is_rejected(self):
+        # RoBERTa's embeddings read the config's pad id as padding and would shift the
+        # positions after it. The reversed vocabulary maps teacher token 10 to id 10.
+        path = save_roberta(self.root / "roberta-pad-id", pad_id=10)
+        self.assertEqual(token_id_map(self.model_path, path, VOCAB)[10].item(), 10)
+        with self.assertRaisesRegex(ValueError, "token id 10 of .* maps to 10, the pad id"):
+            roberta_encoder(path, self.model_path, VOCAB)
+        with self.assertRaisesRegex(ValueError, "pad id"):
+            self.build("roberta", path)
+        # The tokenizer's pad token does not move positions: a teacher token named so
+        # while the config's pad id stays 1 is accepted.
+        path = save_roberta(self.root / "roberta-pad-token", pad="7")
+        self.assertEqual(roberta_encoder(path, self.model_path, VOCAB).width, 8)
+
+    def test_a_masked_lm_checkpoint_loads_its_encoder_weights_quietly(self):
+        # The real RoBERTa-base is a RobertaForMaskedLM checkpoint: its keys carry the
+        # roberta. prefix and it has lm_head.* weights besides the encoder.
+        path = save_roberta(self.root / "roberta-masked-lm", masked_lm=True)
+        stored = load_file(path / "model.safetensors")
+        self.assertTrue(any(key.startswith("lm_head.") for key in stored))
+        with self.assertNoLogs("transformers", "WARNING"):
+            encoder = roberta_encoder(path, self.model_path, VOCAB)
+        weights = encoder.transformer.transformer.state_dict()
+        self.assertEqual(
+            {f"roberta.{key}" for key in weights},
+            {key for key in stored if not key.startswith("lm_head.")})
+        for key, value in weights.items():
+            self.assertTrue(torch.equal(value, stored[f"roberta.{key}"]), key)
+        # A checkpoint without one of the encoder's weights is an error, not a random start.
+        lacking = self.root / "roberta-masked-lm-lacking"
+        shutil.copytree(path, lacking)
+        removed = "roberta.encoder.layer.0.attention.self.query.weight"
+        save_file({key: value for key, value in stored.items() if key != removed},
+                  lacking / "model.safetensors", metadata={"format": "pt"})
+        with self.assertLogs("transformers", "WARNING"), self.assertRaisesRegex(
+                ValueError, "lacks encoder weights: encoder.layer.0.attention.self.query.weight"):
+            roberta_encoder(lacking, self.model_path, VOCAB)
 
     def test_a_missing_roberta_directory_is_rejected(self):
         missing = self.root / "no-roberta"
