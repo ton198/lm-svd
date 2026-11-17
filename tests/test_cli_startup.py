@@ -14,6 +14,7 @@ class CLIStartupTests(unittest.TestCase):
             "experiments.exp5_gpt2_mlp_table.cli",
             "experiments.exp6_gpt2_bilinear_table.cli",
             "experiments.exp7_independent_subnets.cli",
+            "experiments.exp8_hypotheses.cli",
         ):
             with self.subTest(module=module):
                 code = f"""
