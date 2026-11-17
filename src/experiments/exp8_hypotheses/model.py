@@ -312,3 +312,26 @@ class MeanStudent(nn.Module):
                 (self.prefix[None].expand(len(embedded), -1, -1), embedded), dim=1)
         hidden = self.transformer(inputs_embeds=embedded, use_cache=False).last_hidden_state
         return torch.einsum("fe,fke->fk", hidden[:, -1].float(), self.rows[header_ids])
+
+
+class GenericMeanStudent(nn.Module):
+    """exp7's right sub-network on study C's regression, as the control for MeanStudent.
+
+    encoder -> LayerNorm -> Linear gives w(future), and the predicted entry minus g
+    is <w(future), v_z> / sqrt(E), exactly as in an exp7 Mode. Nothing of the
+    frozen model's output layer is reused and the prediction does not start at
+    the frozen model's own. The forward pass adds g, so both students predict the
+    same quantity.
+    """
+
+    def __init__(self, encoder: nn.Module, vectors: torch.Tensor, teacher) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.head = linear_head(encoder.width, vectors.shape[1])
+        self.register_buffer("vectors", vectors, persistent=False)
+        object.__setattr__(self, "teacher", teacher)
+
+    def forward(self, future_ids: torch.Tensor, header_ids: torch.Tensor) -> torch.Tensor:
+        w = self.head(self.encoder(future_ids))
+        change = torch.einsum("fe,fke->fk", w, self.vectors[header_ids]) / w.shape[1] ** 0.5
+        return change + self.teacher.future_only(future_ids, header_ids)

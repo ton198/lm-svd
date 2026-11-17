@@ -28,7 +28,9 @@ from experiments.exp4_table_neural_svd import TABLE_NAMES
 from utils.inference import CausalLMInference
 
 from .grid import Teacher, Windows, step_seed
-from .model import MeanStudent
+from experiments.exp7_independent_subnets.model import token_vectors
+
+from .model import GenericMeanStudent, MeanStudent, build_encoder
 from .runs import RunFiles, lr_factor
 from .spectrum import thin_svd
 
@@ -101,7 +103,11 @@ def train_mean(
     encoder_lr: float,
     seed: int,
     overwrite: bool,
+    generic: str | None = None,
+    roberta_path: Path | None = None,
 ) -> dict:
+    """generic names an exp7 encoder kind: the student is then exp7's right sub-network
+    (GenericMeanStudent) instead of the copy that keeps the model's unembedding."""
     if not (inference_dir / "metadata.json").is_file():
         raise ValueError(f"no finished tables in {inference_dir}; run exp4 inference first")
     config = {
@@ -109,6 +115,9 @@ def train_mean(
         "steps": steps, "eval_every": eval_every, "lr": lr, "encoder_lr": encoder_lr,
         "seed": seed, "model_path": str(model_path), "stream_path": str(stream_path),
     }
+    if generic is not None:
+        config["generic"] = generic
+        config["roberta_path"] = str(roberta_path) if generic == "roberta" else None
     files = RunFiles(output_dir, config, overwrite)
     saved = files.load()
 
@@ -127,16 +136,27 @@ def train_mean(
             f"the model's {inference.max_length} positions")
 
     # The prefix starts as one real window of the stream, fixed by the seed.
-    prefix_ids = None
-    if prefix_tokens:
-        prefix_ids = Windows(
-            stream_path, prefix_tokens, future_tokens, inference.vocab_size,
-            step_seed(seed, 0) + 1,
-        ).draw(1, 1)[0][0].to(device)
-    student = MeanStudent(inference, prefix_ids).to(device)
-    groups = [{"params": list(student.transformer.parameters()), "lr": encoder_lr}]
-    if student.prefix is not None:
-        groups.append({"params": [student.prefix], "lr": lr})
+    if generic is not None:
+        student = GenericMeanStudent(
+            build_encoder(inference, generic, roberta_path),
+            token_vectors(inference.model.get_output_embeddings().weight), teacher,
+        ).to(device)
+        groups = [
+            {"params": list(student.encoder.parameters()),
+             "lr": lr if generic == "scratch" else encoder_lr},
+            {"params": list(student.head.parameters()), "lr": lr},
+        ]
+    else:
+        prefix_ids = None
+        if prefix_tokens:
+            prefix_ids = Windows(
+                stream_path, prefix_tokens, future_tokens, inference.vocab_size,
+                step_seed(seed, 0) + 1,
+            ).draw(1, 1)[0][0].to(device)
+        student = MeanStudent(inference, prefix_ids).to(device)
+        groups = [{"params": list(student.transformer.parameters()), "lr": encoder_lr}]
+        if student.prefix is not None:
+            groups.append({"params": [student.prefix], "lr": lr})
     optimizer = torch.optim.Adam(groups)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, steps))
     step = 0

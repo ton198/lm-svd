@@ -348,6 +348,26 @@ class MeanTests(Exp8Fixture):
         self.assertEqual(student.prefix.shape, (HISTORY_TOKENS, 8))
         self.assertTrue(student.prefix.requires_grad)
 
+    def test_the_generic_student_is_exp7s_right_side_plus_g(self):
+        from experiments.exp7_independent_subnets.model import token_vectors
+        from experiments.exp8_hypotheses.model import GenericMeanStudent, build_encoder
+        tokens = self.table_tokens("train")
+        futures, headers = tokens["futures"], tokens["header_token_ids"]
+        vectors = token_vectors(self.inference.model.get_output_embeddings().weight)
+        student = GenericMeanStudent(
+            build_encoder(self.inference, "gpt2", None), vectors, self.teacher)
+        w = student.head(student.encoder(futures))
+        expected = torch.einsum("fe,fke->fk", w, vectors[headers]) / 8 ** 0.5
+        self.assertTrue(torch.allclose(
+            student(futures, headers) - self.teacher.future_only(futures, headers),
+            expected, atol=1e-5))
+        summary = quiet(
+            train_mean, inference_dir=self.inference_dir, stream_path=self.stream_path,
+            model_path=self.model_path, output_dir=self.root / "mean-generic", device="cpu",
+            prefix_tokens=0, batch_size=4, steps=2, eval_every=1, lr=1e-3, encoder_lr=1e-4,
+            seed=0, overwrite=False, generic="gpt2")
+        self.assertEqual(summary["step"], 2)
+
     def test_the_tables_own_column_means_reach_the_ceiling(self):
         table = load_mean_table(self.inference_dir / "train", self.teacher, "cpu")
 

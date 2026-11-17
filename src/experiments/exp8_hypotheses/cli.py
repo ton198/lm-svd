@@ -99,6 +99,14 @@ def main(argv: list[str] | None = None) -> None:
     mean.add_argument("--prefix-tokens", type=nonnegative_int, default=64,
                       help="Trainable vectors read in front of the future, started at one "
                            "real window; 0 reads the future alone")
+    mean.add_argument("--generic", choices=("gpt2", "gpt2-mean", "roberta", "scratch"),
+                      default=None,
+                      help="Control: train exp7's right sub-network of this encoder kind on "
+                           "the same regression (an encoder, LayerNorm and a linear head), "
+                           "instead of the copy that keeps the model's unembedding; "
+                           "--prefix-tokens is then unused and --lr is the head's")
+    mean.add_argument("--roberta-path", type=Path, default=Path("models/minilmv2-l6-h384"),
+                      help="Pretrained model of --generic roberta")
     mean.add_argument("--batch-size", type=positive_int, default=128)
     mean.add_argument("--lr", type=positive_float, default=1e-3,
                       help="Learning rate of the prefix vectors")
@@ -140,11 +148,17 @@ def main(argv: list[str] | None = None) -> None:
         else:
             from .mean import train_mean
 
+            mean_name = f"mean-prefix{args.prefix_tokens}"
+            if args.generic is not None:
+                kind = args.roberta_path.name if args.generic == "roberta" else args.generic
+                mean_name = f"mean-generic-{kind}"
+
             summary = train_mean(
                 inference_dir=inference_dir, stream_path=args.stream_path,
                 model_path=args.model_path,
-                output_dir=root / (f"mean-prefix{args.prefix_tokens}" + args.tag),
-                device=args.device, prefix_tokens=args.prefix_tokens,
+                output_dir=root / (mean_name + args.tag),
+                device=args.device, prefix_tokens=0 if args.generic else args.prefix_tokens,
+                generic=args.generic, roberta_path=args.roberta_path,
                 batch_size=args.batch_size, steps=args.steps, eval_every=args.eval_every,
                 lr=args.lr, encoder_lr=args.encoder_lr, seed=args.seed,
                 overwrite=args.overwrite)
