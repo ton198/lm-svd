@@ -5,6 +5,7 @@ import math
 import shutil
 import unittest
 import weakref
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -21,6 +22,7 @@ from experiments.exp5_gpt2_mlp_table.loss import paired_loss
 from experiments.exp5_gpt2_mlp_table.train import draw_pairs
 from experiments.exp5_gpt2_mlp_table.tables import load_eval_table
 from experiments.exp7_independent_subnets.align import Moments, alignment, max_correlation
+from experiments.exp7_independent_subnets.cli import main
 from experiments.exp7_independent_subnets.model import build_mode, token_vectors
 from experiments.exp7_independent_subnets.stage import Selection, residual_target, stage_loss
 from experiments.exp7_independent_subnets.train import (
@@ -844,3 +846,71 @@ class ResumeTests(TrainingHelpers, Exp5Fixture):
         (output / "modes" / "mode-01.pt").unlink()
         with self.assertRaisesRegex(ValueError, "mode-01.pt"):
             self.train(output, modes=3)
+
+
+class CLITests(Exp5Fixture):
+    def test_train_writes_under_the_subnet_directory(self):
+        results_root = self.root / "exp7-results"
+        shutil.copytree(
+            self.inference_dir,
+            results_root / "exp4_table_neural_svd" / "tiny__model" / "inference",
+        )
+        arguments = [
+            "train", "--results-root", str(results_root), "--dataset", "tiny",
+            "--model-path", str(self.model_path), "--store-dir", str(self.store_dir),
+            "--subnet", "scratch", "--modes", "1", "--stage-steps", "2",
+            "--min-stage-steps", "0", "--patience", "0", "--eval-every", "2",
+            "--align-pairs", "16", "--scratch-layers", "1", "--scratch-width", "4",
+            "--scratch-heads", "2", "--batch-size", "8", "--device", "cpu",
+        ]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            main(arguments)
+        run = results_root / "exp7_independent_subnets" / "tiny__model" / "train-scratch"
+        self.assertTrue((run / "eval_history.jsonl").is_file())
+        self.assertTrue((run / "modes" / "mode-01.pt").is_file())
+        self.assertIn(f"output_dir: {run}", output.getvalue())
+        self.assertIn("step: 2", output.getvalue())
+        self.assertIn("modes: 1", output.getvalue())
+        self.assertIn("evaluations: 1", output.getvalue())
+        # Other settings on the same run directory are a usage error.
+        with contextlib.redirect_stderr(io.StringIO()) as error, \
+                self.assertRaises(SystemExit) as raised:
+            main([*arguments, "--lr", "0.5"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--overwrite", error.getvalue())
+
+    def test_defaults_match_the_design(self):
+        with patch("experiments.exp7_independent_subnets.train.train_exp7") as train:
+            train.return_value = {"output_dir": "x", "step": 0, "modes": 0, "evaluations": 0}
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["train"])
+        options = train.call_args.kwargs
+        self.assertEqual(
+            {key: options[key] for key in (
+                "subnet", "modes", "stage_steps", "min_stage_steps", "patience", "align_pairs",
+                "scratch_layers", "scratch_width", "scratch_heads", "batch_size", "eval_every",
+                "lr", "encoder_lr", "seed", "device", "overwrite")},
+            {"subnet": "gpt2", "modes": 8, "stage_steps": 30000, "min_stage_steps": 5000,
+             "patience": 5, "align_pairs": 16384, "scratch_layers": 6, "scratch_width": 384,
+             "scratch_heads": 6, "batch_size": 128, "eval_every": 1000, "lr": 3e-4,
+             "encoder_lr": 2e-5, "seed": 42, "device": "cuda", "overwrite": False})
+        self.assertEqual(options["model_path"], Path("models/gpt2-small"))
+        self.assertEqual(
+            options["store_dir"],
+            Path("data/sample_stores/wikitext-103-train__gpt2-small__h64-f32"))
+        self.assertEqual(options["inference_dir"], Path(
+            "data/experiment_results/exp4_table_neural_svd/wikitext-large__gpt2-small/inference"))
+        self.assertEqual(options["output_dir"], Path(
+            "data/experiment_results/exp7_independent_subnets/wikitext-large__gpt2-small"
+            "/train-gpt2"))
+
+    def test_usage_errors(self):
+        for arguments in (["--subnet", "mlp"], ["--modes", "0"], ["--patience", "-1"],
+                          ["--min-stage-steps", "10", "--stage-steps", "5"]):
+            with self.subTest(arguments=arguments), \
+                    patch("experiments.exp7_independent_subnets.train.train_exp7") as train, \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as raised:
+                main(["train", *arguments])
+            self.assertEqual(raised.exception.code, 2)
+            train.assert_not_called()

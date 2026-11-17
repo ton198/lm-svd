@@ -25,6 +25,7 @@ exp3 = "experiments.exp3_L_M_diff.cli:main"
 exp4 = "experiments.exp4_table_neural_svd.cli:main"
 exp5 = "experiments.exp5_gpt2_mlp_table.cli:main"
 exp6 = "experiments.exp6_gpt2_bilinear_table.cli:main"
+exp7 = "experiments.exp7_independent_subnets.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]

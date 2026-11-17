@@ -12,13 +12,14 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp4` | Same entry as `exp1`, in a training table and a disjoint validation table | histories × (futures × top-k), twice | `train/matrix.npy`, `val/matrix.npy` |
 | `exp5` | Same entry as `exp1` minus the header token's centered logit after the future alone, one (history, future) pair at a time | no stored matrix; evaluated on the `exp4` tables | — |
 | `exp6` | Same entry and pairs as `exp5`; the right network is bilinear in the header token's unembedding row | no stored matrix; evaluated on the `exp4` tables | — |
+| `exp7` | Same entry and pairs as `exp5`; one independent pair of sub-networks per mode, trained one mode at a time | no stored matrix; evaluated on the `exp4` tables | — |
 
-Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead runs `inference` → `train`: it builds two tables with their exact SVDs, trains NeuralSVD on the training table, and compares the learned modes with both exact SVDs during training. **exp5** has only `train`: it trains two MLPs on frozen GPT-2 hidden states with pairs from the sample store and compares them with the exact SVDs of the exp4 tables. **exp6** also has only `train`: the same pairs and target as exp5, with a trainable copy of GPT-2 on each side and a right side that is bilinear in the header token's unembedding row.
+Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead runs `inference` → `train`: it builds two tables with their exact SVDs, trains NeuralSVD on the training table, and compares the learned modes with both exact SVDs during training. **exp5** has only `train`: it trains two MLPs on frozen GPT-2 hidden states with pairs from the sample store and compares them with the exact SVDs of the exp4 tables. **exp6** also has only `train`: the same pairs and target as exp5, with a trainable copy of GPT-2 on each side and a right side that is bilinear in the header token's unembedding row. **exp7** also has only `train`: the same pairs and target, with its own pair of sub-networks for every mode, trained and frozen one mode at a time.
 
 ## Navigation
 
 - [Install dependencies](#1-install-dependencies) · [Download models](#2-download-models-for-offline-inference) · [Prepare data](#3-prepare-shared-historyfuture-samples) · [Sample generation and examples](docs/samples.md)
-- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs) · [exp4](#experiment-4-neuralsvd-on-an-explicit-table) · [exp5](#experiment-5-gpt-2-hidden-states-and-mlps-on-the-l_m-table) · [exp6](#experiment-6-a-right-side-bilinear-in-the-header-token)
+- [exp1](#4-experiment-1-centered-logit-matrix) · [exp2](#5-experiment-2-no-bos-historyfuture-pmi-matrix) · [exp3](#6-experiment-3-difference-between-centered-logit-matrices) · [exp1–exp3 analysis](#7-understand-exp1exp3-analysis-outputs) · [exp4](#experiment-4-neuralsvd-on-an-explicit-table) · [exp5](#experiment-5-gpt-2-hidden-states-and-mlps-on-the-l_m-table) · [exp6](#experiment-6-a-right-side-bilinear-in-the-header-token) · [exp7](#experiment-7-an-independent-sub-network-per-singular-function)
 - [Python inference API](#python-inference-api) · [Tests](#tests)
 
 ## Project layout
@@ -558,6 +559,174 @@ uv run exp6 train
 ```
 
 It needs what exp5 needs: the exp4 tables and a sample store from the same model. The heads and `P` use `--lr` (default 3e-4), the two copies `--encoder-lr` (default 2e-5). Outputs go to `<results-root>/exp6_gpt2_bilinear_table/<dataset>__<model>/train/`, with the same files and the same columns as exp5, so its numbers compare directly with exp5's (both are measured on the tables minus `g`). On BlueHive, submit `bluehive_run/exp6-train.sbatch`.
+
+## Experiment 7: an independent sub-network per singular function
+
+exp7 keeps exp5's and exp6's pairs, target and evaluation and changes how the modes are learned. In exp5 and exp6 every mode is one output of a shared network (one GPT-2 copy per side, the 128 modes its 128 outputs), and all modes are trained together with joint nesting. On both exp4 tables (minus `g`) their energy stays at 0.47–0.51 at any rank, where the exact SVD has 0.65 at rank 1 and 0.95 at rank 128. exp6's record shows signs of the modes interfering: on the report table (below) the energy at rank 1 was 0.470 at step 50,000 and 0.393 at step 100,000, while the energy at rank 128 stayed at 0.47–0.50.
+
+What exp7 changes:
+
+- **One pair of sub-networks per mode.** Mode `l` has its own left encoder and head, which read the history, and its own right encoder and head, which read the future. No trainable parameter is shared between the two sides or between two modes; `L` modes have `2L` encoders. The frozen model's unembedding is a constant shared by all modes and is not trained.
+- **Stages.** Stage `l` trains only mode `l`, on each pair's target minus the output of the frozen modes `1..l−1` on the same pair, then freezes it. Only one pair of sub-networks has gradients at a time.
+- **No shared projection.** Each mode's right head gives the full `E`-dimensional vector `w_l(future)`, so exp6's projection `P` is gone.
+
+This is a staged form of the sequential nesting of the NeuralSVD paper (arXiv:2402.03655), in which the gradient of mode `l` is a rank-one fit of the residual after the earlier modes, and the earlier modes receive no gradient from it. The paper trains all modes at once with gradient masks (`utils.nestedlora.NestedLoRA(sequential=True)` is that code). exp7 freezes instead, for two reasons: all sub-networks with gradients do not fit on one GPU, and subtracting the frozen modes' output on the same pair cancels the noise those modes bring, which the masked form cannot do.
+
+### One mode
+
+```text
+left u_l:   history (64 tokens) -> encoder_l^L -> last hidden state
+                                -> LayerNorm (no affine) -> Linear(·, 1) -> a number
+
+right v_l:  future (32 tokens)  -> encoder_l^R -> last hidden state
+                                -> LayerNorm (no affine) -> Linear(·, E) -> w_l(future), (E,)
+            v_l(future, z) = ⟨w_l(future), e_z⟩ / sqrt(E)
+```
+
+`E` is the width of the frozen model's unembedding (768 for GPT-2 Small). `e_z` is the unembedding row of token `z` minus the mean row, divided by the root mean square of all entries, as in exp6; it is neither trained nor saved. The right side has this form because the target itself is `⟨s(history + future) − s(future), e_z − ē⟩` (see [exp6](#experiment-6-a-right-side-bilinear-in-the-header-token)), so every right singular function is the inner product of a vector that depends only on the future with `e_z`.
+
+`--subnet` selects the encoders:
+
+| `--subnet` | Each encoder | Learning rates |
+| --- | --- | --- |
+| `gpt2` (default) | A trainable copy of the model's transformer, dropout off: exp6's encoder, so only "independent or shared" changes | encoders `--encoder-lr` (default 2e-5), heads `--lr` (default 3e-4) |
+| `scratch` | A randomly initialised GPT-2 transformer with its own token and position embeddings and the model's vocabulary, dropout 0; `--scratch-layers` 6, `--scratch-width` 384, `--scratch-heads` 6 by default | everything `--lr`, with a linear warmup over the first 1000 steps of each stage |
+
+Each stage starts a new Adam optimizer.
+
+### One stage
+
+A step of stage `l` draws `--batch-size` (default 128) pairs, computes their target as exp5 does, runs the frozen modes without gradient, and fits the current mode to the residual `r = target − Σ_{i<l} f_i g_i` with the rank-one paired loss
+
+```text
+loss = −2 · mean_b[ f_b · mean_j(r_bj · g_bj) ] + mean_b(f_b²) · mean_{b,j}(g_bj²)
+```
+
+which is exp5's `paired_loss` at `neigs=1`. Only the current mode's parameters are updated.
+
+A stage evaluates every `--eval-every` (default 1000) of its steps and always at its last step. The **selection metric** is the captured energy at rank `l` of the `l` modes (the frozen ones and the current one, not aligned) on the selection table. The stage remembers the current mode's weights at the evaluation with the highest selection metric, and ends when either
+
+- it has run `--stage-steps` (default 30000) steps, or
+- it has run at least `--min-stage-steps` (default 5000) steps and the selection metric has not reached a new best for `--patience` (default 5) evaluations in a row.
+
+It then loads those best weights, freezes the mode and saves it to `modes/mode-XX.pt`, aligns all `l` modes, and the next stage starts. `--patience 0` is a fixed number of steps: the stage runs `--stage-steps` steps and freezes the weights of its last step, with no selection. `--min-stage-steps` may not exceed `--stage-steps`.
+
+### The two tables
+
+exp4's directory names `train` and `val` are misleading here, so exp7's logs, records and this section call them:
+
+| exp7 name (record key) | exp4 table | Shape | Role |
+| --- | --- | --- | --- |
+| **selection table** (`selection`) | `train` | 2048 × 51200 | Decides when a stage ends and which weights are frozen |
+| **report table** (`report`) | `val` | 1024 × 25600 | Reported only |
+
+exp7 trains on neither table; both are held out to the same degree (see [exp5](#experiment-5-gpt-2-hidden-states-and-mlps-on-the-l_m-table)). Both are the exp4 tables minus `g`, each with its exact SVD, as in exp5 and exp6. Only the selection table decides when a mode is frozen. exp4's files and directories keep their names.
+
+### The alignment
+
+The learned functions are not orthogonal and have no common scale. At the end of every stage, stage 1 included (where it only rescales), exp7 draws `--align-pairs` (default 16384) fresh pairs from the store, runs all `l` frozen modes forward only, and estimates three `l × l` matrices:
+
+```text
+Λ_f = E[f fᵀ]        Λ_g = E[g gᵀ] (over all (future, z) columns)        C_ij = E[f_i(h) · target(h, f, z) · g_j(f, z)]
+
+M = Λ_f^{-1/2} C Λ_g^{-1/2} = P S Qᵀ        T_f = Λ_f^{-1/2} P S^{1/2}        T_g = Λ_g^{-1/2} Q S^{1/2}
+```
+
+`C` uses the target, not the residual. The aligned features `F T_f` and `G T_g` are orthogonal and ordered by `S`, largest first, and their product is the least-squares fit of the target within the span of the learned functions. **`aligned`** in `stages.jsonl` is the comparison of these aligned features with the exact SVDs. The alignment only recombines what has been learned: it uses only store pairs, not the evaluation tables, changes no weights, and does not affect later stages, whose residuals use the unaligned frozen modes.
+
+### Run
+
+exp7 needs what exp5 and exp6 need: the exp4 tables and a sample store from the same model. The first step runs stage 1 alone, once with each kind of sub-network; a larger `--modes` then continues in the same directory:
+
+```bash
+uv run exp7 train --subnet gpt2 --modes 1
+uv run exp7 train --subnet scratch --modes 1
+uv run exp7 train --subnet gpt2 --modes 8     # continues the same directory
+```
+
+Outputs go to `<results-root>/exp7_independent_subnets/<dataset>__<model>/train-<subnet>/`, so the two kinds have separate directories. On BlueHive, submit `bluehive_run/exp7-train.sbatch`; arguments after the script name are passed to the command, and resubmitting continues the current stage.
+
+Running the same command again continues: the frozen modes are loaded from `modes/`, and an interrupted stage continues at its last evaluation with its best weights and its count of evaluations without a new best. The sampler is reseeded from `--seed` and the global step, so a continued run draws other pairs. Between runs of one directory:
+
+- **Only `--modes` may change** (and `--device`). Any other changed setting (`--stage-steps`, `--patience`, `--lr`, `--store-dir`, …) is an error that names `--overwrite`, which deletes the outputs and starts over.
+- A `--modes` below the number of finished modes is an error. Equal to it, with no stage in progress, the command returns at once and writes nothing. Equal to it while a later stage is in progress is an error asking for a larger `--modes` or `--overwrite`.
+- **A finished stage cannot be lengthened**, only redone with `--overwrite`.
+
+### Outputs
+
+| File | Content |
+| --- | --- |
+| `eval_history.jsonl` | One line per evaluation, over all stages |
+| `stages.jsonl` | One line per finished stage |
+| `modes/mode-XX.pt` | The frozen mode `XX` (two encoders and two heads): `state_dict`, `stage`, `best_step` |
+| `alignment.pt` | The latest alignment: `T_f`, `T_g`, `S` and `modes`, the number of modes it covers |
+| `checkpoint.pt` | `config` (the settings a continued run must repeat), `completed_modes`, the global `step`, the evaluation `history`, and `stage`: empty between stages, otherwise the stage step, the current mode's weights, its best weights, the optimizer, the warmup schedule of a `scratch` mode and the state of the stopping rule (best value, its step, evaluations since) |
+| `metadata.json` | All settings, `modes`, `warmup_steps`, descriptions of the two sides, and exp5's run metadata; `trainable_parameters` counts one mode, `tables` and `table_shapes` use the keys `selection` and `report`, and `ranks` reads `1..l at stage l` |
+
+`eval_history.jsonl`:
+
+| Field | Meaning |
+| --- | --- |
+| `step` | Global step, counted over all stages |
+| `stage`, `stage_step` | The stage and its own step count |
+| `train_loss` | Mean stage loss since the previous evaluation |
+| `kernel_energy` | Mean square of the target, `E[K²]`, since the previous evaluation |
+| `residual_energy` | Mean square of the residual `r` the current mode is fitted to, since the previous evaluation; equal to `kernel_energy` in stage 1 |
+| `seconds_per_step` | Mean time of a step since the previous evaluation |
+| `selection`, `report` | Comparison of the `l` modes (frozen and current, not aligned) with that table's exact SVD: `singular_values`, `singular_value_relative_error`, `ranks`, `left_subspace_overlap`, `right_subspace_overlap`, `captured_energy`, `exact_captured_energy` (exp4's columns) |
+
+`stages.jsonl`:
+
+| Field | Meaning |
+| --- | --- |
+| `stage` | The stage |
+| `steps` | Steps the stage ran |
+| `best_step` | The stage step whose weights were frozen |
+| `reason` | `steps` (reached `--stage-steps`) or `patience` |
+| `selection_energy` | The selection metric of the frozen weights |
+| `selection`, `report` | Comparison of the frozen modes `1..l`, not aligned |
+| `aligned` | `selection` and `report` comparisons of the aligned modes |
+| `singular_values` | `S` of the alignment |
+| `left_correlation`, `right_correlation` | Largest absolute off-diagonal entry of `Λ_f` and `Λ_g` as a correlation: how far from orthogonal the learned modes are |
+
+Things to keep in mind when reading the records:
+
+- **Ranks are listed one by one, 1..l**, not 1, 2, 4, 8, … as in exp5 and exp6, so that every stage has a value at its own rank `l`.
+- **The numbers compare directly with exp5's and exp6's**: all three are measured on the tables minus `g`.
+
+### How to read the first stage
+
+Reference values on the report table (exp4's `val` table, minus `g`): the shared networks of exp5 and exp6 reach 0.45–0.47 at rank 1 and at best 0.51 at any rank; the exact SVD has 0.654 at rank 1.
+
+| Stage 1 result (report table, energy at rank 1) | Meaning | Next step |
+| --- | --- | --- |
+| Above 0.51 | One independent sub-network learning the first mode alone already exceeds what the shared network reaches with 128 modes. Independence works | Continue in the same directory with the winning kind of sub-network and a larger `--modes` |
+| 0.47–0.51 | Independence removed the interference, but the gain is small | Still continue to 8 modes and see whether the total energy exceeds 0.51 |
+| Below 0.47 | The bottleneck is not the sharing but predicting GPT-2's response to unseen futures from the future alone | Stop and reconsider the input of the right function (for example anchor histories) |
+| `scratch` far below `gpt2` | Starting from GPT-2's weights is necessary | Use only `gpt2` from then on |
+| `scratch` close to or above `gpt2` | A small network is enough and more modes are affordable | Use `scratch` from then on, with a larger `--modes` |
+
+With several stages, look also at the difference between the energy before and after the alignment (a large difference means later modes are repairing the errors of earlier ones), and at the energy each stage adds in `stages.jsonl` compared with what the exact SVD adds at that rank.
+
+### Resources (estimated, not measured)
+
+- `gpt2`: a step needs the same gradient memory as exp6 (about 16 GB at batch 128). Each frozen mode adds about 1 GB of weights and two forward-only GPT-2 passes, so stage 8 needs about 23 GB and a step takes about two to three times as long as in stage 1.
+- `scratch` (default size): each encoder has about 30 million parameters, about 19 million of them in the token embedding.
+
+### Small smoke run
+
+On CPU, after the exp4 tables and at least one store block exist:
+
+```bash
+RESULTS_ROOT=$(mktemp -d /tmp/lm-svd-exp7.XXXXXX)
+mkdir -p "$RESULTS_ROOT/exp4_table_neural_svd"
+ln -s "$PWD/data/experiment_results/exp4_table_neural_svd/wikitext-large__gpt2-small" \
+  "$RESULTS_ROOT/exp4_table_neural_svd/"
+uv run exp7 train --results-root "$RESULTS_ROOT" --device cpu --subnet scratch \
+  --modes 1 --stage-steps 20 --min-stage-steps 0 --patience 0 --eval-every 10 \
+  --align-pairs 64 --scratch-layers 1 --scratch-width 64 --scratch-heads 2 --batch-size 16
+# The same command with --modes 2 adds a second stage in the same directory.
+```
 
 ## Training sample generation and sampling
 
