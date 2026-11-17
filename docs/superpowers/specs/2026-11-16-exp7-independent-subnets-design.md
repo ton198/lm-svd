@@ -1,6 +1,6 @@
 # exp7：每个奇异函数一个独立子网络，逐个训练、逐个冻结
 
-日期：2026-11-16　状态：已批准（2026-11-16）
+日期：2026-11-16　状态：已批准（2026-11-16）；同日修订：子网络改为 BERT 形式（见“修订”一节）
 
 ## 为什么做
 
@@ -29,12 +29,24 @@ NeuralSVD 论文（arXiv:2402.03655）的 sequential nesting 就是这个思路�
 
 exp7 改成分阶段冻结，原因有两个：所有子网络同时带梯度放不进一张显卡；在成对样本上，先在同一个样本上减掉已冻结模式的输出再训练，前面模式带来的噪声会被抵消，而掩码写法做不到这一点。
 
+## 修订（2026-11-16）：子网络改为 BERT 形式
+
+初版实现并合并后，用户决定更换子网络的结构：
+
+1. **`scratch` 改成 BERT 的形式**：双向注意力的 transformer，对所有位置的 hidden state 做平均池化，从头训练。原来是因果注意力、取最后一个 token。
+2. **新增预训练的双向模型 `roberta`**：RoBERTa-base 加平均池化。用户说的是“预训练的 BERT”；选 RoBERTa 是我的决定，原因是它和 GPT-2 用同一套 BPE（已核实：GPT-2 的 50257 个 token 在 RoBERTa 的词表里全部存在，只是编号不同），做一个编号映射就能直接输入，不用把文本解码后重新分词。原版 BERT 用 WordPiece，需要重新分词，而 history 的结尾经常切在词中间。
+3. **`gpt2`（GPT-2 副本）暂时不用**：不再是默认项，也不在运行计划里。代码保留（我的决定，不花成本，以后可以直接对比；用户要求时再删除）。
+
+理由（用户的判断）：每个奇异函数做的事是“读完一段文本，输出一个固定的向量”，这是双向编码器加池化的标准用途。我的保留意见：拟合的目标是 GPT-2 自己的内部量，预训练的双向模型不带这部分知识，可能不如 GPT-2 的副本；第 1 阶段的结果会回答这一点。
+
+下面各节已按修订后的做法改写。训练目标、分阶段、冻结、对齐、评估、续跑都不变。
+
 ## 目标与非目标
 
 **目标**
 
 1. 实现分阶段训练：第 ℓ 阶段只训练第 ℓ 个模式的一对子网络，目标是减掉前 ℓ−1 个已冻结模式之后的残差。
-2. 子网络类型可切换：从 GPT-2 权重初始化的副本，或从头训练的小 transformer。
+2. 子网络类型可切换：从头训练的双向 transformer（BERT 结构），或预训练的 RoBERTa；GPT-2 副本保留为不使用的选项。
 3. 训练目标、成对样本、评估表、评估指标都沿用 exp5/exp6，使数字可以直接和 exp6 比较。
 4. 每个阶段结束时做一次对齐，同时报告对齐前和对齐后的结果。
 5. 可以先只跑 1 个模式，之后在同一个输出目录里接着加模式，不重训已冻结的模式。
@@ -68,8 +80,10 @@ exp7 改成分阶段冻结，原因有两个：所有子网络同时带梯度放
 
 | 方案 | 结论 |
 | --- | --- |
-| **每个函数一个完整的 GPT-2 副本（选定，`--subnet gpt2`）** | 和 exp6 的编码器相同，只改变"是否独立"这一个因素 |
-| **每个函数一个从头训练的小 transformer（选定，`--subnet scratch`）** | 用户提出。旧的对比里从头训练的 transformer 很差，但那些都是共享网络且没训到收敛，不能说明独立时的情况。第 1 阶段两种都跑 |
+| **每个函数一个从头训练的双向 transformer 加平均池化（选定，`--subnet scratch`，默认）** | 用户提出（修订）。BERT 的结构，输入是 GPT-2 的 token |
+| **每个函数一个预训练的 RoBERTa-base 加平均池化（选定，`--subnet roberta`）** | 用户提出预训练的 BERT（修订）；用 RoBERTa 是因为它和 GPT-2 共用 BPE |
+| 每个函数一个完整的 GPT-2 副本（`--subnet gpt2`，保留但暂不使用） | 和 exp6 的编码器相同，只改变"是否独立"这一个因素。初版的默认项；用户决定暂时不用 |
+| 每个函数一个从头训练的因果 transformer、取最后一个 token | 初版的 `scratch`，已被双向加池化的版本替换 |
 | 共用冻结的 GPT-2，每个模式只有小 MLP 头 | exp5 里冻结特征的上限更低（0.35–0.40），不做 |
 | 共用冻结的 GPT-2，每个模式有自己的 LoRA 适配器或最后几层 | 没有先例，引入新变量，暂缓 |
 | 右侧在固定的锚点 history 后面读 future | 小表上不训练就有 0.60（8 个锚点），但它在锚点上跑语言模型，不是独立子网络，用户决定不做 |
@@ -95,10 +109,10 @@ exp7 改成分阶段冻结，原因有两个：所有子网络同时带梯度放
 ### 一个模式的两个子网络
 
 ```
-左 u_ℓ:  h (64 tokens) ──编码器_ℓ^L──> 最后一个 token 的 hidden state
+左 u_ℓ:  h (64 tokens) ──编码器_ℓ^L──> 池化后的向量
                         ──LayerNorm(无仿射) → Linear(·, 1)──> 标量
 
-右 v_ℓ:  f (32 tokens) ──编码器_ℓ^R──> 最后一个 token 的 hidden state
+右 v_ℓ:  f (32 tokens) ──编码器_ℓ^R──> 池化后的向量
                         ──LayerNorm(无仿射) → Linear(·, E)──> w_ℓ(f) ∈ R^E
          v_ℓ(f, z) = ⟨w_ℓ(f), ẽ_z⟩ / sqrt(E)
 ```
@@ -107,10 +121,13 @@ exp7 改成分阶段冻结，原因有两个：所有子网络同时带梯度放
 - 右函数取这个形式是因为目标本身满足 `target = ⟨s(h+f) − s(f), e_z − ē⟩`，所以每个右奇异函数都是"一个只依赖 f 的向量"与 `ẽ_z` 的内积。每个模式有自己的网络，直接输出完整的 E 维向量，不需要 exp6 的共享投影 `P`。
 - 每个模式的左编码器、右编码器、两个头都是这个模式独有的。L 个模式共 2L 个编码器。
 
-**编码器类型**（`--subnet`）：
+**编码器类型**（`--subnet`，默认 `scratch`）。每个编码器把一段 token 变成一个向量（“池化后的向量”）：
 
-- `gpt2`：`experiments.exp5_gpt2_mlp_table.model.trainable_encoder(inference)`，即教师 transformer 的一个可训练副本，dropout 关闭。
-- `scratch`：随机初始化的 GPT-2 结构 transformer（`transformers.GPT2Model`），默认 6 层、宽 384、6 个注意力头（`--scratch-layers`、`--scratch-width`、`--scratch-heads`），dropout 0，自己的 token embedding 和位置 embedding，词表与教师相同。这些默认值是我的决定。
+- `scratch`：随机初始化的 BERT 结构 transformer（`transformers.BertModel`，不带它自带的 pooler），双向注意力，默认 6 层、宽 384、6 个注意力头（`--scratch-layers`、`--scratch-width`、`--scratch-heads`），dropout 0，自己的 token embedding 和位置 embedding，词表与教师相同（直接输入 GPT-2 的 token 编号）。池化是对所有位置的最后一层 hidden state 取平均。
+- `roberta`：预训练的 RoBERTa-base（`--roberta-path`，默认 `models/roberta-base`）的一个可训练副本，dropout 关闭。输入时把 GPT-2 的 token 编号按 token 字符串映射成 RoBERTa 的编号，前后加上 `<s>` 和 `</s>`。池化是对所有位置（含这两个特殊 token）的最后一层 hidden state 取平均。任何一个 GPT-2 token 在 RoBERTa 的词表里找不到时报错。
+- `gpt2`（保留，暂不使用）：`experiments.exp5_gpt2_mlp_table.model.trainable_encoder(inference)`，即教师 transformer 的一个可训练副本，dropout 关闭，因果注意力；“池化”是取最后一个 token 的 hidden state。
+
+平均池化、`<s>`/`</s>`、`scratch` 的大小是我的决定。序列长度固定（history 64、future 32），没有 padding，所以平均不需要掩码。
 
 ### 第 ℓ 阶段的一步
 
@@ -126,7 +143,7 @@ exp7 改成分阶段冻结，原因有两个：所有子网络同时带梯度放
    这等于 `experiments.exp5_gpt2_mlp_table.loss.paired_loss` 在 `neigs=1` 时的值。复用它时需要一个 `NestedLoRA(neigs=1)` 实例提供掩码，并把 `f` 变形为 `(B, 1)`、`g` 变形为 `(B·top_k, 1)`。
 5. 只更新当前模式的参数。
 
-每个阶段新建优化器（Adam）。`gpt2` 的编码器用 `--encoder-lr`（默认 2e-5），头用 `--lr`（默认 3e-4）；`scratch` 的全部参数用 `--lr`，带 1000 步线性 warmup（warmup 是我的决定）。
+每个阶段新建优化器（Adam）。预训练的两种（`roberta`、`gpt2`）的编码器用 `--encoder-lr`（默认 2e-5），头用 `--lr`（默认 3e-4）；`scratch` 的全部参数用 `--lr`，带 1000 步线性 warmup（warmup 是我的决定）。
 
 ### 什么时候冻结
 
@@ -173,14 +190,15 @@ exp7 改成分阶段冻结，原因有两个：所有子网络同时带梯度放
 ### 入口与配套
 
 - 模块 `src/experiments/exp7_independent_subnets/`，`pyproject.toml` 加脚本 `exp7`，只有 `train` 一个子命令。
-- 参数：`--subnet {gpt2,scratch}`（默认 `gpt2`）、`--modes`、`--stage-steps`、`--min-stage-steps`、`--patience`、`--align-pairs`、`--scratch-layers`、`--scratch-width`、`--scratch-heads`、`--batch-size`（默认 128）、`--eval-every`、`--lr`、`--encoder-lr`、`--seed`、`--store-dir`、`--dataset`、`--model-path`、`--results-root`、`--device`、`--overwrite`，与 exp6 的同名参数含义一致。
+- 参数：`--subnet {scratch,roberta,gpt2}`（默认 `scratch`）、`--roberta-path`（默认 `models/roberta-base`，参与续跑时的一致性检查）、`--modes`、`--stage-steps`、`--min-stage-steps`、`--patience`、`--align-pairs`、`--scratch-layers`、`--scratch-width`、`--scratch-heads`、`--batch-size`（默认 128）、`--eval-every`、`--lr`、`--encoder-lr`、`--seed`、`--store-dir`、`--dataset`、`--model-path`、`--results-root`、`--device`、`--overwrite`，与 exp6 的同名参数含义一致。
 - `bluehive_run/exp7-train.sbatch`，照 `exp6-train.sbatch` 写。
 - README 加一节 exp7。
 
 ### 资源估计（未实测）
 
-- `gpt2`：一步的梯度内存与 exp6 相同（batch 128 约 16 GB）。每个已冻结模式多占约 1 GB 权重和两次只做前向的 GPT-2 计算，所以第 8 阶段约 23 GB，每步时间大约是第 1 阶段的两到三倍。
+- `roberta` 和 `gpt2`：每个编码器约 1.25 亿参数。`gpt2` 一步的梯度内存与 exp6 相同（batch 128 约 16 GB），`roberta` 的大小相同，估计相近。每个已冻结模式多占约 1 GB 权重和两次只做前向的计算，所以第 8 阶段约 23 GB，每步时间大约是第 1 阶段的两到三倍。
 - `scratch`（默认大小）：每个编码器约 3000 万参数，其中 token embedding 约 1900 万。
+- `models/roberta-base` 需要先下载（`scripts/download_models.py --models roberta`，约 500 MB），本机和集群各一次。
 
 ### 测试
 
@@ -207,11 +225,11 @@ exp7 改成分阶段冻结，原因有两个：所有子网络同时带梯度放
 
 ## 怎么读结果
 
-第一步只跑第 1 阶段，两种子网络各一次：
+第一步只跑第 1 阶段，`scratch` 和 `roberta` 各一次：
 
 ```bash
-uv run exp7 train --subnet gpt2 --modes 1
 uv run exp7 train --subnet scratch --modes 1
+uv run exp7 train --subnet roberta --modes 1
 ```
 
 对照值（报告表，即 exp4 的 `val` 表，减 `g`）：共享网络的第 1 阶 energy 是 0.45–0.47，共享网络在任何阶数下的最好值是 0.51，精确 SVD 的第 1 阶是 0.654。
@@ -221,7 +239,8 @@ uv run exp7 train --subnet scratch --modes 1
 | 高于 0.51 | 一个独立子网络单独学第一模式，就超过了共享网络用 128 个模式得到的总和。独立是有效的 | 用胜出的子网络类型，以更大的 `--modes` 在同一目录续跑 |
 | 0.47–0.51 | 独立去掉了干扰，但提升有限 | 仍然续跑到 8 个模式，看总 energy 能否超过 0.51 |
 | 0.47 以下 | 瓶颈不在共享上，而在"只读 future 去预测 GPT-2 在没见过的 future 上的反应" | 停下来重新讨论右函数的输入（例如锚点方案） |
-| `scratch` 远低于 `gpt2` | 从 GPT-2 权重出发是必要的 | 后续只用 `gpt2` |
-| `scratch` 接近或超过 `gpt2` | 小网络足够，可以负担更多模式 | 后续用 `scratch`，并加大 `--modes` |
+| `scratch` 远低于 `roberta` | 预训练是必要的 | 后续只用 `roberta` |
+| `scratch` 接近或超过 `roberta` | 小网络足够，可以负担更多模式 | 后续用 `scratch`，并加大 `--modes` |
+| 两种都低于 0.47 | 双向加池化没有解决问题 | 用保留的 `--subnet gpt2` 跑一次第 1 阶段作对照，再讨论 |
 
 多阶段的结果另看两点：对齐前后 energy 的差（差大说明后面的模式在修补前面的误差）；`stages.jsonl` 里每个阶段新增的 energy 相对于精确 SVD 该阶新增的 energy。
