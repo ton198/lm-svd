@@ -15,6 +15,15 @@ A constant left function is then worth exactly nothing, and g drops out as well
 Evaluation is on the two exp4 tables minus their own column means, against the
 exact SVD of that matrix; the left features lose their mean over the table's
 histories.
+
+Study D is the same training with --layout landmark: the right functions are
+mixes of the frozen model's entries behind fixed landmark histories
+(model.LandmarkNetwork), so only the left side has to generalise. Its runs also
+report minus_g_energy, the energy on the table minus g (exp5-exp7's measure) of
+
+    1 x (mean of the landmark rows - g)  +  the learned centered modes,
+
+next to the exact energy at one rank more (the mean counts as a mode).
 """
 
 from __future__ import annotations
@@ -37,6 +46,7 @@ from utils.inference import CausalLMInference
 from utils.nestedlora import NestedLoRA
 
 from .grid import Teacher, Windows, step_seed
+from .mean import load_mean_table
 from .model import ENCODERS, LAYOUTS, build_network, parameter_groups
 from .runs import RunFiles, lr_factor
 
@@ -120,6 +130,32 @@ def span_energy(
     }
 
 
+@torch.no_grad()
+def landmark_mean(network: torch.nn.Module, table, chunk: int = 256) -> dict:
+    """The landmark rows' mean as the first mode of a table minus g (a mean.MeanTable).
+
+    mean_energy: 1 - ||A - 1 x (landmark mean - g)||^2 / ||A||^2; ceiling: the same
+    with the table's own column means; centered_share: ||A - column means||^2 /
+    ||A||^2, the weight of the centered modes in the table minus g; exact[k]: the
+    exact rank-(k + 1) energy of the table minus g.
+    """
+    network.eval()
+    estimate = torch.cat([
+        network.entries(
+            table.future_ids[start:start + chunk], table.header_ids[start:start + chunk]
+        ).mean(dim=0)
+        for start in range(0, len(table.future_ids), chunk)
+    ]) - table.g
+    network.train()
+    miss = (estimate - table.column_mean).double().square().sum().item()
+    return {
+        "mean_energy": 1 - (table.centered_energy + table.histories * miss) / table.total_energy,
+        "ceiling": 1 - table.centered_energy / table.total_energy,
+        "centered_share": table.centered_energy / table.total_energy,
+        "exact": table.exact_energy,
+    }
+
+
 def format_spans(comparison: dict) -> str:
     cells = ", ".join(
         f"{rank}: {left:.4f}/{right:.4f}"
@@ -149,6 +185,7 @@ def train_centered(
     seed: int,
     overwrite: bool,
     roberta_path: Path | None = None,
+    landmarks: int = 64,
     eval_chunk: int = 256,
 ) -> dict:
     if layout not in LAYOUTS or encoder not in ENCODERS or nesting not in NESTINGS:
@@ -163,6 +200,7 @@ def train_centered(
         "steps": steps, "eval_every": eval_every, "lr": lr, "encoder_lr": encoder_lr,
         "seed": seed, "model_path": str(model_path), "stream_path": str(stream_path),
         "roberta_path": str(roberta_path) if encoder == "roberta" else None,
+        "landmarks": landmarks if layout == "landmark" else None,
     }
     files = RunFiles(output_dir, config, overwrite)
     saved = files.load()
@@ -179,8 +217,16 @@ def train_centered(
     if modes not in ranks:
         ranks = ranks + (modes,)
 
+    landmark_ids = None
+    if layout == "landmark":
+        # Fixed by the seed alone, so a resumed run has the same landmarks.
+        landmark_ids = Windows(
+            stream_path, history_tokens, future_tokens, inference.vocab_size,
+            step_seed(seed, 0) + 1,
+        ).draw(landmarks, 1)[0].to(device)
     network = build_network(
-        inference, layout=layout, encoder=encoder, modes=modes, roberta_path=roberta_path
+        inference, layout=layout, encoder=encoder, modes=modes, roberta_path=roberta_path,
+        teacher=teacher, landmark_ids=landmark_ids,
     ).to(device)
     wrapper = NestedLoRA(model=network, neigs=modes, sequential=nesting == "sequential").to(device)
     optimizer = torch.optim.Adam(parameter_groups(network, encoder, lr, encoder_lr))
@@ -205,12 +251,32 @@ def train_centered(
     windows = Windows(
         stream_path, history_tokens, future_tokens, inference.vocab_size, step_seed(seed, step))
 
+    # Study D: how the landmark mean and the centered modes add up on the table minus g.
+    minus_g: dict[str, dict] = {}
+    if layout == "landmark":
+        for name, (table, future_ids, header_ids) in tables.items():
+            reference_table = load_mean_table(inference_dir / name, teacher, device)
+            minus_g[name] = landmark_mean(network, reference_table, eval_chunk)
+            print(
+                f"{name}: the mean of {landmarks} landmark rows as the first mode captures "
+                f"{minus_g[name]['mean_energy']:.4f} of the table minus g "
+                f"(its own column means {minus_g[name]['ceiling']:.4f}, "
+                f"exact rank 1 {minus_g[name]['exact'][0]:.4f})", flush=True)
+
     def evaluate() -> dict:
         record = {}
         for name, (table, future_ids, header_ids) in tables.items():
             left, right = table_features(network, table, future_ids, header_ids, eval_chunk)
             comparison = compare_with_exact_svd(left, right, table, ranks)
             comparison.update(span_energy(left, right, table.matrix, comparison["ranks"]))
+            if name in minus_g:
+                parts = minus_g[name]
+                comparison["minus_g_energy"] = [
+                    parts["mean_energy"] + parts["centered_share"] * energy
+                    for energy in comparison["captured_energy"]]
+                comparison["minus_g_exact_energy"] = [
+                    parts["exact"][min(rank, len(parts["exact"]) - 1)]
+                    for rank in comparison["ranks"]]
             record[name] = comparison
         return record
 
@@ -249,6 +315,12 @@ def train_centered(
             for name in TABLE_NAMES:
                 print(format_comparison(name, record[name]), flush=True)
                 print(format_spans(record[name]), flush=True)
+                if "minus_g_energy" in record[name]:
+                    cells = ", ".join(
+                        f"{rank}+1: {energy:.4f}/{exact:.4f}" for rank, energy, exact in zip(
+                            record[name]["ranks"], record[name]["minus_g_energy"],
+                            record[name]["minus_g_exact_energy"]))
+                    print(f"        table minus g, mean + modes: energy/exact  {cells}", flush=True)
             files.save({
                 "network": network.state_dict(), "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(), "step": step,

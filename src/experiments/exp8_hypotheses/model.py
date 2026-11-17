@@ -6,6 +6,8 @@ left_features (N, L) and right_features (F, K, L):
 - SharedNetwork: one encoder per side, mode l is output l of each head (exp6's
   layout with exp7's encoders).
 - IndependentNetwork: L exp7 Modes, each with its own two encoders.
+- LandmarkNetwork (study D): only the left side is a network. A right function
+  is a fixed mix of the frozen model's own entries behind M landmark histories.
 
 Study C (the column means themselves) uses MeanStudent, a trainable copy of the
 frozen model whose output keeps the model's own unembedding.
@@ -21,6 +23,7 @@ from torch import nn
 from experiments.exp5_gpt2_mlp_table.model import linear_head, trainable_encoder
 from experiments.exp7_independent_subnets.model import (
     LastToken,
+    MeanPool,
     Mode,
     build_mode,
     roberta_encoder,
@@ -29,8 +32,10 @@ from experiments.exp7_independent_subnets.model import (
 )
 from utils.inference import CausalLMInference
 
-ENCODERS = ("gpt2", "roberta", "scratch")
-LAYOUTS = ("shared", "independent")
+ENCODERS = ("gpt2", "gpt2-mean", "roberta", "scratch")
+# Kinds that start from pretrained weights, trained at encoder_lr.
+PRETRAINED = ("gpt2", "gpt2-mean", "roberta")
+LAYOUTS = ("shared", "independent", "landmark")
 SCRATCH = {"scratch_layers": 6, "scratch_width": 384, "scratch_heads": 6}
 
 
@@ -40,6 +45,9 @@ def build_encoder(
     """An exp7 encoder: token ids (B, T) -> (B, width)."""
     if kind == "gpt2":
         return LastToken(trainable_encoder(inference), inference.model.config.hidden_size)
+    if kind == "gpt2-mean":
+        # The same copy, averaged over its positions instead of read at the last one.
+        return MeanPool(trainable_encoder(inference), inference.model.config.hidden_size)
     if kind == "roberta":
         if roberta_path is None:
             raise ValueError("encoder 'roberta' needs roberta_path")
@@ -97,12 +105,80 @@ class IndependentNetwork(nn.Module):
         ], dim=-1)
 
 
+class LandmarkNetwork(nn.Module):
+    """Right functions made of the frozen model's entries behind landmark histories.
+
+    For M fixed landmark histories h_1..h_M, the response of a column (future, z)
+    is the vector of its entries behind each of them, minus their mean:
+
+        r_m(future, z) = entry(h_m, future, z) - mean over m' of entry(h_m', future, z)
+
+    and right function l is sum_m mix[l, m] r_m. The frozen model computes the
+    responses for any future, so the right side has nothing to generalise; it
+    costs M passes of the model per future. Only `mix` (L x M) and the left
+    encoder and head are trained. The mean over the landmarks is itself an
+    estimate of the column's mean over all histories (see landmark_mean).
+    """
+
+    def __init__(
+        self, left_encoder: nn.Module, modes: int, teacher, landmark_ids: torch.Tensor
+    ) -> None:
+        super().__init__()
+        if modes > len(landmark_ids):
+            raise ValueError(
+                f"{modes} modes need at least as many landmarks, got {len(landmark_ids)}")
+        self.modes = modes
+        self.left_encoder = left_encoder
+        self.left_head = linear_head(left_encoder.width, modes)
+        self.mix = nn.Parameter(torch.eye(modes, len(landmark_ids)))
+        self.register_buffer("landmark_ids", landmark_ids)
+        # Not a submodule: the frozen model is neither trained nor saved here.
+        object.__setattr__(self, "teacher", teacher)
+        self._table_responses: dict[tuple[int, int], torch.Tensor] = {}
+
+    def encoders(self) -> list[nn.Module]:
+        return [self.left_encoder]
+
+    def left_features(self, history_ids: torch.Tensor) -> torch.Tensor:
+        return self.left_head(self.left_encoder(history_ids))
+
+    @torch.no_grad()
+    def entries(self, future_ids: torch.Tensor, header_ids: torch.Tensor) -> torch.Tensor:
+        """Entries (M, F, K) of every landmark history with every future."""
+        return self.teacher.grid_entries(self.landmark_ids, future_ids, header_ids)
+
+    def responses(self, future_ids: torch.Tensor, header_ids: torch.Tensor) -> torch.Tensor:
+        """(M, F, K), centered over the landmarks.
+
+        In evaluation mode the result is kept for the same slice of a table's
+        futures: the landmarks are fixed, so a table's responses never change.
+        """
+        key = (future_ids.data_ptr(), len(future_ids))
+        if not self.training and key in self._table_responses:
+            return self._table_responses[key]
+        entries = self.entries(future_ids, header_ids)
+        responses = entries - entries.mean(dim=0, keepdim=True)
+        if not self.training:
+            self._table_responses[key] = responses
+        return responses
+
+    def right_features(self, future_ids: torch.Tensor, header_ids: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("lm,mfk->fkl", self.mix, self.responses(future_ids, header_ids))
+
+
 def build_network(
     inference: CausalLMInference, *, layout: str, encoder: str, modes: int,
-    roberta_path: Path | None = None,
+    roberta_path: Path | None = None, teacher=None, landmark_ids: torch.Tensor | None = None,
 ) -> nn.Module:
     if layout not in LAYOUTS:
         raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
+    if layout == "landmark":
+        if teacher is None or landmark_ids is None:
+            raise ValueError("layout 'landmark' needs the teacher and landmark_ids")
+        return LandmarkNetwork(
+            build_encoder(inference, encoder, roberta_path), modes, teacher, landmark_ids)
+    if encoder == "gpt2-mean" and layout == "independent":
+        raise ValueError("encoder 'gpt2-mean' has no independent layout")
     vectors = token_vectors(inference.model.get_output_embeddings().weight)
     if layout == "shared":
         return SharedNetwork(
@@ -116,6 +192,8 @@ def build_network(
 
 def parameter_groups(network: nn.Module, encoder: str, lr: float, encoder_lr: float) -> list[dict]:
     """Pretrained encoders at encoder_lr, everything else at lr; scratch has one group."""
+    if encoder not in ENCODERS:
+        raise ValueError(f"encoder must be one of {ENCODERS}, got {encoder!r}")
     if encoder == "scratch":
         return [{"params": list(network.parameters()), "lr": lr}]
     in_encoders = {

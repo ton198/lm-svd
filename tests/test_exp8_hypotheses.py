@@ -10,6 +10,7 @@ import torch
 from experiments.exp4_table_neural_svd.train import load_table
 from experiments.exp8_hypotheses.center import (
     centered_loss,
+    landmark_mean,
     load_centered_table,
     span_energy,
     train_centered,
@@ -229,6 +230,52 @@ class CenterTests(Exp8Fixture):
             self.run_center("center-bad", history_batch=1)
         with self.assertRaisesRegex(ValueError, "unknown layout"):
             self.run_center("center-bad", nesting="both")
+
+
+class LandmarkTests(Exp8Fixture):
+    def network(self, modes=2):
+        tokens = self.table_tokens("train")
+        torch.manual_seed(0)
+        return build_network(
+            self.inference, layout="landmark", encoder="gpt2-mean", modes=modes,
+            teacher=self.teacher, landmark_ids=tokens["histories"][:3]), tokens
+
+    def test_right_functions_start_as_the_landmark_rows_minus_their_mean(self):
+        network, tokens = self.network()
+        futures, headers = tokens["futures"], tokens["header_token_ids"]
+        rows = self.teacher.grid_entries(tokens["histories"][:3], futures, headers)
+        expected = (rows - rows.mean(dim=0))[:2].permute(1, 2, 0)
+        self.assertTrue(torch.allclose(network.right_features(futures, headers), expected, atol=1e-5))
+        self.assertEqual(network.left_features(tokens["histories"]).shape, (4, 2))
+        trained = {name for name, p in network.named_parameters() if p.requires_grad}
+        self.assertIn("mix", trained)
+        self.assertFalse(any(name.startswith("teacher") for name in trained))
+        with self.assertRaisesRegex(ValueError, "at least as many landmarks"):
+            self.network(modes=4)
+
+    def test_all_histories_as_landmarks_give_the_tables_own_column_means(self):
+        tokens = self.table_tokens("train")
+        network = build_network(
+            self.inference, layout="landmark", encoder="gpt2-mean", modes=2,
+            teacher=self.teacher, landmark_ids=tokens["histories"])
+        table = load_mean_table(self.inference_dir / "train", self.teacher, "cpu")
+        parts = landmark_mean(network, table, chunk=2)
+        self.assertAlmostEqual(parts["mean_energy"], parts["ceiling"], places=5)
+        self.assertAlmostEqual(parts["ceiling"] + parts["centered_share"], 1.0, places=9)
+        self.assertAlmostEqual(parts["exact"][0], table.exact_rank1, places=9)
+
+    def test_training_reports_the_energy_on_the_table_minus_g(self):
+        summary = quiet(
+            train_centered, inference_dir=self.inference_dir, stream_path=self.stream_path,
+            model_path=self.model_path, output_dir=self.root / "landmark-run", device="cpu",
+            layout="landmark", encoder="gpt2-mean", nesting="joint", modes=2, history_batch=4,
+            future_batch=3, steps=2, eval_every=1, lr=1e-3, encoder_lr=1e-4, seed=0,
+            overwrite=False, landmarks=3)
+        self.assertEqual(summary["step"], 2)
+        record = json.loads(
+            (self.root / "landmark-run" / "eval_history.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(len(record["val"]["minus_g_energy"]), 2)
+        self.assertEqual(len(record["val"]["minus_g_exact_energy"]), 2)
 
 
 class MeanTests(Exp8Fixture):

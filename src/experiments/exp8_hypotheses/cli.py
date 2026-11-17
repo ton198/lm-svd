@@ -17,7 +17,7 @@ from . import EXPERIMENT
 
 DEFAULT_STREAM = Path("data/token_streams/wikitext-103-train.npy")
 # --lr of study B for each encoder kind, as in exp7.
-CENTER_LR = {"scratch": 1e-4, "roberta": 3e-4, "gpt2": 3e-4}
+CENTER_LR = {"scratch": 1e-4, "roberta": 3e-4, "gpt2": 3e-4, "gpt2-mean": 3e-4}
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -57,11 +57,19 @@ def main(argv: list[str] | None = None) -> None:
              "the exp4 tables minus theirs")
     _common(center)
     _training(center, steps=30000)
-    center.add_argument("--layout", choices=("shared", "independent"), default="shared",
+    center.add_argument("--layout", choices=("shared", "independent", "landmark"),
+                        default="shared",
                         help="shared: one encoder per side, a mode is an output; "
-                             "independent: every mode has its own two encoders (exp7)")
-    center.add_argument("--encoder", choices=("gpt2", "roberta", "scratch"), default="gpt2",
-                        help="exp7's encoder kinds")
+                             "independent: every mode has its own two encoders (exp7); "
+                             "landmark (study D): only the left side is a network, a right "
+                             "function is a trained mix of the frozen model's entries behind "
+                             "--landmarks fixed histories")
+    center.add_argument("--encoder", choices=("gpt2", "gpt2-mean", "roberta", "scratch"),
+                        default="gpt2",
+                        help="exp7's encoder kinds; gpt2-mean averages the copy's positions "
+                             "instead of reading the last one")
+    center.add_argument("--landmarks", type=positive_int, default=64,
+                        help="Landmark histories of --layout landmark, drawn from the stream")
     center.add_argument("--roberta-path", type=Path, default=Path("models/minilmv2-l6-h384"),
                         help="Pretrained model of --encoder roberta")
     center.add_argument("--nesting", choices=("joint", "sequential"), default="joint",
@@ -103,6 +111,8 @@ def main(argv: list[str] | None = None) -> None:
 
             encoder_name = args.roberta_path.name if args.encoder == "roberta" else args.encoder
             name = f"center-{args.layout}-{encoder_name}-{args.nesting}-L{args.modes}"
+            if args.layout == "landmark":
+                name += f"-M{args.landmarks}"
             summary = train_centered(
                 inference_dir=inference_dir, stream_path=args.stream_path,
                 model_path=args.model_path, output_dir=root / (name + args.tag),
@@ -110,7 +120,8 @@ def main(argv: list[str] | None = None) -> None:
                 nesting=args.nesting, modes=args.modes, history_batch=args.history_batch,
                 future_batch=args.future_batch, steps=args.steps, eval_every=args.eval_every,
                 lr=getattr(args, "lr", CENTER_LR[args.encoder]), encoder_lr=args.encoder_lr,
-                seed=args.seed, overwrite=args.overwrite, roberta_path=args.roberta_path)
+                seed=args.seed, overwrite=args.overwrite, roberta_path=args.roberta_path,
+                landmarks=args.landmarks)
         else:
             from .mean import train_mean
 

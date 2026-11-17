@@ -43,6 +43,7 @@ class MeanTable:
     total_energy: float  # ||A||^2 of the table minus g
     centered_energy: float  # ||A - 1 x column_mean||^2
     exact_rank1: float
+    exact_energy: list[float]  # entry k: exact energy of the leading k + 1 modes, k <= 256
 
 
 @torch.no_grad()
@@ -56,11 +57,14 @@ def load_mean_table(table_dir: Path, teacher: Teacher, device: str | torch.devic
     column_mean = matrix.mean(dim=0)
     total = matrix.square().sum().item()
     centered = (matrix - column_mean).square().sum().item()
-    top = thin_svd(matrix)[1][0].item() ** 2
+    values = thin_svd(matrix)[1].square()
+    top = values[0].item()
+    cumulative = (values[:257].cumsum(dim=0) / total).tolist()
     return MeanTable(
         future_ids=future_ids, header_ids=header_ids, g=g,
         column_mean=column_mean.float().reshape(g.shape), histories=matrix.shape[0],
         total_energy=total, centered_energy=centered, exact_rank1=top / total,
+        exact_energy=cumulative,
     )
 
 
