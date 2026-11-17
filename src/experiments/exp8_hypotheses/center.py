@@ -200,8 +200,9 @@ def train_centered(
         "steps": steps, "eval_every": eval_every, "lr": lr, "encoder_lr": encoder_lr,
         "seed": seed, "model_path": str(model_path), "stream_path": str(stream_path),
         "roberta_path": str(roberta_path) if encoder == "roberta" else None,
-        "landmarks": landmarks if layout == "landmark" else None,
     }
+    if layout == "landmark":
+        config["landmarks"] = landmarks
     files = RunFiles(output_dir, config, overwrite)
     saved = files.load()
 
