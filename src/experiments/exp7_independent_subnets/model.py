@@ -12,13 +12,24 @@ parameter is shared between the two sides or between two modes.
 
 An encoder maps token ids (B, T) to one pooled vector per sequence (B, width).
 Sequences have a fixed length and no padding, so no attention mask is needed.
+All token ids are the frozen model's (GPT-2's); a roberta encoder maps them to
+RoBERTa's ids by token string.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from torch import nn
-from transformers import BertConfig, BertModel
+from transformers import (
+    AutoTokenizer,
+    BertConfig,
+    BertModel,
+    PretrainedConfig,
+    PreTrainedTokenizerBase,
+    RobertaModel,
+)
 
 from experiments.exp7_independent_subnets import SUBNETS
 from experiments.exp5_gpt2_mlp_table.model import linear_head, trainable_encoder
@@ -74,6 +85,122 @@ def scratch_encoder(
     ), add_pooling_layer=False), width)
 
 
+def _tokenizer(path: Path) -> PreTrainedTokenizerBase:
+    try:
+        return AutoTokenizer.from_pretrained(path, local_files_only=True)
+    except OSError as error:
+        raise ValueError(f"cannot load the local tokenizer of {path}: {error}") from error
+
+
+def token_id_map(model_path: Path, roberta_path: Path, vocab_size: int) -> torch.Tensor:
+    """(vocab_size,) int64: entry i is RoBERTa's id of the string of token i of model_path.
+
+    Rejects a missing RoBERTa directory, model tokens missing from RoBERTa's
+    vocabulary and a model token that is RoBERTa's pad token.
+    """
+    if not Path(roberta_path).is_dir():
+        raise ValueError(
+            f"RoBERTa directory does not exist: {roberta_path}; download it with "
+            "`uv run python scripts/download_models.py --models roberta` or pass --roberta-path")
+    strings = {index: token for token, index in _tokenizer(model_path).get_vocab().items()}
+    absent = [i for i in range(vocab_size) if i not in strings]
+    if absent:
+        raise ValueError(
+            f"the tokenizer of {model_path} has no token of id {absent[0]} "
+            f"(the model has {vocab_size} ids)")
+    roberta = _tokenizer(roberta_path)
+    vocab = roberta.get_vocab()
+    missing = [strings[i] for i in range(vocab_size) if strings[i] not in vocab]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of the {vocab_size} tokens of {model_path} are not in the "
+            f"vocabulary of {roberta_path}, for example {missing[0]!r}")
+    id_map = torch.tensor([vocab[strings[i]] for i in range(vocab_size)], dtype=torch.int64)
+    # RoBERTa reads its pad id as padding: the positions after it would shift.
+    if roberta.pad_token_id is not None and (id_map == roberta.pad_token_id).any():
+        raise ValueError(
+            f"the token {roberta.pad_token!r} of {model_path} is the pad token of "
+            f"{roberta_path}")
+    return id_map
+
+
+class RobertaInput(nn.Module):
+    """A RoBERTa transformer fed the model's token ids, mapped and wrapped in <s> .. </s>."""
+
+    def __init__(
+        self, transformer: nn.Module, id_map: torch.Tensor, bos_id: int, eos_id: int
+    ) -> None:
+        super().__init__()
+        self.transformer = transformer
+        # Derived from the tokenizer files, so it is saved in no mode file.
+        self.register_buffer("id_map", id_map, persistent=False)
+        self.bos_id = bos_id
+        self.eos_id = eos_id
+
+    @property
+    def config(self) -> PretrainedConfig:
+        return self.transformer.config
+
+    @property
+    def max_tokens(self) -> int:
+        """The longest sequence of model tokens it reads, <s> and </s> not counted.
+
+        RoBERTa's positions start after its pad id: T tokens without padding take
+        positions pad_token_id + 1 .. pad_token_id + T.
+        """
+        config = self.transformer.config
+        return config.max_position_embeddings - config.pad_token_id - 1 - 2
+
+    def forward(self, input_ids: torch.Tensor):
+        """(B, T) model token ids -> the transformer's output on (B, T + 2) RoBERTa ids."""
+        ids = self.id_map[input_ids]
+        bos = ids.new_full((len(ids), 1), self.bos_id)
+        eos = ids.new_full((len(ids), 1), self.eos_id)
+        return self.transformer(input_ids=torch.cat([bos, ids, eos], dim=1))
+
+
+def roberta_encoder(roberta_path: Path, model_path: Path, vocab_size: int) -> MeanPool:
+    """A trainable copy of the pretrained RoBERTa at roberta_path, dropout off, mean-pooled.
+
+    It reads the token ids of the model at model_path; the mean is over all
+    positions, <s> and </s> included. RoBERTa's own pooler is left out.
+    """
+    id_map = token_id_map(model_path, roberta_path, vocab_size)
+    try:
+        transformer = RobertaModel.from_pretrained(
+            roberta_path, add_pooling_layer=False, hidden_dropout_prob=0.0,
+            attention_probs_dropout_prob=0.0, local_files_only=True)
+    except OSError as error:
+        raise ValueError(f"cannot load the local RoBERTa from {roberta_path}: {error}") from error
+    config = transformer.config
+    return MeanPool(
+        RobertaInput(transformer, id_map, config.bos_token_id, config.eos_token_id),
+        config.hidden_size,
+    ).train()
+
+
+def max_tokens(encoder: nn.Module) -> int:
+    """The largest T of the token ids (B, T) a LastToken or MeanPool encoder reads."""
+    transformer = encoder.transformer
+    if isinstance(transformer, RobertaInput):
+        return transformer.max_tokens
+    return transformer.config.max_position_embeddings
+
+
+def check_lengths(mode: Mode, history_tokens: int, future_tokens: int) -> None:
+    """Reject sequences that do not fit the positions of the encoder of their side."""
+    for side, name, encoder, tokens in (
+        ("history", "left", mode.left_encoder, history_tokens),
+        ("future", "right", mode.right_encoder, future_tokens),
+    ):
+        longest = max_tokens(encoder)
+        if tokens > longest:
+            raise ValueError(
+                f"{side} sequences of {tokens} tokens do not fit the {name} encoder, which "
+                f"reads at most {longest} tokens besides the ones it adds itself (history "
+                f"{history_tokens}, future {future_tokens} tokens)")
+
+
 class Mode(nn.Module):
     def __init__(
         self,
@@ -112,11 +239,13 @@ def build_mode(
     scratch_layers: int,
     scratch_width: int,
     scratch_heads: int,
+    roberta_path: Path | None = None,
 ) -> Mode:
     """One mode with two encoders of kind `subnet` and their two heads.
 
-    `scratch` starts each side at a random BERT transformer, `gpt2` at a copy of
-    the teacher's transformer.
+    `scratch` starts each side at a random BERT transformer, `roberta` at the
+    pretrained RoBERTa in roberta_path, `gpt2` at a copy of the teacher's
+    transformer.
     """
     if subnet not in SUBNETS:
         raise ValueError(f"subnet must be one of {SUBNETS}, got {subnet!r}")
@@ -127,12 +256,16 @@ def build_mode(
                 scratch_layers, scratch_width, scratch_heads)
             for _ in range(2)
         )
-    elif subnet == "gpt2":
+    elif subnet == "roberta":
+        if roberta_path is None:
+            raise ValueError("subnet 'roberta' needs roberta_path")
+        left_encoder, right_encoder = (
+            roberta_encoder(roberta_path, inference.model_path, inference.vocab_size)
+            for _ in range(2))
+    else:
         width = inference.model.config.hidden_size
         left_encoder, right_encoder = (
             LastToken(trainable_encoder(inference), width) for _ in range(2))
-    else:
-        raise ValueError(f"subnet {subnet!r} cannot be built yet")
     embedding = inference.model.get_output_embeddings().weight.shape[1]
     return Mode(
         left_encoder, right_encoder,

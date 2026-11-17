@@ -49,7 +49,7 @@ from utils.inference import CausalLMInference
 
 from . import PRETRAINED, SUBNETS, TABLE_KEYS, WARMUP_STEPS
 from .align import Moments, alignment, max_correlation
-from .model import Mode, build_mode, token_vectors
+from .model import Mode, build_mode, check_lengths, token_vectors
 from .stage import Selection, residual_target, stage_loss
 
 # Added to the stage number when seeding the weights of a new mode, so the seeds
@@ -60,6 +60,11 @@ ENCODERS = {
     "scratch": "a randomly initialised BERT transformer (bidirectional attention, no pooler, "
                "dropout 0) with its own token and position embeddings, reading the model's "
                "token ids; pooled vector: the mean of its last hidden state over all positions",
+    "roberta": "a trainable copy of the pretrained RoBERTa in roberta_path (bidirectional "
+               "attention, no pooler, dropout 0); the model's token ids are mapped to "
+               "RoBERTa's by token string and the sequence is wrapped in <s> .. </s>; pooled "
+               "vector: the mean of its last hidden state over all positions, <s> and </s> "
+               "included",
     "gpt2": "a trainable copy of the model's transformer (causal attention, dropout off); "
             "pooled vector: the hidden state of the last position",
 }
@@ -208,6 +213,15 @@ def _read_checkpoint(output_dir: Path, config: dict, modes: int) -> dict | None:
     return checkpoint
 
 
+def _build_mode(inference: CausalLMInference, config: dict) -> Mode:
+    """A new mode of the run's kind, on the CPU."""
+    return build_mode(
+        inference, config["subnet"], scratch_layers=config["scratch_layers"],
+        scratch_width=config["scratch_width"], scratch_heads=config["scratch_heads"],
+        roberta_path=Path(config["roberta_path"]),
+    )
+
+
 @dataclass
 class StageState:
     """A stage in progress: what checkpoint.pt stores besides the frozen modes."""
@@ -261,11 +275,7 @@ class StagedRun:
         self.started = time.perf_counter()
 
     def new_mode(self) -> Mode:
-        config = self.config
-        return build_mode(
-            self.inference, config["subnet"], scratch_layers=config["scratch_layers"],
-            scratch_width=config["scratch_width"], scratch_heads=config["scratch_heads"],
-        ).to(self.device)
+        return _build_mode(self.inference, self.config).to(self.device)
 
     def start_stage(self, stage: int, saved: dict | None = None) -> StageState:
         """Mode `stage` with its own optimizer.
@@ -543,6 +553,7 @@ def train_exp7(
     encoder_lr: float,
     seed: int,
     overwrite: bool,
+    roberta_path: Path,
     encode_batch: int = 1024,
     eval_chunk: int = 256,
 ) -> dict:
@@ -554,7 +565,8 @@ def train_exp7(
     evaluations; it then freezes the weights of its best evaluation (its last
     with patience 0). Modes of a pretrained kind (PRETRAINED) train their
     encoders with encoder_lr and their heads with lr; scratch modes train
-    everything with lr after a linear warmup.
+    everything with lr after a linear warmup. roberta_path is the pretrained
+    RoBERTa of the roberta kind; it is part of the settings of every kind.
 
     Writes eval_history.jsonl (one line per evaluation), stages.jsonl (one
     line per finished stage), modes/mode-XX.pt, alignment.pt (the latest
@@ -586,7 +598,8 @@ def train_exp7(
                 f"and {scratch_heads}")
     config = {
         "inference_dir": str(inference_dir), "store_dir": str(store_dir),
-        "model_path": str(model_path), "subnet": subnet, "stage_steps": stage_steps,
+        "model_path": str(model_path), "roberta_path": str(roberta_path), "subnet": subnet,
+        "stage_steps": stage_steps,
         "min_stage_steps": min_stage_steps, "patience": patience, "align_pairs": align_pairs,
         "scratch_layers": scratch_layers, "scratch_width": scratch_width,
         "scratch_heads": scratch_heads, "batch_size": batch_size, "eval_every": eval_every,
@@ -621,6 +634,13 @@ def train_exp7(
         raise ValueError(
             f"--modes {modes} exceeds the {exact_modes} exact singular vectors of the "
             f"selection table (exp4 {selection_name!r} in {inference_dir})")
+    if subnet == "roberta":
+        # A mode built here and dropped reports a missing RoBERTa directory, missing
+        # tokens or too few positions before --overwrite deletes anything. scratch and
+        # gpt2 have the model's positions, which the store's pairs fit.
+        check_lengths(
+            _build_mode(inference, config), history_tokens=exact.histories.shape[1],
+            future_tokens=exact.columns.shape[1] - 1)
     if overwrite:
         for name in ("checkpoint.pt", "eval_history.jsonl", "stages.jsonl", "alignment.pt"):
             (output_dir / name).unlink(missing_ok=True)
@@ -676,6 +696,10 @@ def train_exp7(
     if subnet == "gpt2":
         rates = (
             f"copies of the model's transformer read at the last token; heads lr {lr}, "
+            f"encoders lr {encoder_lr}")
+    elif subnet == "roberta":
+        rates = (
+            f"copies of the pretrained RoBERTa in {roberta_path}, mean-pooled; heads lr {lr}, "
             f"encoders lr {encoder_lr}")
     else:
         rates = (

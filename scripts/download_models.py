@@ -15,6 +15,14 @@ GPT2_FILES = (
     "vocab.json",
     "merges.txt",
 )
+ROBERTA_FILES = (
+    "config.json",
+    "model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+)
 MODELS = {
     "small": (
         "openai-community/gpt2",
@@ -34,7 +42,15 @@ MODELS = {
         "gpt2-large",
         GPT2_FILES,
     ),
+    # exp7's --subnet roberta; downloaded only when named.
+    "roberta": (
+        "FacebookAI/roberta-base",
+        "e2da8e2f811d1448a5b465c236feacd80ffbac7b",
+        "roberta-base",
+        ROBERTA_FILES,
+    ),
 }
+DEFAULT_MODELS = ["small", "medium", "large"]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -43,8 +59,8 @@ def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--models", nargs="+", choices=tuple(MODELS), default=list(MODELS),
-        help="Models to download",
+        "--models", nargs="+", choices=tuple(MODELS), default=DEFAULT_MODELS,
+        help="Models to download; roberta (RoBERTa-base, for exp7) only when named",
     )
     parser.add_argument(
         "--output-dir", type=Path,

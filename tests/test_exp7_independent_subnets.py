@@ -1,8 +1,11 @@
 import contextlib
+import importlib.util
 import io
 import json
 import math
+import re
 import shutil
+import tempfile
 import unittest
 import weakref
 from pathlib import Path
@@ -10,7 +13,17 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
-from transformers import BertModel, GPT2Model
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import WhitespaceSplit
+from transformers import (
+    AutoTokenizer,
+    BertModel,
+    GPT2Model,
+    PreTrainedTokenizerFast,
+    RobertaConfig,
+    RobertaModel,
+)
 
 from experiments.exp4_table_neural_svd.train import compare_with_exact_svd
 from experiments.exp5_gpt2_mlp_table.features import (
@@ -22,12 +35,18 @@ from experiments.exp5_gpt2_mlp_table.features import (
 from experiments.exp5_gpt2_mlp_table.loss import paired_loss
 from experiments.exp5_gpt2_mlp_table.train import draw_pairs
 from experiments.exp5_gpt2_mlp_table.tables import load_eval_table
+from experiments.exp7_independent_subnets import PRETRAINED, SUBNETS
 from experiments.exp7_independent_subnets.align import Moments, alignment, max_correlation
 from experiments.exp7_independent_subnets.cli import main
 from experiments.exp7_independent_subnets.model import (
     LastToken,
     MeanPool,
+    Mode,
+    RobertaInput,
     build_mode,
+    check_lengths,
+    roberta_encoder,
+    token_id_map,
     token_vectors,
 )
 from experiments.exp7_independent_subnets.stage import Selection, residual_target, stage_loss
@@ -43,14 +62,55 @@ from utils.nestedlora import NestedLoRA
 from test_exp5_gpt2_mlp_table import FUTURES, HISTORIES, TOP_K, VOCAB, Exp5Fixture
 
 SCRATCH = dict(scratch_layers=1, scratch_width=4, scratch_heads=2)
-SUBNETS = ("gpt2", "scratch")
+# The teacher's token strings, by id (Exp5Fixture's word-level tokenizer).
+TEACHER_TOKENS = ["[UNK]", *map(str, range(1, VOCAB))]
 
 
 def parameter_ids(module: torch.nn.Module) -> set[int]:
     return {id(p) for p in module.parameters()}
 
 
-class ModeTests(Exp5Fixture):
+def save_roberta(
+    path: Path, *, positions: int = 12, missing: tuple[str, ...] = (), pad: str = "<pad>"
+) -> Path:
+    """A tiny random RoBERTa whose vocabulary holds the teacher's token strings reversed.
+
+    missing leaves teacher tokens out of its vocabulary; pad names its pad token.
+    """
+    words = [word for word in reversed(TEACHER_TOKENS) if word not in missing]
+    vocab = {"<s>": 0, "<pad>": 1, "</s>": 2, "<unk>": 3,
+             **{word: 4 + i for i, word in enumerate(words)}}
+    # Without its pooler, like the real checkpoint (which has none), so loading it
+    # prints no report of unexpected weights.
+    RobertaModel(RobertaConfig(
+        vocab_size=VOCAB + 4, hidden_size=8, num_hidden_layers=1, num_attention_heads=2,
+        intermediate_size=16, max_position_embeddings=positions, pad_token_id=1,
+        bos_token_id=0, eos_token_id=2,
+    ), add_pooling_layer=False).save_pretrained(path)
+    tokenizer = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = WhitespaceSplit()
+    PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer, bos_token="<s>", eos_token="</s>", unk_token="<unk>",
+        pad_token=pad,
+    ).save_pretrained(path)
+    return path
+
+
+class Exp7Fixture(Exp5Fixture):
+    """Exp5Fixture and a tiny RoBERTa directory for the roberta kind."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.roberta_dir = save_roberta(cls.root / "roberta")
+
+    def build(self, subnet: str, roberta_path: Path | None = None) -> Mode:
+        """A mode of any kind; roberta reads the tiny directory unless told otherwise."""
+        return build_mode(
+            self.inference, subnet, **SCRATCH, roberta_path=roberta_path or self.roberta_dir)
+
+
+class ModeTests(Exp7Fixture):
     HEADER = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 16]])
 
     def vectors(self):
@@ -67,7 +127,7 @@ class ModeTests(Exp5Fixture):
 
     def test_shapes_and_the_bilinear_right_side(self):
         for subnet in SUBNETS:
-            mode = build_mode(self.inference, subnet, **SCRATCH)
+            mode = self.build(subnet)
             vectors = self.vectors()
             futures = torch.tensor(FUTURES)
             with torch.no_grad():
@@ -112,6 +172,7 @@ class ModeTests(Exp5Fixture):
         return changed
 
     def test_scratch_is_bidirectional_and_mean_pooled(self):
+        torch.manual_seed(0)
         encoder = build_mode(self.inference, "scratch", **SCRATCH).left_encoder
         self.assertIsInstance(encoder, MeanPool)
         self.assertIsInstance(encoder.transformer, BertModel)
@@ -126,7 +187,8 @@ class ModeTests(Exp5Fixture):
         with torch.no_grad():
             pooled = encoder(ids)
             hidden = encoder.transformer(input_ids=ids).last_hidden_state
-            changed = encoder.transformer(input_ids=self.last_token_changed(ids)).last_hidden_state
+            changed = encoder.transformer(
+                input_ids=self.last_token_changed(ids)).last_hidden_state
         torch.testing.assert_close(pooled, hidden.mean(dim=1), atol=1e-6, rtol=0)
         # A causal model's first position does not see the last token.
         self.assertFalse(torch.allclose(changed[:, 0], hidden[:, 0], atol=1e-4))
@@ -149,9 +211,9 @@ class ModeTests(Exp5Fixture):
         self.assertFalse(torch.allclose(changed[:, -1], hidden[:, -1], atol=1e-4))
 
     def test_every_kind_gives_one_vector_per_sequence(self):
-        widths = {"scratch": 4, "gpt2": self.inference.model.config.hidden_size}
+        widths = {"scratch": 4, "roberta": 8, "gpt2": self.inference.model.config.hidden_size}
         for subnet in SUBNETS:
-            mode = build_mode(self.inference, subnet, **SCRATCH)
+            mode = self.build(subnet)
             for encoder in (mode.left_encoder, mode.right_encoder):
                 self.assertEqual(encoder.width, widths[subnet])
                 self.assertEqual(encoder.width, encoder.transformer.config.hidden_size)
@@ -163,8 +225,8 @@ class ModeTests(Exp5Fixture):
 
     def test_the_four_parts_of_a_mode_and_two_modes_share_no_parameter(self):
         for subnet in SUBNETS:
-            mode_a = build_mode(self.inference, subnet, **SCRATCH)
-            mode_b = build_mode(self.inference, subnet, **SCRATCH)
+            mode_a = self.build(subnet)
+            mode_b = self.build(subnet)
             groups = [
                 parameter_ids(getattr(mode, name))
                 for mode in (mode_a, mode_b)
@@ -177,7 +239,7 @@ class ModeTests(Exp5Fixture):
 
     def test_each_side_reads_its_own_input_only(self):
         for subnet in SUBNETS:
-            mode = build_mode(self.inference, subnet, **SCRATCH)
+            mode = self.build(subnet)
             vectors = self.vectors()
             mode.left_features(torch.tensor(HISTORIES)).sum().backward()
             for part in (mode.right_encoder, mode.right_head):
@@ -200,9 +262,83 @@ class ModeTests(Exp5Fixture):
     def test_unknown_subnet_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "subnet"):
             build_mode(self.inference, "mlp", **SCRATCH)
-        # A known kind whose encoder does not exist yet.
-        with self.assertRaisesRegex(ValueError, "roberta"):
+        # roberta needs its directory.
+        with self.assertRaisesRegex(ValueError, "roberta_path"):
             build_mode(self.inference, "roberta", **SCRATCH)
+
+    def roberta_vocab(self, path: Path) -> dict[str, int]:
+        return AutoTokenizer.from_pretrained(path, local_files_only=True).get_vocab()
+
+    def test_roberta_ids_follow_the_token_strings(self):
+        id_map = token_id_map(self.model_path, self.roberta_dir, VOCAB)
+        self.assertEqual((id_map.dtype, id_map.shape), (torch.int64, (VOCAB,)))
+        teacher = AutoTokenizer.from_pretrained(self.model_path, local_files_only=True)
+        self.assertEqual(teacher.convert_ids_to_tokens(list(range(VOCAB))), TEACHER_TOKENS)
+        vocab = self.roberta_vocab(self.roberta_dir)
+        self.assertEqual(
+            id_map.tolist(), [vocab[teacher.convert_ids_to_tokens(i)] for i in range(VOCAB)])
+        # The reversed order over 4 + 17 ids leaves only the middle token, "10", at its
+        # own id: a map that kept the teacher's ids would be wrong at all other 16.
+        self.assertEqual((id_map == torch.arange(VOCAB)).nonzero().flatten().tolist(), [10])
+        self.assertTrue(set(id_map.tolist()).isdisjoint({0, 1, 2, 3}))
+
+    def test_roberta_encoder_wraps_the_sequence_and_mean_pools(self):
+        encoder = roberta_encoder(self.roberta_dir, self.model_path, VOCAB)
+        self.assertIsInstance(encoder, MeanPool)
+        self.assertIsInstance(encoder.transformer, RobertaInput)
+        roberta = encoder.transformer.transformer
+        self.assertIsInstance(roberta, RobertaModel)
+        self.assertIsNone(roberta.pooler)
+        self.assertEqual(encoder.width, 8)
+        self.assertTrue(encoder.training and roberta.training)
+        self.assertEqual(
+            (roberta.config.hidden_dropout_prob, roberta.config.attention_probs_dropout_prob),
+            (0.0, 0.0))
+        self.assertTrue(all(p.requires_grad for p in encoder.parameters()))
+        plain = RobertaModel.from_pretrained(
+            self.roberta_dir, add_pooling_layer=False, local_files_only=True).eval()
+        self.assertEqual(set(roberta.state_dict()), set(plain.state_dict()))
+        for key, value in plain.state_dict().items():
+            self.assertTrue(torch.equal(roberta.state_dict()[key], value), key)
+        id_map = token_id_map(self.model_path, self.roberta_dir, VOCAB)
+        for rows in (HISTORIES, FUTURES):
+            ids = torch.tensor(rows)
+            wrapped = torch.cat([
+                torch.zeros(len(ids), 1, dtype=torch.long), id_map[ids],
+                torch.full((len(ids), 1), 2)], dim=1)
+            with torch.no_grad():
+                # The encoder stays in train mode: its dropout is off.
+                pooled = encoder(ids)
+                expected = plain(input_ids=wrapped).last_hidden_state.mean(dim=1)
+            self.assertEqual(wrapped.shape[1], ids.shape[1] + 2)
+            torch.testing.assert_close(pooled, expected, atol=1e-6, rtol=0)
+        # id_map is derived from the tokenizer files and saved in no mode file.
+        mode = self.build("roberta")
+        state = mode.state_dict()
+        self.assertFalse([key for key in state if "id_map" in key])
+        self.assertTrue(torch.equal(mode.left_encoder.transformer.id_map, id_map))
+        fresh = self.build("roberta")
+        fresh.load_state_dict(state)  # strict
+        self.assertTrue(torch.equal(fresh.right_encoder.transformer.id_map, id_map))
+
+    def test_a_token_missing_from_roberta_is_rejected(self):
+        path = save_roberta(self.root / "roberta-missing", missing=("5", "9"))
+        with self.assertRaisesRegex(ValueError, r"2 of the 17 tokens.*'5'"):
+            token_id_map(self.model_path, path, VOCAB)
+        with self.assertRaisesRegex(ValueError, "2 of the 17 tokens"):
+            self.build("roberta", path)
+
+    def test_a_teacher_token_that_is_robertas_pad_token_is_rejected(self):
+        # RoBERTa reads its pad id as padding and would shift the positions after it.
+        path = save_roberta(self.root / "roberta-pad", pad="7")
+        with self.assertRaisesRegex(ValueError, "'7'.*pad"):
+            token_id_map(self.model_path, path, VOCAB)
+
+    def test_a_missing_roberta_directory_is_rejected(self):
+        missing = self.root / "no-roberta"
+        with self.assertRaisesRegex(
+                ValueError, f"{re.escape(str(missing))}.*download_models.py --models roberta"):
+            token_id_map(self.model_path, missing, VOCAB)
 
 
 class StageTests(unittest.TestCase):
@@ -389,7 +525,7 @@ class TrainingHelpers:
             model_path=self.model_path, output_dir=output_dir, device="cpu", subnet="gpt2",
             modes=2, stage_steps=4, min_stage_steps=0, patience=0, align_pairs=32,
             **SCRATCH, batch_size=8, eval_every=2, lr=1e-2, encoder_lr=1e-3, seed=0,
-            overwrite=False,
+            overwrite=False, roberta_path=self.roberta_dir,
         )
         options.update(changes)
         with contextlib.redirect_stdout(io.StringIO()) as output:
@@ -407,12 +543,12 @@ class TrainingHelpers:
         return [json.loads(line) for line in lines]
 
 
-class TrainingTests(TrainingHelpers, Exp5Fixture):
+class TrainingTests(TrainingHelpers, Exp7Fixture):
     def vectors(self):
         return token_vectors(self.inference.model.get_output_embeddings().weight)
 
     def load_mode(self, path, subnet="gpt2"):
-        mode = build_mode(self.inference, subnet, **SCRATCH)
+        mode = self.build(subnet)
         mode.load_state_dict(torch.load(path, weights_only=True)["state_dict"])
         return mode
 
@@ -429,10 +565,10 @@ class TrainingTests(TrainingHelpers, Exp5Fixture):
         vectors = self.vectors()
         for subnet in SUBNETS:
             with self.subTest(subnet=subnet):
-                frozen = [build_mode(self.inference, subnet, **SCRATCH) for _ in range(2)]
+                frozen = [self.build(subnet) for _ in range(2)]
                 for mode in frozen:
                     mode.requires_grad_(False).eval()
-                current = build_mode(self.inference, subnet, **SCRATCH)
+                current = self.build(subnet)
                 frozen_before = [
                     {name: p.detach().clone() for name, p in mode.named_parameters()}
                     for mode in frozen]
@@ -760,7 +896,7 @@ class TrainingTests(TrainingHelpers, Exp5Fixture):
                            stage_steps=2, lr=1e-2, encoder_lr=1e-3)
             mode, groups = states[0].mode, states[0].optimizer.param_groups
             with self.subTest(subnet=subnet):
-                if subnet == "gpt2":
+                if subnet in PRETRAINED:
                     heads = parameter_ids(mode.left_head) | parameter_ids(mode.right_head)
                     encoders = (
                         parameter_ids(mode.left_encoder) | parameter_ids(mode.right_encoder))
@@ -809,8 +945,101 @@ class TrainingTests(TrainingHelpers, Exp5Fixture):
                            **{**SCRATCH, **change})
         self.assertEqual({path: path.stat().st_mtime_ns for path in output.rglob("*")}, before)
 
+    def recorded_stages(self):
+        """A patch of StagedRun.start_stage that records the stages it starts, and the list."""
+        states = []
+        start_stage = StagedRun.start_stage
 
-class ResumeTests(TrainingHelpers, Exp5Fixture):
+        def recording_start(run, stage, *args, **kwargs):
+            states.append(start_stage(run, stage, *args, **kwargs))
+            return states[-1]
+
+        return patch.object(StagedRun, "start_stage", recording_start), states
+
+    def test_roberta_modes_share_nothing_and_train(self):
+        modes = [self.build("roberta") for _ in range(2)]
+        groups = [parameter_ids(mode) for mode in modes] + [parameter_ids(self.inference.model)]
+        for i, first in enumerate(groups):
+            for second in groups[i + 1:]:
+                self.assertFalse(first & second)
+        output = self.root / "exp7-roberta"
+        recording, states = self.recorded_stages()
+        with recording:
+            summary = self.train(output, subnet="roberta", modes=2, lr=1e-2, encoder_lr=1e-3)
+        self.assertEqual(
+            summary, {"output_dir": str(output), "step": 8, "modes": 2, "evaluations": 4})
+        self.assertEqual(sorted(path.name for path in output.iterdir()), [
+            "alignment.pt", "checkpoint.pt", "eval_history.jsonl", "metadata.json", "modes",
+            "stages.jsonl"])
+        self.assertEqual([(s["stage"], s["reason"]) for s in self.stages(output)],
+                         [(1, "steps"), (2, "steps")])
+        state = torch.load(output / "modes" / "mode-02.pt", weights_only=True)["state_dict"]
+        self.assertEqual(set(state), set(self.build("roberta").state_dict()))
+        metadata = json.loads((output / "metadata.json").read_text())
+        self.assertEqual((metadata["subnet"], metadata["roberta_path"]),
+                         ("roberta", str(self.roberta_dir)))
+        self.assertEqual(metadata["warmup_steps"], 0)
+        self.assertIn("RoBERTa", metadata["encoder"])
+        self.assertIn("encoders lr 0.001", self.log)
+        self.assertEqual(len(states), 2)
+        for state in states:
+            mode = state.mode
+            heads = parameter_ids(mode.left_head) | parameter_ids(mode.right_head)
+            encoders = parameter_ids(mode.left_encoder) | parameter_ids(mode.right_encoder)
+            self.assertEqual(
+                [(group["lr"], {id(p) for p in group["params"]})
+                 for group in state.optimizer.param_groups],
+                [(1e-2, heads), (1e-3, encoders)])
+            self.assertIsNone(state.scheduler)
+        self.assertFalse(parameter_ids(states[0].mode) & parameter_ids(states[1].mode))
+
+    def test_a_missing_roberta_directory_is_reported_before_anything_is_deleted(self):
+        output = self.root / "exp7-roberta-finished"
+        self.train(output, subnet="roberta", modes=1, stage_steps=2)
+        before = {path: path.stat().st_mtime_ns for path in output.rglob("*")}
+        missing = self.root / "exp7-no-roberta"
+        with self.assertRaisesRegex(
+                ValueError, f"{re.escape(str(missing))}.*download_models.py"):
+            self.train(output, subnet="roberta", modes=1, stage_steps=2, overwrite=True,
+                       roberta_path=missing)
+        # The other errors of a roberta directory come before the deletion as well.
+        lacking = save_roberta(self.root / "exp7-roberta-lacking", missing=("3", "4"))
+        short = save_roberta(self.root / "exp7-roberta-short", positions=6)
+        for path, message in ((lacking, "2 of the 17 tokens"), (short, "history")):
+            with self.subTest(path=path.name), self.assertRaisesRegex(ValueError, message):
+                self.train(output, subnet="roberta", modes=1, stage_steps=2, overwrite=True,
+                           roberta_path=path)
+        self.assertEqual({path: path.stat().st_mtime_ns for path in output.rglob("*")}, before)
+
+    def test_too_long_sequences_are_rejected(self):
+        # RoBERTa's positions start after its pad id 1: T tokens without padding take the
+        # positions 2 .. T + 1, so P position embeddings hold P - 2 tokens, <s> and </s>
+        # among them. With P = 7 the longest input is 3 tokens, the fixture's histories.
+        path = save_roberta(self.root / "roberta-seven", positions=7)
+        mode = self.build("roberta", path)
+        check_lengths(mode, 3, 2)
+        with torch.no_grad():
+            self.assertEqual(mode.left_features(torch.tensor(HISTORIES)).shape, (6,))
+            longer = torch.tensor([[1, 2, 3, 4]])
+            # The check and the installed transformers agree on the first rejected length.
+            with self.assertRaises((IndexError, RuntimeError)):
+                mode.left_encoder(longer)
+        with self.assertRaisesRegex(
+                ValueError, "history sequences of 4 tokens.*at most 3.*history 4, future 2"):
+            check_lengths(mode, 4, 2)
+        with self.assertRaisesRegex(ValueError, "future sequences of 4 tokens.*at most 3"):
+            check_lengths(mode, 3, 4)
+        # Too short for the fixture's histories: the run stops before it writes anything.
+        short = save_roberta(self.root / "roberta-six", positions=6)
+        output = self.root / "exp7-too-long"
+        with self.assertRaisesRegex(
+                ValueError, "history sequences of 3 tokens.*at most 2.*history 3, future 2"):
+            self.train(output, subnet="roberta", modes=1, roberta_path=short)
+        self.assertFalse(output.exists())
+        self.assertNotIn("Stage 1", self.log)
+
+
+class ResumeTests(TrainingHelpers, Exp7Fixture):
     def interrupted(self, output_dir, records):
         """Raise KeyboardInterrupt at the first draw of pairs once `records` evaluations exist.
 
@@ -1067,6 +1296,23 @@ class ResumeTests(TrainingHelpers, Exp5Fixture):
         with self.assertRaises(FileExistsError):
             self.train(history_only, modes=1, stage_steps=2)
 
+    def test_resume_needs_the_same_roberta_path(self):
+        output = self.root / "exp7-roberta-resume"
+        other = self.root / "exp7-roberta-other"
+        shutil.copytree(self.roberta_dir, other)
+        self.train(output, subnet="roberta", modes=1)
+        first_mode = (output / "modes" / "mode-01.pt").read_bytes()
+        before = self.mtimes(output)
+        with self.assertRaisesRegex(ValueError, "roberta_path.*--overwrite"):
+            self.train(output, subnet="roberta", modes=2, roberta_path=other)
+        self.assertEqual(self.mtimes(output), before)
+        # The frozen mode is loaded from its file (strictly, without id_map) and kept.
+        summary = self.train(output, subnet="roberta", modes=2)
+        self.assertEqual(summary["modes"], 2)
+        self.assertIn("Stage 2: mode 2 on the target minus 1 frozen mode(s)", self.log)
+        self.assertEqual((output / "modes" / "mode-01.pt").read_bytes(), first_mode)
+        self.assertEqual([s["stage"] for s in self.stages(output)], [1, 2])
+
     def test_a_missing_mode_file_is_reported(self):
         output = self.root / "exp7-missing"
         self.train(output, modes=2)
@@ -1075,7 +1321,7 @@ class ResumeTests(TrainingHelpers, Exp5Fixture):
             self.train(output, modes=3)
 
 
-class CLITests(Exp5Fixture):
+class CLITests(Exp7Fixture):
     def test_train_writes_under_the_subnet_directory(self):
         results_root = self.root / "exp7-results"
         shutil.copytree(
@@ -1106,6 +1352,27 @@ class CLITests(Exp5Fixture):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("--overwrite", error.getvalue())
 
+    def test_train_roberta_writes_under_its_own_directory(self):
+        results_root = self.root / "exp7-results-roberta"
+        shutil.copytree(
+            self.inference_dir,
+            results_root / "exp4_table_neural_svd" / "tiny__model" / "inference",
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            main([
+                "train", "--results-root", str(results_root), "--dataset", "tiny",
+                "--model-path", str(self.model_path), "--store-dir", str(self.store_dir),
+                "--subnet", "roberta", "--roberta-path", str(self.roberta_dir),
+                "--modes", "1", "--stage-steps", "2", "--min-stage-steps", "0",
+                "--patience", "0", "--eval-every", "2", "--align-pairs", "16",
+                "--batch-size", "8", "--device", "cpu",
+            ])
+        run = results_root / "exp7_independent_subnets" / "tiny__model" / "train-roberta"
+        self.assertTrue((run / "modes" / "mode-01.pt").is_file())
+        self.assertIn(f"output_dir: {run}", output.getvalue())
+        metadata = json.loads((run / "metadata.json").read_text())
+        self.assertEqual(metadata["roberta_path"], str(self.roberta_dir))
+
     def test_defaults_match_the_design(self):
         with patch("experiments.exp7_independent_subnets.train.train_exp7") as train:
             train.return_value = {"output_dir": "x", "step": 0, "modes": 0, "evaluations": 0}
@@ -1122,6 +1389,7 @@ class CLITests(Exp5Fixture):
              "scratch_heads": 6, "batch_size": 128, "eval_every": 1000, "lr": 3e-4,
              "encoder_lr": 2e-5, "seed": 42, "device": "cuda", "overwrite": False})
         self.assertEqual(options["model_path"], Path("models/gpt2-small"))
+        self.assertEqual(options["roberta_path"], Path("models/roberta-base"))
         self.assertEqual(
             options["store_dir"],
             Path("data/sample_stores/wikitext-103-train__gpt2-small__h64-f32"))
@@ -1131,9 +1399,18 @@ class CLITests(Exp5Fixture):
             "data/experiment_results/exp7_independent_subnets/wikitext-large__gpt2-small"
             "/train-scratch"))
 
+    def test_roberta_path_is_passed_through(self):
+        with patch("experiments.exp7_independent_subnets.train.train_exp7") as train:
+            train.return_value = {"output_dir": "x", "step": 0, "modes": 0, "evaluations": 0}
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["train", "--subnet", "roberta", "--roberta-path", "elsewhere/roberta"])
+        options = train.call_args.kwargs
+        self.assertEqual(
+            (options["subnet"], options["roberta_path"]), ("roberta", Path("elsewhere/roberta")))
+        self.assertEqual(options["output_dir"].name, "train-roberta")
+
     def test_usage_errors(self):
-        # roberta is not offered before its encoder exists.
-        for arguments in (["--subnet", "mlp"], ["--subnet", "roberta"], ["--modes", "0"], ["--patience", "-1"],
+        for arguments in (["--subnet", "mlp"], ["--modes", "0"], ["--patience", "-1"],
                           ["--min-stage-steps", "10", "--stage-steps", "5"]):
             with self.subTest(arguments=arguments), \
                     patch("experiments.exp7_independent_subnets.train.train_exp7") as train, \
@@ -1142,3 +1419,49 @@ class CLITests(Exp5Fixture):
                 main(["train", *arguments])
             self.assertEqual(raised.exception.code, 2)
             train.assert_not_called()
+
+
+class DownloadModelsTests(unittest.TestCase):
+    """scripts/download_models.py with snapshot_download patched: nothing is downloaded."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        path = Path(__file__).resolve().parents[1] / "scripts" / "download_models.py"
+        spec = importlib.util.spec_from_file_location("download_models", path)
+        cls.script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.script)
+
+    def run_script(self, arguments: list[str]) -> list[dict]:
+        """The keyword arguments of each snapshot_download call; it writes the files asked for."""
+        def download(*, local_dir, allow_patterns, **_):
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            for name in allow_patterns:
+                (Path(local_dir) / name).write_text("")
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        output_dir = Path(tmp.name)
+        with patch.object(self.script, "snapshot_download", side_effect=download) as fetch, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.script.main([*arguments, "--output-dir", str(output_dir)])
+        self.output_dir = output_dir
+        return [call.kwargs for call in fetch.call_args_list]
+
+    def test_the_default_is_the_three_gpt2_models(self):
+        calls = self.run_script([])
+        self.assertEqual(
+            [(call["repo_id"], call["local_dir"]) for call in calls],
+            [("openai-community/gpt2", self.output_dir / "gpt2-small"),
+             ("openai-community/gpt2-medium", self.output_dir / "gpt2-medium"),
+             ("openai-community/gpt2-large", self.output_dir / "gpt2-large")])
+
+    def test_roberta_is_downloaded_when_named(self):
+        calls = self.run_script(["--models", "roberta"])
+        self.assertEqual(calls, [{
+            "repo_id": "FacebookAI/roberta-base",
+            "revision": "e2da8e2f811d1448a5b465c236feacd80ffbac7b",
+            "local_dir": self.output_dir / "roberta-base",
+            "allow_patterns": [
+                "config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json",
+                "vocab.json", "merges.txt"],
+        }])

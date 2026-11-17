@@ -29,12 +29,18 @@ def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     train_parser.add_argument(
-        # roberta is offered once its encoder exists.
-        "--subnet", choices=[kind for kind in SUBNETS if kind != "roberta"], default="scratch",
+        "--subnet", choices=SUBNETS, default="scratch",
         help="Encoders of each side of a mode. scratch: a randomly initialised bidirectional "
              "BERT transformer reading the model's token ids, mean-pooled over all positions; "
-             "roberta: not available yet; gpt2 (kept, not in the planned runs): a trainable "
-             "copy of the model's causal transformer, read at the last token",
+             "roberta: a trainable copy of the pretrained RoBERTa in --roberta-path, reading "
+             "the model's tokens mapped to RoBERTa's ids by token string between <s> and "
+             "</s>, mean-pooled over all positions; gpt2 (kept, not in the planned runs): a "
+             "trainable copy of the model's causal transformer, read at the last token",
+    )
+    train_parser.add_argument(
+        "--roberta-path", type=Path, default=Path("models/roberta-base"),
+        help="Local pretrained RoBERTa of --subnet roberta "
+             "(scripts/download_models.py --models roberta); a continued run must repeat it",
     )
     train_parser.add_argument(
         "--modes", type=positive_int, default=8,
@@ -67,12 +73,12 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--eval-every", type=positive_int, default=1000)
     train_parser.add_argument(
         "--lr", type=positive_float, default=3e-4,
-        help="Learning rate of the heads of a gpt2 mode, and of all of a scratch mode "
-             f"after a linear warmup over the first {WARMUP_STEPS} steps of its stage",
+        help="Learning rate of the heads of a roberta or gpt2 mode, and of all of a scratch "
+             f"mode after a linear warmup over the first {WARMUP_STEPS} steps of its stage",
     )
     train_parser.add_argument(
         "--encoder-lr", type=positive_float, default=2e-5,
-        help="Learning rate of the two transformer copies of a gpt2 mode",
+        help="Learning rate of the two encoders of a roberta or gpt2 mode, without warmup",
     )
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument(
@@ -118,6 +124,7 @@ def main(argv: list[str] | None = None) -> None:
             encoder_lr=args.encoder_lr,
             seed=args.seed,
             overwrite=args.overwrite,
+            roberta_path=args.roberta_path,
         )
     except (ValueError, FileExistsError) as error:
         parser.error(str(error))

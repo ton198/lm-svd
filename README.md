@@ -53,17 +53,21 @@ uv run python scripts/download_models.py
 
 # Optional: download just one model.
 uv run python scripts/download_models.py --models medium
+
+# RoBERTa-base for exp7's --subnet roberta; only downloaded when named.
+uv run python scripts/download_models.py --models roberta
 ```
 
-The script downloads **complete inference files**, not every file in the upstream repositories. Each GPT-2 directory contains `model.safetensors`, `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, and `merges.txt`. These include the full model weights, not just tokenizers. Duplicate PyTorch, TensorFlow, Flax, Rust, and ONNX weight formats are not downloaded.
+The script downloads **complete inference files**, not every file in the upstream repositories. Each GPT-2 directory contains `model.safetensors`, `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, and `merges.txt`. The RoBERTa directory contains `model.safetensors`, `config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, and `merges.txt`. These include the full model weights, not just tokenizers. Duplicate PyTorch, TensorFlow, Flax, Rust, and ONNX weight formats are not downloaded.
 
 | Local directory | Hugging Face repository | Pinned revision |
 | --- | --- | --- |
 | `models/gpt2-small` | [openai-community/gpt2](https://huggingface.co/openai-community/gpt2) | `607a30d783dfa663caf39e06633721c8d4cfcd7e` |
 | `models/gpt2-medium` | [openai-community/gpt2-medium](https://huggingface.co/openai-community/gpt2-medium) | `6dcaa7a952f72f9298047fd5137cd6e4f05f41da` |
 | `models/gpt2-large` | [openai-community/gpt2-large](https://huggingface.co/openai-community/gpt2-large) | `32b71b12589c2f8d625668d2335a01cac3249519` |
+| `models/roberta-base` | [FacebookAI/roberta-base](https://huggingface.co/FacebookAI/roberta-base) | `e2da8e2f811d1448a5b465c236feacd80ffbac7b` |
 
-Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of all three model directories; by default it is the repository's `models/` directory. Use `--models large` for GPT-2 Large. Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
+Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of the model directories; by default it is the repository's `models/` directory. Without `--models` the script downloads the three GPT-2 models; `--models roberta` downloads RoBERTa-base (about 500 MB, used only by exp7). Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
 
 After downloading the required models and source data, all tokenization and model inference can run offline.
 
@@ -590,9 +594,12 @@ right v_l:  future (32 tokens)  -> encoder_l^R -> pooled vector
 | `--subnet` | Each encoder | Pooled vector | Learning rates |
 | --- | --- | --- | --- |
 | `scratch` (default) | A randomly initialised BERT transformer (`transformers.BertModel` without its pooler), bidirectional, trained from scratch, dropout 0, with its own token and position embeddings; it reads the model's token ids directly; `--scratch-layers` 6, `--scratch-width` 384, `--scratch-heads` 6 by default | The mean of the last hidden state over all positions | everything `--lr` (default 3e-4), with a linear warmup over the first 1000 steps of each stage |
+| `roberta` | A trainable copy of the pretrained RoBERTa-base in `--roberta-path` (default `models/roberta-base`; `transformers.RobertaModel` without its pooler), bidirectional, dropout 0. The model's GPT-2 token ids are mapped to RoBERTa's ids by token string, and `<s>` is put in front of the sequence and `</s>` behind it | The mean of the last hidden state over all positions, `<s>` and `</s>` included | encoders `--encoder-lr` (default 2e-5), heads `--lr` (default 3e-4), no warmup |
 | `gpt2` (kept, not used in the planned runs) | A trainable copy of the model's transformer, causal, dropout off: exp6's encoder, so only "independent or shared" changes | The hidden state of the last position | encoders `--encoder-lr` (default 2e-5), heads `--lr` (default 3e-4) |
 
 Each stage starts a new Adam optimizer.
+
+Why RoBERTa and not the original BERT: RoBERTa uses the same byte-level BPE as GPT-2. All 50257 GPT-2 tokens are in RoBERTa's vocabulary of 50265, under other ids, so a table from GPT-2 id to RoBERTa id built from the token strings is all it takes, and no text is decoded and tokenized again. BERT uses WordPiece and would need the text tokenized again, and a history often ends in the middle of a word. A GPT-2 token missing from RoBERTa's vocabulary, or a missing `--roberta-path` directory, is an error before anything is written. RoBERTa-base has 514 position embeddings, of which a sequence without padding can use 512: 64 history tokens or 32 future tokens plus `<s>` and `</s>` fit, and a longer sequence is an error before training.
 
 ### One stage
 
@@ -636,18 +643,27 @@ M = Λ_f^{-1/2} C Λ_g^{-1/2} = P S Qᵀ        T_f = Λ_f^{-1/2} P S^{1/2}     
 
 ### Run
 
-exp7 needs what exp5 and exp6 need: the exp4 tables and a sample store from the same model. The first step runs stage 1 alone; a larger `--modes` then continues in the same directory:
+exp7 needs what exp5 and exp6 need: the exp4 tables and a sample store from the same model. The first step runs stage 1 alone, once with `scratch` and once with `roberta`:
 
 ```bash
-uv run exp7 train --modes 1     # --subnet scratch, the default
-uv run exp7 train --modes 8     # continues the same directory
+uv run python scripts/download_models.py --models roberta   # once per machine
+uv run exp7 train --subnet scratch --modes 1
+uv run exp7 train --subnet roberta --modes 1
 ```
+
+Then, with the kind chosen from the table in [How to read the first stage](#how-to-read-the-first-stage), the same command with a larger `--modes` continues that kind's directory:
+
+```bash
+uv run exp7 train --subnet scratch --modes 8     # continues train-scratch
+```
+
+`--subnet scratch` is the default. `--roberta-path` (default `models/roberta-base`) names the local RoBERTa of `--subnet roberta`; nothing is downloaded during training. It is one of the settings a continued run must repeat (see below), for every kind.
 
 Outputs go to `<results-root>/exp7_independent_subnets/<dataset>__<model>/train-<subnet>/`, so each kind has its own directory. On BlueHive, submit `bluehive_run/exp7-train.sbatch`; arguments after the script name are passed to the command, and resubmitting continues the current stage.
 
 Running the same command again continues: the frozen modes are loaded from `modes/`, and an interrupted stage continues at its last evaluation with its best weights and its count of evaluations without a new best. The sampler is reseeded from `--seed` and the global step, so a continued run draws other pairs. Between runs of one directory:
 
-- **Only `--modes` may change** (and `--device`). Any other changed setting (`--stage-steps`, `--patience`, `--lr`, `--store-dir`, …) is an error that names `--overwrite`, which deletes the outputs and starts over.
+- **Only `--modes` may change** (and `--device`). Any other changed setting (`--stage-steps`, `--patience`, `--lr`, `--store-dir`, `--roberta-path`, …) is an error that names `--overwrite`, which deletes the outputs and starts over.
 - A `--modes` below the number of finished modes is an error. Equal to it, with no stage in progress, the command returns at once and writes nothing. Equal to it while a later stage is in progress is an error asking for a larger `--modes` or `--overwrite`.
 - **A finished stage cannot be lengthened**, only redone with `--overwrite`.
 
@@ -701,21 +717,23 @@ Things to keep in mind when reading the records:
 
 Reference values on the report table (exp4's `val` table, minus `g`): the shared networks of exp5 and exp6 reach 0.45–0.47 at rank 1 and at best 0.51 at any rank; the exact SVD has 0.654 at rank 1.
 
-Read the table below on the **unaligned** `report` captured energy at rank 1, from `eval_history.jsonl` or `stages.jsonl`. With one mode the alignment only rescales, so `aligned` should agree up to estimation noise.
+Stage 1 is run once with `scratch` and once with `roberta` (see [Run](#run)). Read the table below on the **unaligned** `report` captured energy at rank 1, from `eval_history.jsonl` or `stages.jsonl`. With one mode the alignment only rescales, so `aligned` should agree up to estimation noise.
 
 | Stage 1 result (report table, energy at rank 1) | Meaning | Next step |
 | --- | --- | --- |
 | Above 0.51 | One independent sub-network learning the first mode alone already exceeds what the shared network reaches with 128 modes. Independence works | Continue in the same directory with the winning kind of sub-network and a larger `--modes` |
 | 0.47–0.51 | Independence removed the interference, but the gain is small | Still continue to 8 modes and see whether the total energy exceeds 0.51 |
 | Below 0.47 | The bottleneck is not the sharing but predicting GPT-2's response to unseen futures from the future alone | Stop and reconsider the input of the right function (for example anchor histories) |
-| `scratch` far below `gpt2` | Starting from GPT-2's weights is necessary | Use only `gpt2` from then on |
-| `scratch` close to or above `gpt2` | A small network is enough and more modes are affordable | Use `scratch` from then on, with a larger `--modes` |
+| `scratch` far below `roberta` | Pretraining is necessary | Use only `roberta` from then on |
+| `scratch` close to or above `roberta` | A small network is enough and more modes are affordable | Use `scratch` from then on, with a larger `--modes` |
+| Both below 0.47 | A bidirectional encoder with pooling did not solve the problem | Run stage 1 once with the kept `--subnet gpt2` for comparison, then reconsider |
 
 With several stages, look also at the difference between the energy before and after the alignment (a large difference means later modes are repairing the errors of earlier ones), and at the energy each stage adds in `stages.jsonl` compared with what the exact SVD adds at that rank.
 
 ### Resources (estimated, not measured)
 
-- `gpt2`: a step needs the same gradient memory as exp6 (about 16 GB at batch 128). Each frozen mode adds about 1 GB of weights and two forward-only GPT-2 passes, so stage 8 needs about 23 GB and a step takes about two to three times as long as in stage 1.
+- `gpt2`: each encoder has about 125 million parameters. A step needs the same gradient memory as exp6 (about 16 GB at batch 128). Each frozen mode adds about 1 GB of weights and two forward-only GPT-2 passes, so stage 8 needs about 23 GB and a step takes about two to three times as long as in stage 1.
+- `roberta`: each encoder also has about 125 million parameters, so its memory, time and disk are expected to be close to `gpt2`'s.
 - `scratch` (default size, a 6-layer BERT of width 384): each encoder has about 30 million parameters, about 19 million of them in the token embedding of GPT-2's 50257 tokens.
 - Disk: every evaluation rewrites the whole checkpoint (the current mode, its best weights and the optimizer state). For `gpt2`, a run directory with 8 modes is estimated at about 16 GB, including the checkpoint's temporary file. This is an estimate, not a measurement.
 

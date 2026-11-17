@@ -16,9 +16,13 @@ cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
 export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"
 
 # Resubmitting continues the current stage from its last evaluation. Extra arguments
-# pass through. Train the first mode first, then add modes in the same directory:
-#   sbatch bluehive_run/exp7-train.sbatch --subnet gpt2 --modes 1
-#   sbatch bluehive_run/exp7-train.sbatch --subnet gpt2 --modes 8
+# pass through. Train the first mode of each planned kind first, then add modes to the
+# chosen kind's directory:
+#   sbatch bluehive_run/exp7-train.sbatch --subnet scratch --modes 1
+#   sbatch bluehive_run/exp7-train.sbatch --subnet roberta --modes 1
+#   sbatch bluehive_run/exp7-train.sbatch --subnet scratch --modes 8
+# --subnet roberta needs models/roberta-base on the cluster
+# (uv run python scripts/download_models.py --models roberta, once).
 # Needs the exp4 tables (exp4-inference.sbatch) and a sample store with published blocks,
 # or a producer running at the same time (sample-store-produce.sbatch).
 exec .venv/bin/python -u -m experiments.exp7_independent_subnets train "$@"
