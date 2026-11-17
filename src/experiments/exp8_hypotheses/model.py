@@ -35,7 +35,7 @@ from utils.inference import CausalLMInference
 ENCODERS = ("gpt2", "gpt2-mean", "roberta", "scratch")
 # Kinds that start from pretrained weights, trained at encoder_lr.
 PRETRAINED = ("gpt2", "gpt2-mean", "roberta")
-LAYOUTS = ("shared", "independent", "landmark")
+LAYOUTS = ("shared", "independent", "landmark", "prototype")
 SCRATCH = {"scratch_layers": 6, "scratch_width": 384, "scratch_heads": 6}
 
 
@@ -166,12 +166,80 @@ class LandmarkNetwork(nn.Module):
         return torch.einsum("lm,mfk->fkl", self.mix, self.responses(future_ids, header_ids))
 
 
+class PrototypeNetwork(LandmarkNetwork):
+    """LandmarkNetwork whose landmarks are trained.
+
+    Each landmark history is replaced by its token embeddings as free vectors (a
+    "prototype history"), read in front of the future by a copy of the model.
+    At the start the two networks are the same function. Training moves the
+    prototypes towards histories whose rows span the table best; with
+    train_copy the copy's weights are trained as well. The right side is then
+    a network of its own: it never calls the frozen model.
+
+    The copy runs in bfloat16 on a GPU, which changes the centered entries'
+    energy by about 0.1%.
+    """
+
+    def __init__(
+        self, left_encoder: nn.Module, modes: int, inference: CausalLMInference,
+        landmark_ids: torch.Tensor, train_copy: bool, chunk: int = 512,
+    ) -> None:
+        super().__init__(left_encoder, modes, None, landmark_ids)
+        self.transformer = trainable_encoder(inference).requires_grad_(train_copy)
+        embedding = self.transformer.get_input_embeddings()
+        self.prototypes = nn.Parameter(
+            embedding(landmark_ids.to(embedding.weight.device)).detach().clone())
+        weight = inference.model.get_output_embeddings().weight.detach().float()
+        self.register_buffer("rows", weight - weight.mean(dim=0), persistent=False)
+        self.train_copy = train_copy
+        self.chunk = chunk
+
+    def encoders(self) -> list[nn.Module]:
+        return [self.left_encoder, self.transformer]
+
+    def _entries(self, future_ids: torch.Tensor, header_ids: torch.Tensor) -> torch.Tensor:
+        prototypes, futures = len(self.prototypes), len(future_ids)
+        on_gpu = self.prototypes.device.type == "cuda"
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=on_gpu):
+            cache = self.transformer(inputs_embeds=self.prototypes, use_cache=True).past_key_values
+            cache.batch_repeat_interleave(futures)
+            hidden = self.transformer(
+                input_ids=future_ids.repeat(prototypes, 1), past_key_values=cache, use_cache=True,
+            ).last_hidden_state[:, -1]
+        return torch.einsum(
+            "mfe,fke->mfk", hidden.float().unflatten(0, (prototypes, futures)),
+            self.rows[header_ids])
+
+    def entries(self, future_ids: torch.Tensor, header_ids: torch.Tensor) -> torch.Tensor:
+        """(M, F, K): the copy's entries behind every prototype, with gradients in training."""
+        if self.training:
+            return self._entries(future_ids, header_ids)
+        group = max(self.chunk // len(self.prototypes), 1)
+        with torch.no_grad():
+            return torch.cat([
+                self._entries(future_ids[start:start + group], header_ids[start:start + group])
+                for start in range(0, len(future_ids), group)
+            ], dim=1)
+
+    def responses(self, future_ids: torch.Tensor, header_ids: torch.Tensor) -> torch.Tensor:
+        # The prototypes change, so nothing is kept between evaluations.
+        entries = self.entries(future_ids, header_ids)
+        return entries - entries.mean(dim=0, keepdim=True)
+
+
 def build_network(
     inference: CausalLMInference, *, layout: str, encoder: str, modes: int,
     roberta_path: Path | None = None, teacher=None, landmark_ids: torch.Tensor | None = None,
+    train_copy: bool = False,
 ) -> nn.Module:
     if layout not in LAYOUTS:
         raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
+    if layout == "prototype":
+        if landmark_ids is None:
+            raise ValueError("layout 'prototype' needs landmark_ids")
+        return PrototypeNetwork(
+            build_encoder(inference, encoder, roberta_path), modes, inference, landmark_ids,
+            train_copy)
     if layout == "landmark":
         if teacher is None or landmark_ids is None:
             raise ValueError("layout 'landmark' needs the teacher and landmark_ids")

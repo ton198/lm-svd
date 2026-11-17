@@ -57,13 +57,18 @@ def main(argv: list[str] | None = None) -> None:
              "the exp4 tables minus theirs")
     _common(center)
     _training(center, steps=30000)
-    center.add_argument("--layout", choices=("shared", "independent", "landmark"),
+    center.add_argument("--layout", choices=("shared", "independent", "landmark", "prototype"),
                         default="shared",
                         help="shared: one encoder per side, a mode is an output; "
                              "independent: every mode has its own two encoders (exp7); "
                              "landmark (study D): only the left side is a network, a right "
                              "function is a trained mix of the frozen model's entries behind "
-                             "--landmarks fixed histories")
+                             "--landmarks fixed histories; prototype (study D): the "
+                             "landmarks are trainable vectors read by a copy of the model")
+    center.add_argument("--train-copy", action="store_true",
+                        help="--layout prototype: also train the copy's weights")
+    center.add_argument("--mean-weight", type=float, default=1.0,
+                        help="--layout prototype: weight of the column-mean error in the loss")
     center.add_argument("--encoder", choices=("gpt2", "gpt2-mean", "roberta", "scratch"),
                         default="gpt2",
                         help="exp7's encoder kinds; gpt2-mean averages the copy's positions "
@@ -111,8 +116,10 @@ def main(argv: list[str] | None = None) -> None:
 
             encoder_name = args.roberta_path.name if args.encoder == "roberta" else args.encoder
             name = f"center-{args.layout}-{encoder_name}-{args.nesting}-L{args.modes}"
-            if args.layout == "landmark":
+            if args.layout in ("landmark", "prototype"):
                 name += f"-M{args.landmarks}"
+            if args.layout == "prototype" and args.train_copy:
+                name += "-copy"
             summary = train_centered(
                 inference_dir=inference_dir, stream_path=args.stream_path,
                 model_path=args.model_path, output_dir=root / (name + args.tag),
@@ -121,7 +128,8 @@ def main(argv: list[str] | None = None) -> None:
                 future_batch=args.future_batch, steps=args.steps, eval_every=args.eval_every,
                 lr=getattr(args, "lr", CENTER_LR[args.encoder]), encoder_lr=args.encoder_lr,
                 seed=args.seed, overwrite=args.overwrite, roberta_path=args.roberta_path,
-                landmarks=args.landmarks)
+                landmarks=args.landmarks, train_copy=args.train_copy,
+                mean_weight=args.mean_weight)
         else:
             from .mean import train_mean
 

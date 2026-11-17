@@ -278,6 +278,49 @@ class LandmarkTests(Exp8Fixture):
         self.assertEqual(len(record["val"]["minus_g_exact_energy"]), 2)
 
 
+class PrototypeTests(Exp8Fixture):
+    def test_prototypes_start_as_the_landmarks_and_are_trained(self):
+        tokens = self.table_tokens("train")
+        futures, headers = tokens["futures"], tokens["header_token_ids"]
+        networks = {}
+        for layout in ("landmark", "prototype"):
+            torch.manual_seed(0)
+            networks[layout] = build_network(
+                self.inference, layout=layout, encoder="gpt2-mean", modes=2,
+                teacher=self.teacher, landmark_ids=tokens["histories"][:3])
+        prototype = networks["prototype"]
+        self.assertTrue(torch.allclose(
+            prototype.right_features(futures, headers),
+            networks["landmark"].right_features(futures, headers), atol=1e-4))
+        prototype.eval()  # the chunked pass without gradients gives the same entries
+        prototype.chunk = 3
+        self.assertTrue(torch.allclose(
+            prototype.entries(futures, headers),
+            self.teacher.grid_entries(tokens["histories"][:3], futures, headers), atol=1e-4))
+        trained = {name for name, p in prototype.named_parameters() if p.requires_grad}
+        self.assertIn("prototypes", trained)
+        self.assertFalse(any(name.startswith("transformer.") for name in trained))
+        copied = build_network(
+            self.inference, layout="prototype", encoder="gpt2-mean", modes=2,
+            landmark_ids=tokens["histories"][:3], train_copy=True)
+        self.assertTrue(any(
+            name.startswith("transformer.") and p.requires_grad
+            for name, p in copied.named_parameters()))
+
+    def test_training_moves_the_prototypes_and_reports_the_mean(self):
+        summary = quiet(
+            train_centered, inference_dir=self.inference_dir, stream_path=self.stream_path,
+            model_path=self.model_path, output_dir=self.root / "prototype-run", device="cpu",
+            layout="prototype", encoder="gpt2-mean", nesting="joint", modes=2, history_batch=4,
+            future_batch=3, steps=2, eval_every=1, lr=1e-2, encoder_lr=1e-4, seed=0,
+            overwrite=False, landmarks=3)
+        self.assertEqual(summary["step"], 2)
+        records = [json.loads(line) for line in
+                   (self.root / "prototype-run" / "eval_history.jsonl").read_text().splitlines()]
+        self.assertNotEqual(records[0]["val"]["mean_energy"], records[1]["val"]["mean_energy"])
+        self.assertEqual(len(records[1]["val"]["minus_g_energy"]), 2)
+
+
 class MeanTests(Exp8Fixture):
     def test_without_training_the_student_gives_the_frozen_models_entries(self):
         tokens = self.table_tokens("train")

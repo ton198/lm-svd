@@ -24,6 +24,10 @@ report minus_g_energy, the energy on the table minus g (exp5-exp7's measure) of
     1 x (mean of the landmark rows - g)  +  the learned centered modes,
 
 next to the exact energy at one rank more (the mean counts as a mode).
+--layout prototype trains the landmarks themselves (model.PrototypeNetwork) and
+adds mean_weight x the squared error between the mean of its rows and the mean
+of the grid's columns, so that the same prototypes also keep giving the first
+mode.
 """
 
 from __future__ import annotations
@@ -186,6 +190,8 @@ def train_centered(
     overwrite: bool,
     roberta_path: Path | None = None,
     landmarks: int = 64,
+    train_copy: bool = False,
+    mean_weight: float = 1.0,
     eval_chunk: int = 256,
 ) -> dict:
     if layout not in LAYOUTS or encoder not in ENCODERS or nesting not in NESTINGS:
@@ -201,8 +207,11 @@ def train_centered(
         "seed": seed, "model_path": str(model_path), "stream_path": str(stream_path),
         "roberta_path": str(roberta_path) if encoder == "roberta" else None,
     }
-    if layout == "landmark":
+    if layout in ("landmark", "prototype"):
         config["landmarks"] = landmarks
+    if layout == "prototype":
+        config["train_copy"] = train_copy
+        config["mean_weight"] = mean_weight
     files = RunFiles(output_dir, config, overwrite)
     saved = files.load()
 
@@ -219,7 +228,7 @@ def train_centered(
         ranks = ranks + (modes,)
 
     landmark_ids = None
-    if layout == "landmark":
+    if layout in ("landmark", "prototype"):
         # Fixed by the seed alone, so a resumed run has the same landmarks.
         landmark_ids = Windows(
             stream_path, history_tokens, future_tokens, inference.vocab_size,
@@ -227,7 +236,7 @@ def train_centered(
         ).draw(landmarks, 1)[0].to(device)
     network = build_network(
         inference, layout=layout, encoder=encoder, modes=modes, roberta_path=roberta_path,
-        teacher=teacher, landmark_ids=landmark_ids,
+        teacher=teacher, landmark_ids=landmark_ids, train_copy=train_copy,
     ).to(device)
     wrapper = NestedLoRA(model=network, neigs=modes, sequential=nesting == "sequential").to(device)
     optimizer = torch.optim.Adam(parameter_groups(network, encoder, lr, encoder_lr))
@@ -254,10 +263,11 @@ def train_centered(
 
     # Study D: how the landmark mean and the centered modes add up on the table minus g.
     minus_g: dict[str, dict] = {}
-    if layout == "landmark":
+    mean_tables: dict = {}
+    if layout in ("landmark", "prototype"):
         for name, (table, future_ids, header_ids) in tables.items():
-            reference_table = load_mean_table(inference_dir / name, teacher, device)
-            minus_g[name] = landmark_mean(network, reference_table, eval_chunk)
+            mean_tables[name] = load_mean_table(inference_dir / name, teacher, device)
+            minus_g[name] = landmark_mean(network, mean_tables[name], eval_chunk)
             print(
                 f"{name}: the mean of {landmarks} landmark rows as the first mode captures "
                 f"{minus_g[name]['mean_energy']:.4f} of the table minus g "
@@ -267,11 +277,14 @@ def train_centered(
     def evaluate() -> dict:
         record = {}
         for name, (table, future_ids, header_ids) in tables.items():
+            if layout == "prototype":  # its mean moves with the prototypes
+                minus_g[name] = landmark_mean(network, mean_tables[name], eval_chunk)
             left, right = table_features(network, table, future_ids, header_ids, eval_chunk)
             comparison = compare_with_exact_svd(left, right, table, ranks)
             comparison.update(span_energy(left, right, table.matrix, comparison["ranks"]))
             if name in minus_g:
                 parts = minus_g[name]
+                comparison["mean_energy"] = parts["mean_energy"]
                 comparison["minus_g_energy"] = [
                     parts["mean_energy"] + parts["centered_share"] * energy
                     for energy in comparison["captured_energy"]]
@@ -290,9 +303,17 @@ def train_centered(
         history_ids, future_ids = history_ids.to(device), future_ids.to(device)
         header_ids, _ = teacher.headers(future_ids, top_k)
         entries = teacher.grid_entries(history_ids, future_ids, header_ids)
-        loss = centered_loss(
-            wrapper, network.left_features(history_ids),
-            network.right_features(future_ids, header_ids), entries)
+        if layout == "prototype":
+            # One pass of the copy gives the modes and the estimate of the column means.
+            behind = network.entries(future_ids, header_ids)
+            centered = behind - behind.mean(dim=0, keepdim=True)
+            right = torch.einsum("lm,mfk->fkl", network.mix, centered)
+            loss = centered_loss(wrapper, network.left_features(history_ids), right, entries)
+            loss = loss + mean_weight * (behind.mean(dim=0) - entries.mean(dim=0)).square().mean()
+        else:
+            loss = centered_loss(
+                wrapper, network.left_features(history_ids),
+                network.right_features(future_ids, header_ids), entries)
         if not torch.isfinite(loss):
             raise RuntimeError(f"the loss is not finite at step {step}")
         optimizer.zero_grad(set_to_none=True)
