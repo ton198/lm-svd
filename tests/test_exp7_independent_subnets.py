@@ -4,6 +4,7 @@ import json
 import math
 import shutil
 import unittest
+import weakref
 from unittest.mock import patch
 
 import numpy as np
@@ -17,11 +18,13 @@ from experiments.exp5_gpt2_mlp_table.features import (
     pair_targets,
 )
 from experiments.exp5_gpt2_mlp_table.loss import paired_loss
+from experiments.exp5_gpt2_mlp_table.train import draw_pairs
 from experiments.exp5_gpt2_mlp_table.tables import load_eval_table
 from experiments.exp7_independent_subnets.align import Moments, alignment, max_correlation
 from experiments.exp7_independent_subnets.model import build_mode, token_vectors
 from experiments.exp7_independent_subnets.stage import Selection, residual_target, stage_loss
 from experiments.exp7_independent_subnets.train import (
+    StagedRun,
     mode_table_features,
     selection_energy,
     train_exp7,
@@ -310,7 +313,9 @@ class AlignmentTests(unittest.TestCase):
         self.assertAlmostEqual(max_correlation(gram), 0.5)
 
 
-class TrainingTests(Exp5Fixture):
+class TrainingHelpers:
+    """Runs train_exp7 on the Exp5Fixture and reads its output files."""
+
     def train(self, output_dir, **changes):
         options = dict(
             inference_dir=self.inference_dir, store_dir=self.store_dir,
@@ -321,9 +326,10 @@ class TrainingTests(Exp5Fixture):
         )
         options.update(changes)
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            summary = train_exp7(**options)
-        self.log = output.getvalue()
-        return summary
+            try:
+                return train_exp7(**options)
+            finally:
+                self.log = output.getvalue()
 
     def records(self, output_dir):
         lines = (output_dir / "eval_history.jsonl").read_text().splitlines()
@@ -333,6 +339,8 @@ class TrainingTests(Exp5Fixture):
         lines = (output_dir / "stages.jsonl").read_text().splitlines()
         return [json.loads(line) for line in lines]
 
+
+class TrainingTests(TrainingHelpers, Exp5Fixture):
     def vectors(self):
         return token_vectors(self.inference.model.get_output_embeddings().weight)
 
@@ -618,14 +626,221 @@ class TrainingTests(Exp5Fixture):
                 self.train(self.root / "exp7-bad", **change)
         self.assertFalse((self.root / "exp7-bad").exists())
 
-    def test_existing_outputs_need_overwrite(self):
-        # Removed in Task 5 when resuming replaces this rule.
-        output = self.root / "exp7-overwrite"
-        self.train(output, modes=2, stage_steps=2)
-        with self.assertRaises(FileExistsError):
-            self.train(output, modes=1, stage_steps=2)
+    def test_a_finished_stage_releases_its_optimizer_and_best_weights(self):
+        # Adam's moments of a gpt2 mode are as large as two copies of the model: they
+        # must be gone before the next mode is built.
+        finished = []
+        released = []
+        finish_stage, start_stage = StagedRun.finish_stage, StagedRun.start_stage
+
+        def recording_finish(run, state, reason):
+            finished.append([
+                weakref.ref(state.optimizer),
+                weakref.ref(next(iter(state.best_state_dict.values())))])
+            finish_stage(run, state, reason)
+
+        def checking_start(run, stage, *args, **kwargs):
+            released.append([ref() is None for refs in finished for ref in refs])
+            return start_stage(run, stage, *args, **kwargs)
+
+        with patch.object(StagedRun, "finish_stage", recording_finish), \
+                patch.object(StagedRun, "start_stage", checking_start):
+            self.train(self.root / "exp7-release", modes=3, patience=2)
+        self.assertEqual(released, [[], [True, True], [True, True, True, True]])
+
+
+class ResumeTests(TrainingHelpers, Exp5Fixture):
+    def interrupted(self, output_dir, records):
+        """Raise KeyboardInterrupt at the first draw of pairs once `records` evaluations exist.
+
+        Counting the draws would be fragile: the alignment draws pairs too.
+        """
+        history = output_dir / "eval_history.jsonl"
+
+        def draw(sampler, count):
+            if history.exists() and len(history.read_text().splitlines()) >= records:
+                raise KeyboardInterrupt
+            return draw_pairs(sampler, count)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            patch("experiments.exp7_independent_subnets.train.draw_pairs", side_effect=draw))
+        stack.enter_context(self.assertRaises(KeyboardInterrupt))
+        return stack
+
+    def assert_same_weights(self, first, second):
+        first = torch.load(first, weights_only=True)["state_dict"]
+        second = torch.load(second, weights_only=True)["state_dict"]
+        self.assertEqual(set(first), set(second))
+        for key, value in first.items():
+            self.assertTrue(torch.equal(second[key], value), key)
+
+    def mtimes(self, output_dir):
+        return {path: path.stat().st_mtime_ns for path in output_dir.rglob("*")}
+
+    def test_resume_in_the_middle_of_a_stage(self):
+        output = self.root / "exp7-resume-middle"
+        options = dict(modes=2, stage_steps=6, eval_every=2, patience=3)
+        with self.interrupted(output, 5):
+            self.train(output, **options)
+        checkpoint = torch.load(output / "checkpoint.pt", weights_only=True)
+        self.assertEqual(
+            (checkpoint["completed_modes"], checkpoint["step"], checkpoint["stage"]["stage_step"]),
+            (1, 10, 4))
+        first_mode = (output / "modes" / "mode-01.pt").read_bytes()
+        summary = self.train(output, **options)
+        self.assertIn("Resuming stage 2 at stage step 4 (step 10)", self.log)
+        self.assertNotIn("stage 1", self.log.lower())
+        self.assertEqual((output / "modes" / "mode-01.pt").read_bytes(), first_mode)
+        records = self.records(output)
+        self.assertEqual([r["step"] for r in records], [2, 4, 6, 8, 10, 12])
+        self.assertEqual([(r["stage"], r["stage_step"]) for r in records[3:]],
+                         [(2, 2), (2, 4), (2, 6)])
+        self.assertEqual([(s["stage"], s["steps"]) for s in self.stages(output)],
+                         [(1, 6), (2, 6)])
+        self.assertEqual(
+            summary, {"output_dir": str(output), "step": 12, "modes": 2, "evaluations": 6})
+        checkpoint = torch.load(output / "checkpoint.pt", weights_only=True)
+        self.assertEqual((checkpoint["completed_modes"], checkpoint["stage"]), (2, None))
+        self.assertEqual(checkpoint["history"], records)
+
+    def test_a_resumed_scratch_stage_continues_its_warmup(self):
+        output = self.root / "exp7-resume-scratch"
+        options = dict(modes=1, subnet="scratch", stage_steps=8)
+        with self.interrupted(output, 2):
+            self.train(output, **options)
+        with self.interrupted(output, 3):
+            self.train(output, **options)
+        self.assertIn("Resuming stage 1 at stage step 4 (step 4)", self.log)
+        stage = torch.load(output / "checkpoint.pt", weights_only=True)["stage"]
+        self.assertEqual(stage["stage_step"], 6)
+        self.assertEqual(stage["scheduler_state_dict"]["last_epoch"], 6)
+        self.assertAlmostEqual(
+            stage["optimizer_state_dict"]["param_groups"][0]["lr"], 1e-2 * 7 / 1000)
+        self.assertEqual(self.train(output, **options)["step"], 8)
+
+    def test_resume_restores_the_best_weights_and_the_stale_count(self):
+        output = self.root / "exp7-resume-best"
+        plain = self.root / "exp7-resume-best-plain"
+        options = dict(modes=1, stage_steps=8, eval_every=2, patience=2)
+        with patch("experiments.exp7_independent_subnets.train.selection_energy",
+                   side_effect=[0.9, 0.1]), self.interrupted(output, 2):
+            self.train(output, **options)
+        with patch("experiments.exp7_independent_subnets.train.selection_energy",
+                   return_value=0.1):
+            summary = self.train(output, **options)
+        self.assertIn("Resuming stage 1 at stage step 4 (step 4)", self.log)
+        self.assertEqual(summary["step"], 6)
+        self.assertEqual([r["stage_step"] for r in self.records(output)], [2, 4, 6])
+        stage = self.stages(output)[0]
+        self.assertEqual(
+            (stage["steps"], stage["best_step"], stage["reason"], stage["selection_energy"]),
+            (6, 2, "patience", 0.9))
+        self.train(plain, modes=1, stage_steps=2, eval_every=2, patience=0)
+        self.assert_same_weights(plain / "modes" / "mode-01.pt", output / "modes" / "mode-01.pt")
+        self.assertEqual(
+            torch.load(output / "modes" / "mode-01.pt", weights_only=True)["best_step"], 2)
+
+    def test_resume_after_the_last_evaluation_of_a_stage(self):
+        # Interrupted while the stage is being frozen: in the alignment, or while the
+        # checkpoint after the stage line is written. The stage is not trained further.
+        plain = self.root / "exp7-resume-last-plain"
+        self.train(plain, modes=1)
+        write_checkpoint = StagedRun.write_checkpoint
+
+        def failing_write(run, state):
+            if state is None:
+                raise KeyboardInterrupt
+            write_checkpoint(run, state)
+
+        for name in ("alignment", "checkpoint"):
+            with self.subTest(name=name):
+                output = self.root / f"exp7-resume-last-{name}"
+                if name == "alignment":
+                    with self.interrupted(output, 2):
+                        self.train(output, modes=1)
+                else:
+                    with patch.object(StagedRun, "write_checkpoint", failing_write), \
+                            self.assertRaises(KeyboardInterrupt):
+                        self.train(output, modes=1)
+                summary = self.train(output, modes=1)
+                self.assertIn("Resuming stage 1 at stage step 4 (step 4)", self.log)
+                self.assertEqual(
+                    summary, {"output_dir": str(output), "step": 4, "modes": 1, "evaluations": 2})
+                self.assertEqual([r["step"] for r in self.records(output)], [2, 4])
+                self.assertEqual([(s["stage"], s["steps"]) for s in self.stages(output)],
+                                 [(1, 4)])
+                self.assert_same_weights(
+                    plain / "modes" / "mode-01.pt", output / "modes" / "mode-01.pt")
+
+    def test_adding_modes_keeps_the_frozen_ones(self):
+        output = self.root / "exp7-add"
+        self.train(output, modes=1)
+        first_mode = (output / "modes" / "mode-01.pt").read_bytes()
+        summary = self.train(output, modes=3)
+        self.assertEqual((output / "modes" / "mode-01.pt").read_bytes(), first_mode)
+        self.assertNotIn("stage 1", self.log.lower())
+        self.assertNotIn("Resuming", self.log)
+        self.assertIn("Stage 2: mode 2 on the target minus 1 frozen mode(s)", self.log)
+        records = self.records(output)
+        self.assertEqual([r["step"] for r in records], [2, 4, 6, 8, 10, 12])
+        self.assertEqual([r["stage"] for r in records], [1, 1, 2, 2, 3, 3])
+        self.assertEqual([s["stage"] for s in self.stages(output)], [1, 2, 3])
+        self.assertEqual(
+            summary, {"output_dir": str(output), "step": 12, "modes": 3, "evaluations": 6})
+        self.assertEqual(
+            sorted(path.name for path in (output / "modes").iterdir()),
+            ["mode-01.pt", "mode-02.pt", "mode-03.pt"])
+        self.assertEqual(json.loads((output / "metadata.json").read_text())["modes"], 3)
+
+    def test_modes_below_and_equal_to_the_finished_count(self):
+        output = self.root / "exp7-done"
+        summary = self.train(output, modes=2)
+        with self.assertRaisesRegex(ValueError, "holds 2 finished modes.*--modes 1"):
+            self.train(output, modes=1)
+        before = self.mtimes(output)
+        # Nothing expensive either: the model and the tables are not loaded.
+        with patch("experiments.exp7_independent_subnets.train.prepare_run",
+                   side_effect=AssertionError("prepare_run")):
+            self.assertEqual(self.train(output, modes=2), summary)
+        self.assertEqual(self.mtimes(output), before)
+
+    def test_modes_equal_to_the_finished_count_with_a_stage_in_progress(self):
+        output = self.root / "exp7-in-progress"
+        with self.interrupted(output, 3):
+            self.train(output, modes=2)
+        before = self.mtimes(output)
+        with self.assertRaisesRegex(ValueError, "stage 2 is in progress.*--modes 2"):
+            self.train(output, modes=1)
+        self.assertEqual(self.mtimes(output), before)
+
+    def test_resume_needs_the_same_settings(self):
+        output = self.root / "exp7-settings"
+        self.train(output, modes=1)
+        before = self.mtimes(output)
+        for change in ({"subnet": "scratch"}, {"stage_steps": 6}, {"patience": 1},
+                       {"lr": 1e-3}, {"align_pairs": 16}, {"scratch_width": 8}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "--overwrite"):
+                self.train(output, modes=2, **change)
+        self.assertEqual(self.mtimes(output), before)
+        self.train(output, modes=2)
         summary = self.train(output, modes=1, stage_steps=2, overwrite=True)
-        self.assertEqual(summary["modes"], 1)
-        self.assertEqual(len(self.records(output)), 1)
-        self.assertEqual(len(self.stages(output)), 1)
+        self.assertIn("Stage 1: mode 1", self.log)
+        self.assertEqual(
+            summary, {"output_dir": str(output), "step": 2, "modes": 1, "evaluations": 1})
         self.assertEqual([path.name for path in (output / "modes").iterdir()], ["mode-01.pt"])
+        self.assertEqual([r["step"] for r in self.records(output)], [2])
+        self.assertEqual(len(self.stages(output)), 1)
+        # Without a checkpoint, an existing eval_history.jsonl is not resumed.
+        history_only = self.root / "exp7-history-only"
+        history_only.mkdir()
+        shutil.copy(output / "eval_history.jsonl", history_only)
+        with self.assertRaises(FileExistsError):
+            self.train(history_only, modes=1, stage_steps=2)
+
+    def test_a_missing_mode_file_is_reported(self):
+        output = self.root / "exp7-missing"
+        self.train(output, modes=2)
+        (output / "modes" / "mode-01.pt").unlink()
+        with self.assertRaisesRegex(ValueError, "mode-01.pt"):
+            self.train(output, modes=3)

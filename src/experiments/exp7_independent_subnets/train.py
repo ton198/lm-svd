@@ -9,11 +9,16 @@ selection table: only it decides when a stage ends and which weights are
 frozen. exp4's val table is the report table. At the end of a stage the mode
 is frozen and saved, and all l modes are aligned on fresh store pairs
 (align.py). The alignment changes no weights and no later stage.
+
+checkpoint.pt records the progress: the frozen modes in modes/ are final and at
+most one stage is in progress. The same command continues an interrupted run or
+adds modes to a finished one.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import gc
 import json
 import shutil
 import time
@@ -143,10 +148,54 @@ def _write_lines(path: Path, records: list[dict]) -> None:
     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
 
 
-def _append_line(path: Path, record: dict) -> None:
-    previous = path.read_text(encoding="utf-8") if path.exists() else ""
-    write_atomic(path, lambda tmp: tmp.write_text(
-        previous + json.dumps(record) + "\n", encoding="utf-8"))
+def _write_stage_line(path: Path, line: dict) -> None:
+    """Add a stage's line to stages.jsonl, dropping lines of it and later stages.
+
+    A run interrupted after the line was written finishes the stage again.
+    """
+    previous = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    kept = [record for record in map(json.loads, previous) if record["stage"] < line["stage"]]
+    write_atomic(path, lambda tmp: _write_lines(tmp, [*kept, line]))
+
+
+def _mode_path(output_dir: Path, stage: int) -> Path:
+    """The file of the frozen mode of a stage."""
+    return output_dir / "modes" / f"mode-{stage:02d}.pt"
+
+
+def _read_checkpoint(output_dir: Path, config: dict, modes: int) -> dict | None:
+    """checkpoint.pt of output_dir if it can be continued to `modes` modes.
+
+    None without a checkpoint. Rejects other settings, fewer modes than are
+    finished (or are being trained) and a missing mode file.
+    """
+    path = output_dir / "checkpoint.pt"
+    if not path.exists():
+        return None
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    saved = checkpoint["config"]
+    if saved != config:
+        changed = {
+            key: (saved.get(key), config.get(key))
+            for key in sorted(set(saved) | set(config)) if saved.get(key) != config.get(key)}
+        raise ValueError(
+            f"settings differ from the checkpoint in {output_dir} (saved, now): {changed}; "
+            "pass --overwrite to start over")
+    completed = checkpoint["completed_modes"]
+    if modes < completed:
+        raise ValueError(
+            f"{output_dir} holds {completed} finished modes; cannot reduce them to "
+            f"--modes {modes} (pass --overwrite to start over)")
+    if modes == completed and checkpoint["stage"] is not None:
+        raise ValueError(
+            f"stage {completed + 1} is in progress in {output_dir}; pass --modes "
+            f"{completed + 1} or more to finish it, or --overwrite to start over")
+    for stage in range(1, completed + 1):
+        if not _mode_path(output_dir, stage).is_file():
+            raise ValueError(
+                f"checkpoint.pt counts {completed} finished modes but "
+                f"{_mode_path(output_dir, stage)} is missing; pass --overwrite to start over")
+    return checkpoint
 
 
 @dataclass
@@ -201,14 +250,23 @@ class StagedRun:
         self.history: list[dict] = []
         self.started = time.perf_counter()
 
-    def start_stage(self, stage: int) -> StageState:
-        """A new mode with its own optimizer, seeded by the stage number."""
+    def new_mode(self) -> Mode:
         config = self.config
-        torch.manual_seed(sampler_seed(config["seed"], MODE_SEED_OFFSET + stage))
-        mode = build_mode(
+        return build_mode(
             self.inference, config["subnet"], scratch_layers=config["scratch_layers"],
             scratch_width=config["scratch_width"], scratch_heads=config["scratch_heads"],
         ).to(self.device)
+
+    def start_stage(self, stage: int, saved: dict | None = None) -> StageState:
+        """Mode `stage` with its own optimizer.
+
+        A new stage is seeded by the stage number; with saved, the stage dict of
+        checkpoint.pt, the stage continues where it was saved.
+        """
+        config = self.config
+        if saved is None:
+            torch.manual_seed(sampler_seed(config["seed"], MODE_SEED_OFFSET + stage))
+        mode = self.new_mode()
         if config["subnet"] == "gpt2":
             optimizer = torch.optim.Adam([
                 {"params": [*mode.left_head.parameters(), *mode.right_head.parameters()],
@@ -220,10 +278,29 @@ class StagedRun:
         else:
             optimizer = torch.optim.Adam(mode.parameters(), lr=config["lr"])
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_factor)
-        selection = Selection(
-            max_steps=config["stage_steps"], min_steps=config["min_stage_steps"],
-            patience=config["patience"])
-        return StageState(stage, mode, optimizer, scheduler, selection)
+        if saved is None:
+            selection = Selection(
+                max_steps=config["stage_steps"], min_steps=config["min_stage_steps"],
+                patience=config["patience"])
+            return StageState(stage, mode, optimizer, scheduler, selection)
+        mode.load_state_dict(saved["mode_state_dict"])
+        optimizer.load_state_dict(saved["optimizer_state_dict"])
+        if scheduler is not None:
+            scheduler.load_state_dict(saved["scheduler_state_dict"])
+        return StageState(
+            stage, mode, optimizer, scheduler, Selection(**saved["selection"]),
+            stage_step=saved["stage_step"], best_state_dict=saved["best_state_dict"])
+
+    def resume(self, checkpoint: dict) -> StageState:
+        """Load the frozen modes and the progress of checkpoint.pt; the stage to run next."""
+        self.step, self.history = checkpoint["step"], checkpoint["history"]
+        for stage in range(1, checkpoint["completed_modes"] + 1):
+            mode = self.new_mode()
+            mode.load_state_dict(torch.load(
+                _mode_path(self.output_dir, stage), map_location="cpu",
+                weights_only=True)["state_dict"])
+            self.freeze(mode)
+        return self.start_stage(len(self.frozen) + 1, checkpoint["stage"])
 
     def draw_batch(
         self, count: int
@@ -280,11 +357,23 @@ class StagedRun:
         """Train state.mode from state.stage_step until the stage ends, then freeze it."""
         batch_size, eval_every = self.config["batch_size"], self.config["eval_every"]
         stage_steps = self.config["stage_steps"]
-        print(
-            f"Stage {state.stage}: mode {state.stage} on the target minus "
-            f"{len(self.frozen)} frozen mode(s)",
-            flush=True,
-        )
+        if state.stage_step == 0:
+            print(
+                f"Stage {state.stage}: mode {state.stage} on the target minus "
+                f"{len(self.frozen)} frozen mode(s)",
+                flush=True,
+            )
+        else:
+            print(
+                f"Resuming stage {state.stage} at stage step {state.stage_step} "
+                f"(step {self.step})",
+                flush=True,
+            )
+            # Saved at its last evaluation: the run stopped while freezing the mode.
+            reason = state.selection.reason(state.stage_step)
+            if reason is not None:
+                self.finish_stage(state, reason)
+                return
         loss_sum = kernel_sum = residual_sum = 0.0
         window = 0
         window_started = time.perf_counter()
@@ -373,10 +462,10 @@ class StagedRun:
             best_step = state.stage_step
             best_energy = selection_energy(self.history[-1])
         self.freeze(mode)
-        modes_dir = self.output_dir / "modes"
-        modes_dir.mkdir(exist_ok=True)
+        path = _mode_path(self.output_dir, stage)
+        path.parent.mkdir(exist_ok=True)
         weights = {key: value.detach().cpu() for key, value in mode.state_dict().items()}
-        write_atomic(modes_dir / f"mode-{stage:02d}.pt", lambda tmp: torch.save(
+        write_atomic(path, lambda tmp: torch.save(
             {"state_dict": weights, "stage": stage, "best_step": best_step}, tmp))
 
         moments, T_f, T_g, S = self.align()
@@ -395,7 +484,7 @@ class StagedRun:
             "left_correlation": max_correlation(moments.lam_f),
             "right_correlation": max_correlation(moments.lam_g),
         }
-        _append_line(self.output_dir / "stages.jsonl", line)
+        _write_stage_line(self.output_dir / "stages.jsonl", line)
         self.write_checkpoint(None)
         print(
             f"stage {stage} finished at stage step {state.stage_step} ({reason}), "
@@ -445,8 +534,13 @@ def train_exp7(
 
     Writes eval_history.jsonl (one line per evaluation), stages.jsonl (one
     line per finished stage), modes/mode-XX.pt, alignment.pt (the latest
-    alignment), checkpoint.pt and metadata.json to output_dir. An existing
-    eval_history.jsonl needs overwrite, which starts again.
+    alignment), checkpoint.pt and metadata.json to output_dir.
+
+    With a checkpoint.pt of the same settings (modes may differ) the run
+    continues: the stage in progress from its last evaluation, then the stages
+    up to `modes`. With all `modes` modes finished it returns the summary and
+    writes nothing. overwrite deletes the outputs and starts again; without a
+    checkpoint an existing eval_history.jsonl needs it.
     """
     if subnet not in SUBNETS:
         raise ValueError(f"subnet must be one of {SUBNETS}, got {subnet!r}")
@@ -457,10 +551,6 @@ def train_exp7(
     ):
         if value < smallest:
             raise ValueError(f"{name} must be at least {smallest}, got {value}")
-    inference, tables, top_k, store_config = prepare_run(
-        inference_dir=inference_dir, store_dir=store_dir, model_path=model_path,
-        device=device, seed=seed, encode_batch=encode_batch,
-    )
     config = {
         "inference_dir": str(inference_dir), "store_dir": str(store_dir),
         "model_path": str(model_path), "subnet": subnet, "stage_steps": stage_steps,
@@ -473,25 +563,45 @@ def train_exp7(
 
     output_dir = Path(output_dir)
     history_path = output_dir / "eval_history.jsonl"
+    checkpoint = None if overwrite else _read_checkpoint(output_dir, config, modes)
+    if checkpoint is None and not overwrite and history_path.exists():
+        raise FileExistsError(
+            f"output already exists: {history_path}; pass --overwrite to replace it")
+    if checkpoint is not None and checkpoint["completed_modes"] == modes:
+        # Every mode is finished: no model, no tables, no file is touched.
+        print(f"{output_dir} already holds {modes} finished modes", flush=True)
+        return {
+            "output_dir": str(output_dir), "step": checkpoint["step"], "modes": modes,
+            "evaluations": len(checkpoint["history"]),
+        }
+
+    inference, tables, top_k, store_config = prepare_run(
+        inference_dir=inference_dir, store_dir=store_dir, model_path=model_path,
+        device=device, seed=seed, encode_batch=encode_batch,
+    )
     if overwrite:
         for name in ("checkpoint.pt", "eval_history.jsonl", "stages.jsonl", "alignment.pt"):
             (output_dir / name).unlink(missing_ok=True)
         shutil.rmtree(output_dir / "modes", ignore_errors=True)
-    elif history_path.exists():
-        raise FileExistsError(
-            f"output already exists: {history_path}; pass --overwrite to replace it")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # The frozen teacher's constant, shared by every mode and saved nowhere.
     vectors = token_vectors(inference.model.get_output_embeddings().weight).to(device)
     run = StagedRun(
         inference=inference, tables=tables, top_k=top_k, vectors=vectors,
-        # Seeded by the global step the run starts from, as in exp5.
-        sampler=SampleSampler(store_dir, seed=sampler_seed(seed, 0)),
+        # Seeded by the global step the run starts from, as in exp5, so a continued
+        # run does not replay the pairs it has seen.
+        sampler=SampleSampler(
+            store_dir, seed=sampler_seed(seed, 0 if checkpoint is None else checkpoint["step"])),
         config=config, output_dir=output_dir, device=device, encode_batch=encode_batch,
         eval_chunk=eval_chunk,
     )
-    state = run.start_stage(1)
+    if checkpoint is None:
+        state = run.start_stage(1)
+    else:
+        state = run.resume(checkpoint)
+        # It holds CPU copies of the stage's weights and optimizer state.
+        del checkpoint
 
     shared = run_metadata(
         device=device, top_k=top_k, tables=tables, model=state.mode, store_config=store_config)
@@ -533,6 +643,11 @@ def train_exp7(
     )
     while True:
         run.run_stage(state)
+        # The finished stage's optimizer state and best weights go before the next
+        # mode is built: Adam's moments of a gpt2 mode are two copies of the model.
+        # collect() frees what a reference cycle (the warmup scheduler) still holds.
+        del state
+        gc.collect()
         if len(run.frozen) == modes:
             break
         state = run.start_stage(len(run.frozen) + 1)
