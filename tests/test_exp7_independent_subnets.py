@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from experiments.exp5_gpt2_mlp_table.loss import paired_loss
+from experiments.exp7_independent_subnets.align import Moments, alignment, max_correlation
 from experiments.exp7_independent_subnets.model import build_mode, token_vectors
 from experiments.exp7_independent_subnets.stage import Selection, residual_target, stage_loss
 from utils.nestedlora import NestedLoRA
@@ -193,3 +194,91 @@ class StageTests(unittest.TestCase):
         self.assertFalse(s.keeps_best)
         self.assertFalse(s.record(0.9, 2))
         self.assertEqual((s.reason(2), s.reason(4)), (None, "steps"))
+
+
+class AlignmentTests(unittest.TestCase):
+    N, C = 12, 20
+    S = torch.tensor([5.0, 3.0, 2.0, 1.0, 0.5], dtype=torch.float64)
+
+    def setUp(self):
+        torch.manual_seed(0)
+        f64 = dict(dtype=torch.float64)
+        self.U = torch.linalg.qr(torch.randn(self.N, 5, **f64))[0]
+        self.V = torch.linalg.qr(torch.randn(self.C, 5, **f64))[0]
+        self.A = (self.U * self.S) @ self.V.T
+
+    def moments(self, F, G):
+        return (F.T @ F / self.N, G.T @ G / self.C, F.T @ self.A @ G / (self.N * self.C))
+
+    def projected(self, F, G):
+        def projector(X):
+            return X @ torch.linalg.pinv(X)
+        return projector(F) @ self.A @ projector(G).T
+
+    def test_alignment_recovers_the_truncated_svd_from_a_mixed_basis(self):
+        s = self.S
+        F = self.U[:, :3] @ torch.randn(3, 3, dtype=torch.float64)
+        G = self.V[:, :3] @ torch.randn(3, 3, dtype=torch.float64)
+        T_f, T_g, S = alignment(*self.moments(F, G))
+        torch.testing.assert_close(
+            (F @ T_f) @ (G @ T_g).T, (self.U[:, :3] * s[:3]) @ self.V[:, :3].T, atol=1e-8, rtol=0)
+        torch.testing.assert_close(S, s[:3] / (self.N * self.C) ** 0.5, atol=1e-10, rtol=0)
+        torch.testing.assert_close(
+            (F @ T_f).T @ (F @ T_f) / self.N, torch.diag(S), atol=1e-10, rtol=0)
+        torch.testing.assert_close(
+            (G @ T_g).T @ (G @ T_g) / self.C, torch.diag(S), atol=1e-10, rtol=0)
+
+    def test_alignment_is_the_least_squares_fit_in_the_span(self):
+        F = torch.randn(self.N, 3, dtype=torch.float64)
+        G = torch.randn(self.C, 3, dtype=torch.float64)
+        T_f, T_g, _ = alignment(*self.moments(F, G))
+        torch.testing.assert_close(
+            (F @ T_f) @ (G @ T_g).T, self.projected(F, G), atol=1e-8, rtol=0)
+
+    def test_one_mode_is_rescaled(self):
+        F = torch.randn(self.N, 1, dtype=torch.float64)
+        G = torch.randn(self.C, 1, dtype=torch.float64)
+        lam_f, lam_g, cross = self.moments(F, G)
+        T_f, T_g, _ = alignment(lam_f, lam_g, cross)
+        torch.testing.assert_close(T_f * T_g, cross / (lam_f * lam_g), atol=1e-10, rtol=1e-10)
+
+    def test_collinear_and_zero_modes_give_finite_transforms(self):
+        F = torch.randn(self.N, 3, dtype=torch.float64)
+        F[:, 1] = 2 * F[:, 0]
+        G = torch.randn(self.C, 3, dtype=torch.float64)
+        G[:, 2] = 0
+        T_f, T_g, S = alignment(*self.moments(F, G))
+        for out in (T_f, T_g, S):
+            self.assertTrue(torch.isfinite(out).all())
+        self.assertAlmostEqual(S[-1].item(), 0.0, delta=1e-12)
+        torch.testing.assert_close(
+            (F @ T_f) @ (G @ T_g).T, self.projected(F, G), atol=1e-8, rtol=0)
+
+    def test_moments_match_their_definitions_in_any_chunking(self):
+        P, K, L = 6, 3, 2
+        left = torch.randn(P, L)
+        right = torch.randn(P, K, L)
+        target = torch.randn(P, K)
+        l64, r64, t64 = left.double(), right.double(), target.double()
+        lam_f = torch.stack([torch.outer(f, f) for f in l64]).mean(0)
+        lam_g = torch.stack([torch.outer(g, g) for p in r64 for g in p]).mean(0)
+        cross = torch.zeros(L, L, dtype=torch.float64)
+        for p in range(P):
+            for i in range(L):
+                for j in range(L):
+                    cross[i, j] += l64[p, i] * (t64[p] * r64[p, :, j]).mean() / P
+        whole = Moments(L)
+        whole.add(left, right, target)
+        chunked = Moments(L)
+        chunked.add(left[:4], right[:4], target[:4])
+        chunked.add(left[4:], right[4:], target[4:])
+        for moments in (whole, chunked):
+            self.assertEqual(moments.lam_f.dtype, torch.float64)
+            torch.testing.assert_close(moments.lam_f, lam_f, atol=1e-12, rtol=0)
+            torch.testing.assert_close(moments.lam_g, lam_g, atol=1e-12, rtol=0)
+            torch.testing.assert_close(moments.cross, cross, atol=1e-12, rtol=0)
+
+    def test_max_correlation(self):
+        self.assertEqual(max_correlation(torch.tensor([[4.0]])), 0.0)
+        self.assertAlmostEqual(
+            max_correlation(torch.tensor([[4.0, -1.0], [-1.0, 1.0]])), 0.5)
