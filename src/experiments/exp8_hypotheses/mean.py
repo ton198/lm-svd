@@ -162,8 +162,9 @@ def train_mean(
     step = 0
     if saved is not None:
         student.load_state_dict(saved["network"])
-        optimizer.load_state_dict(saved["optimizer"])
-        scheduler.load_state_dict(saved["scheduler"])
+        if "optimizer" in saved:  # a finished run may keep its weights only
+            optimizer.load_state_dict(saved["optimizer"])
+            scheduler.load_state_dict(saved["scheduler"])
         step = saved["step"]
         print(f"Resuming at step {step}", flush=True)
     files.write_metadata({

@@ -65,6 +65,10 @@ def main(argv: list[str] | None = None) -> None:
                              "function is a trained mix of the frozen model's entries behind "
                              "--landmarks fixed histories; prototype (study D): the "
                              "landmarks are trainable vectors read by a copy of the model")
+    center.add_argument("--target", choices=("centered", "minus-g"), default="centered",
+                        help="minus-g is the control: the same grids and networks on "
+                             "exp5-exp7's target, with the column means left in, compared "
+                             "with the tables minus g")
     center.add_argument("--train-copy", action="store_true",
                         help="--layout prototype: also train the copy's weights")
     center.add_argument("--mean-weight", type=float, default=1.0,
@@ -128,6 +132,8 @@ def main(argv: list[str] | None = None) -> None:
 
             encoder_name = args.roberta_path.name if args.encoder == "roberta" else args.encoder
             name = f"center-{args.layout}-{encoder_name}-{args.nesting}-L{args.modes}"
+            if args.target != "centered":
+                name = name.replace("center-", f"{args.target}-", 1)
             if args.right_encoder is not None:
                 name += f"-right-{args.right_encoder}"
             if args.layout in ("landmark", "prototype"):
@@ -143,7 +149,7 @@ def main(argv: list[str] | None = None) -> None:
                 lr=getattr(args, "lr", CENTER_LR[args.encoder]), encoder_lr=args.encoder_lr,
                 seed=args.seed, overwrite=args.overwrite, roberta_path=args.roberta_path,
                 landmarks=args.landmarks, train_copy=args.train_copy,
-                right_encoder=args.right_encoder,
+                right_encoder=args.right_encoder, target=args.target,
                 mean_weight=args.mean_weight)
         else:
             from .mean import train_mean

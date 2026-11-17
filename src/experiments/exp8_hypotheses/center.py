@@ -55,6 +55,26 @@ from .model import ENCODERS, LAYOUTS, build_network, parameter_groups
 from .runs import RunFiles, lr_factor
 
 NESTINGS = ("joint", "sequential")
+# centered: study B. minus-g: the control, exp5-exp7's target on the same grids.
+TARGETS = ("centered", "minus-g")
+
+
+def plain_loss(
+    wrapper: NestedLoRA, left: torch.Tensor, right: torch.Tensor, entries: torch.Tensor
+) -> torch.Tensor:
+    """NestedLoRA loss on a grid of entries (N, F, K), nothing centered (the control)."""
+    return wrapper.compute_loss_kernel(left, right.flatten(0, 1), entries.flatten(1))[0]
+
+
+def load_minus_g_table(
+    table_dir: Path, inference: CausalLMInference, device: str | torch.device
+) -> tuple[Table, torch.Tensor, torch.Tensor]:
+    """An exp4 table minus g with its exact SVD (exp5's table), its futures and header ids."""
+    from experiments.exp5_gpt2_mlp_table.tables import load_eval_table
+
+    loaded = load_eval_table(table_dir, inference, device)
+    futures = len(loaded.future_ids)
+    return loaded.table, loaded.future_ids, loaded.table.columns[:, -1].reshape(futures, -1)
 
 
 def centered_loss(
@@ -86,9 +106,12 @@ def load_centered_table(
 @torch.no_grad()
 def table_features(
     network: torch.nn.Module, table: Table, future_ids: torch.Tensor,
-    header_ids: torch.Tensor, chunk: int,
+    header_ids: torch.Tensor, chunk: int, center: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Features of every row (N, L), minus their mean, and of every column (C, L); float64."""
+    """Features of every row (N, L), minus their mean, and of every column (C, L); float64.
+
+    With center=False (the control) the row features keep their mean.
+    """
     network.eval()
     left = torch.cat([
         network.left_features(table.histories[start:start + chunk]).double()
@@ -101,7 +124,7 @@ def table_features(
         for start in range(0, len(future_ids), chunk)
     ])
     network.train()
-    return left - left.mean(dim=0, keepdim=True), right
+    return (left - left.mean(dim=0, keepdim=True) if center else left), right
 
 
 @torch.no_grad()
@@ -193,10 +216,15 @@ def train_centered(
     train_copy: bool = False,
     mean_weight: float = 1.0,
     right_encoder: str | None = None,
+    target: str = "centered",
     eval_chunk: int = 256,
 ) -> dict:
     if layout not in LAYOUTS or encoder not in ENCODERS or nesting not in NESTINGS:
         raise ValueError(f"unknown layout {layout!r}, encoder {encoder!r} or nesting {nesting!r}")
+    if target not in TARGETS:
+        raise ValueError(f"target must be one of {TARGETS}, got {target!r}")
+    if target != "centered" and layout in ("landmark", "prototype"):
+        raise ValueError("the minus-g control is for the shared and independent layouts")
     if history_batch < 2:
         raise ValueError("history_batch must be at least 2: a column's mean needs two histories")
     if not (inference_dir / "metadata.json").is_file():
@@ -210,6 +238,8 @@ def train_centered(
     }
     if right_encoder is not None:
         config["right_encoder"] = right_encoder
+    if target != "centered":
+        config["target"] = target
     if layout in ("landmark", "prototype"):
         config["landmarks"] = landmarks
     if layout == "prototype":
@@ -221,7 +251,11 @@ def train_centered(
     torch.manual_seed(seed)
     inference = CausalLMInference(model_path, device)
     teacher = Teacher(inference)
-    tables = {name: load_centered_table(inference_dir / name, device) for name in TABLE_NAMES}
+    centered = target == "centered"
+    tables = {
+        name: load_centered_table(inference_dir / name, device) if centered
+        else load_minus_g_table(inference_dir / name, inference, device)
+        for name in TABLE_NAMES}
     reference, _, reference_headers = tables["val"]
     top_k = reference_headers.shape[1]
     history_tokens = reference.histories.shape[1]
@@ -248,13 +282,14 @@ def train_centered(
     step = 0
     if saved is not None:
         network.load_state_dict(saved["network"])
-        optimizer.load_state_dict(saved["optimizer"])
-        scheduler.load_state_dict(saved["scheduler"])
+        if "optimizer" in saved:  # a finished run may keep its weights only
+            optimizer.load_state_dict(saved["optimizer"])
+            scheduler.load_state_dict(saved["scheduler"])
         step = saved["step"]
         print(f"Resuming at step {step}", flush=True)
     files.write_metadata({
         **config, "device": device, "top_k": top_k,
-        "target": "logit(token | history + future) - vocabulary mean, minus the mean of that "
+        "target_description": "logit(token | history + future) - vocabulary mean, minus the mean of that "
                   "over the histories of the batch (training) or of the table (evaluation)",
         "sampling": "a fresh grid of history_batch x future_batch stream windows per step, "
                     "computed by the frozen model",
@@ -283,7 +318,8 @@ def train_centered(
         for name, (table, future_ids, header_ids) in tables.items():
             if layout == "prototype":  # its mean moves with the prototypes
                 minus_g[name] = landmark_mean(network, mean_tables[name], eval_chunk)
-            left, right = table_features(network, table, future_ids, header_ids, eval_chunk)
+            left, right = table_features(
+                network, table, future_ids, header_ids, eval_chunk, center=centered)
             comparison = compare_with_exact_svd(left, right, table, ranks)
             comparison.update(span_energy(left, right, table.matrix, comparison["ranks"]))
             if name in minus_g:
@@ -305,13 +341,17 @@ def train_centered(
     while step < steps:
         history_ids, future_ids = windows.draw(history_batch, future_batch)
         history_ids, future_ids = history_ids.to(device), future_ids.to(device)
-        header_ids, _ = teacher.headers(future_ids, top_k)
+        header_ids, g = teacher.headers(future_ids, top_k)
         entries = teacher.grid_entries(history_ids, future_ids, header_ids)
-        if layout == "prototype":
+        if not centered:
+            loss = plain_loss(
+                wrapper, network.left_features(history_ids),
+                network.right_features(future_ids, header_ids), entries - g)
+        elif layout == "prototype":
             # One pass of the copy gives the modes and the estimate of the column means.
             behind = network.entries(future_ids, header_ids)
-            centered = behind - behind.mean(dim=0, keepdim=True)
-            right = torch.einsum("lm,mfk->fkl", network.mix, centered)
+            responses = behind - behind.mean(dim=0, keepdim=True)
+            right = torch.einsum("lm,mfk->fkl", network.mix, responses)
             loss = centered_loss(wrapper, network.left_features(history_ids), right, entries)
             loss = loss + mean_weight * (behind.mean(dim=0) - entries.mean(dim=0)).square().mean()
         else:
@@ -326,7 +366,8 @@ def train_centered(
         scheduler.step()
         step += 1
         losses.append(loss.item())
-        kernel_energy.append((entries - entries.mean(dim=0)).square().mean().item())
+        kernel_energy.append(
+            (entries - (entries.mean(dim=0) if centered else g)).square().mean().item())
         if step % eval_every == 0 or step == steps:
             seconds = (time.perf_counter() - started) / len(losses)
             record = {

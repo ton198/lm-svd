@@ -216,6 +216,20 @@ class CenterTests(Exp8Fixture):
             self.run_center("center-run", modes=3)
         self.assertEqual(self.run_center("center-run", modes=3, overwrite=True)["step"], 4)
 
+    def test_the_minus_g_control_trains_on_and_compares_with_exp5s_table(self):
+        summary = self.run_center("control-run", target="minus-g", steps=2, eval_every=1)
+        self.assertEqual(summary["step"], 2)
+        metadata = json.loads((self.root / "control-run" / "metadata.json").read_text())
+        self.assertEqual(metadata["target"], "minus-g")
+        record = json.loads(
+            (self.root / "control-run" / "eval_history.jsonl").read_text().splitlines()[-1])
+        from experiments.exp5_gpt2_mlp_table.tables import load_eval_table
+        exact = load_eval_table(self.inference_dir / "val", self.inference, "cpu").table
+        share = (exact.singular_values[0] ** 2 / exact.singular_values.square().sum()).item()
+        self.assertAlmostEqual(record["val"]["exact_captured_energy"][0], share, places=6)
+        with self.assertRaisesRegex(ValueError, "control is for"):
+            self.run_center("control-bad", target="minus-g", layout="landmark")
+
     def test_a_stopped_run_resumes_from_its_checkpoint(self):
         self.run_center("center-stopped", steps=4)
         files = RunFiles(self.root / "center-stopped", {}, overwrite=False)
