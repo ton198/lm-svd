@@ -192,6 +192,7 @@ def train_centered(
     landmarks: int = 64,
     train_copy: bool = False,
     mean_weight: float = 1.0,
+    right_encoder: str | None = None,
     eval_chunk: int = 256,
 ) -> dict:
     if layout not in LAYOUTS or encoder not in ENCODERS or nesting not in NESTINGS:
@@ -207,6 +208,8 @@ def train_centered(
         "seed": seed, "model_path": str(model_path), "stream_path": str(stream_path),
         "roberta_path": str(roberta_path) if encoder == "roberta" else None,
     }
+    if right_encoder is not None:
+        config["right_encoder"] = right_encoder
     if layout in ("landmark", "prototype"):
         config["landmarks"] = landmarks
     if layout == "prototype":
@@ -237,6 +240,7 @@ def train_centered(
     network = build_network(
         inference, layout=layout, encoder=encoder, modes=modes, roberta_path=roberta_path,
         teacher=teacher, landmark_ids=landmark_ids, train_copy=train_copy,
+        right_encoder=right_encoder,
     ).to(device)
     wrapper = NestedLoRA(model=network, neigs=modes, sequential=nesting == "sequential").to(device)
     optimizer = torch.optim.Adam(parameter_groups(network, encoder, lr, encoder_lr))

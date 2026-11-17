@@ -73,6 +73,10 @@ def main(argv: list[str] | None = None) -> None:
                         default="gpt2",
                         help="exp7's encoder kinds; gpt2-mean averages the copy's positions "
                              "instead of reading the last one")
+    center.add_argument("--right-encoder", choices=("gpt2", "gpt2-mean", "roberta"),
+                        default=None,
+                        help="--layout shared: another pretrained kind for the right side "
+                             "(default: the same as --encoder)")
     center.add_argument("--landmarks", type=positive_int, default=64,
                         help="Landmark histories of --layout landmark, drawn from the stream")
     center.add_argument("--roberta-path", type=Path, default=Path("models/minilmv2-l6-h384"),
@@ -116,6 +120,8 @@ def main(argv: list[str] | None = None) -> None:
 
             encoder_name = args.roberta_path.name if args.encoder == "roberta" else args.encoder
             name = f"center-{args.layout}-{encoder_name}-{args.nesting}-L{args.modes}"
+            if args.right_encoder is not None:
+                name += f"-right-{args.right_encoder}"
             if args.layout in ("landmark", "prototype"):
                 name += f"-M{args.landmarks}"
             if args.layout == "prototype" and args.train_copy:
@@ -129,6 +135,7 @@ def main(argv: list[str] | None = None) -> None:
                 lr=getattr(args, "lr", CENTER_LR[args.encoder]), encoder_lr=args.encoder_lr,
                 seed=args.seed, overwrite=args.overwrite, roberta_path=args.roberta_path,
                 landmarks=args.landmarks, train_copy=args.train_copy,
+                right_encoder=args.right_encoder,
                 mean_weight=args.mean_weight)
         else:
             from .mean import train_mean

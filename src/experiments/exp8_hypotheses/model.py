@@ -230,10 +230,16 @@ class PrototypeNetwork(LandmarkNetwork):
 def build_network(
     inference: CausalLMInference, *, layout: str, encoder: str, modes: int,
     roberta_path: Path | None = None, teacher=None, landmark_ids: torch.Tensor | None = None,
-    train_copy: bool = False,
+    train_copy: bool = False, right_encoder: str | None = None,
 ) -> nn.Module:
+    """right_encoder gives the shared layout another encoder kind on the right side."""
     if layout not in LAYOUTS:
         raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
+    if right_encoder is not None:
+        if layout != "shared":
+            raise ValueError("right_encoder is for the shared layout")
+        if (right_encoder == "scratch") != (encoder == "scratch"):
+            raise ValueError("a scratch encoder cannot be mixed with a pretrained one")
     if layout == "prototype":
         if landmark_ids is None:
             raise ValueError("layout 'prototype' needs landmark_ids")
@@ -251,7 +257,7 @@ def build_network(
     if layout == "shared":
         return SharedNetwork(
             build_encoder(inference, encoder, roberta_path),
-            build_encoder(inference, encoder, roberta_path), modes, vectors)
+            build_encoder(inference, right_encoder or encoder, roberta_path), modes, vectors)
     return IndependentNetwork(
         [build_mode(inference, encoder, roberta_path=roberta_path, **SCRATCH)
          for _ in range(modes)],

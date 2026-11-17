@@ -163,6 +163,19 @@ class CenterTests(Exp8Fixture):
                  for p in head.parameters()}
         self.assertEqual({id(p) for p in head_group["params"]}, heads)
 
+    def test_the_right_side_can_have_another_pretrained_encoder(self):
+        from experiments.exp7_independent_subnets.model import LastToken, MeanPool
+        network = build_network(
+            self.inference, layout="shared", encoder="gpt2-mean", modes=2, right_encoder="gpt2")
+        self.assertIsInstance(network.left_encoder, MeanPool)
+        self.assertIsInstance(network.right_encoder, LastToken)
+        with self.assertRaisesRegex(ValueError, "cannot be mixed"):
+            build_network(self.inference, layout="shared", encoder="scratch", modes=2,
+                          right_encoder="gpt2")
+        with self.assertRaisesRegex(ValueError, "shared layout"):
+            build_network(self.inference, layout="independent", encoder="gpt2", modes=2,
+                          right_encoder="gpt2")
+
     def test_span_energy_of_the_exact_vectors_is_the_exact_energy(self):
         table, _, _ = load_centered_table(self.inference_dir / "train", "cpu")
         ranks = [1, 2]
