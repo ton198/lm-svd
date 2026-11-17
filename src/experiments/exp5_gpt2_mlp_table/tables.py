@@ -7,6 +7,7 @@ tables therefore lose g from every row and get a fresh exact SVD.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,12 +27,12 @@ from .model import Exp5FinetuneNetwork
 
 @dataclass(frozen=True)
 class EvalTable:
-    table: Table  # the stored matrix minus g, with the exact SVD of that matrix
+    table: Table  # the stored matrix minus its baseline (g), with the exact SVD of that matrix
     history_hidden: torch.Tensor  # (N, hidden) float32
     future_hidden: torch.Tensor  # (F, hidden) float32, from the frozen model
     future_ids: torch.Tensor  # (F, T) int64, for a right side with its own encoder
-    residual_energy: float  # ||matrix - g||^2 / ||matrix||^2
-    residual_top_mode: float  # leading squared singular value over ||matrix - g||^2
+    residual_energy: float  # ||matrix - baseline||^2 / ||matrix||^2
+    residual_top_mode: float  # leading squared singular value over ||matrix - baseline||^2
 
 
 @torch.no_grad()
@@ -40,12 +41,16 @@ def load_eval_table(
     inference: CausalLMInference,
     device: str | torch.device,
     batch_size: int = 1024,
+    baseline: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
 ) -> EvalTable:
     """Load an exp4 table, remove g and take the exact SVD of the result.
 
     g is read at the stored header tokens. exp4 selected them one future at a
     time, and a batched pass can order near-tied tokens differently, so they
     are not selected again; they only have to be among the model's top-k.
+
+    With baseline, its values are removed instead of g: it maps the futures
+    (F, T) and their header tokens (F, K) to one number per column (F, K).
     """
     tokens = np.load(table_dir / "tokens.npz")
     matrix = np.load(table_dir / "matrix.npy")
@@ -67,7 +72,8 @@ def load_eval_table(
             "another model or top-k"
         )
 
-    residual = matrix - g.reshape(-1).cpu().numpy()
+    removed = g if baseline is None else baseline(futures, header_ids)
+    residual = matrix - removed.reshape(-1).float().cpu().numpy()
     svd = matrix_svd(residual, device=device)
     residual_norm_sq = float(np.square(residual, dtype=np.float64).sum())
     return EvalTable(

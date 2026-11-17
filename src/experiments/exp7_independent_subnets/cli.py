@@ -15,6 +15,24 @@ from utils.experiment_paths import INFERENCE_DIR, add_run_arguments, run_dir
 
 from . import DEFAULT_LR, EXPERIMENT, SUBNETS, WARMUP_STEPS
 
+DEFAULT_POOL_DIR = Path("data/center_pools/wikitext-103-train__gpt2-small__h64-f32__m64")
+DEFAULT_STREAM = Path("data/token_streams/wikitext-103-train.npy")
+
+
+def build_pool(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    try:
+        from .center import build_center_pool
+
+        summary = build_center_pool(
+            pool_dir=args.pool_dir, model_path=args.model_path, stream_path=args.stream_path,
+            device=args.device, histories=args.histories, futures=args.futures,
+            history_tokens=args.history_tokens, future_tokens=args.future_tokens,
+            seed=args.seed, overwrite=args.overwrite, chunk=args.chunk,
+        )
+    except (ValueError, FileExistsError) as error:
+        parser.error(str(error))
+    print("\n".join(f"{key}: {value}" for key, value in summary.items()))
+
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
@@ -22,6 +40,28 @@ def main(argv: list[str] | None = None) -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    pool_parser = subparsers.add_parser(
+        "center-pool",
+        help="Compute, for a fixed set of futures, the mean of the model's final state over "
+             "fixed histories: the column center that `train --center-pool` subtracts",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    pool_parser.add_argument("--pool-dir", type=Path, default=DEFAULT_POOL_DIR)
+    pool_parser.add_argument(
+        "--histories", type=positive_int, default=64,
+        help="Fixed histories a column is averaged over, drawn from the stream")
+    pool_parser.add_argument(
+        "--futures", type=positive_int, default=200000,
+        help="Futures of the pool, drawn from the stream; each costs --histories passes")
+    pool_parser.add_argument("--history-tokens", type=positive_int, default=64)
+    pool_parser.add_argument("--future-tokens", type=positive_int, default=32)
+    pool_parser.add_argument("--stream-path", type=Path, default=DEFAULT_STREAM)
+    pool_parser.add_argument("--model-path", type=Path, default=Path("models/gpt2-small"))
+    pool_parser.add_argument("--seed", type=nonnegative_int, default=0)
+    pool_parser.add_argument(
+        "--chunk", type=positive_int, default=1024, help="Sequences per pass of the model")
+    pool_parser.add_argument("--device", default="cuda")
+    pool_parser.add_argument("--overwrite", action="store_true")
     train_parser = subparsers.add_parser(
         "train",
         help="Train one pair of sub-networks per singular function, one mode at a time, "
@@ -90,6 +130,13 @@ def main(argv: list[str] | None = None) -> None:
         "--store-dir", type=Path, default=DEFAULT_STORE_DIR,
         help="Sample store to draw training pairs from; it must come from --model-path",
     )
+    train_parser.add_argument(
+        "--center-pool", type=Path, default=None,
+        help="A finished center pool (`exp7 center-pool`). The target is then the table "
+             "entry minus its column's mean over the pool's fixed histories instead of "
+             "minus g, the pairs are pool futures behind fresh stream histories, and "
+             "--store-dir is not read. The run directory gets the suffix -center<histories>",
+    )
     add_run_arguments(train_parser)
     # The evaluation tables are exp4's, which are built from this sample set.
     train_parser.set_defaults(dataset="wikitext-large")
@@ -97,6 +144,9 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--device", default="cuda")
     train_parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "center-pool":
+        build_pool(args, parser)
+        return
     if args.min_stage_steps > args.stage_steps:
         parser.error(
             f"--min-stage-steps ({args.min_stage_steps}) must not exceed "
@@ -112,6 +162,10 @@ def main(argv: list[str] | None = None) -> None:
     try:
         from .train import train_exp7
 
+        if args.center_pool is not None:
+            from .center import read_pool_config
+
+            run_name += f"-center{read_pool_config(args.center_pool)['histories']}"
         model_label = args.model_path.name
         summary = train_exp7(
             inference_dir=run_dir(
@@ -138,6 +192,7 @@ def main(argv: list[str] | None = None) -> None:
             seed=args.seed,
             overwrite=args.overwrite,
             roberta_path=args.roberta_path,
+            center_pool=args.center_pool,
         )
     except (ValueError, FileExistsError) as error:
         parser.error(str(error))

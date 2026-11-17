@@ -13,6 +13,11 @@ is frozen and saved, and all l modes are aligned on fresh store pairs
 checkpoint.pt records the progress: the frozen modes in modes/ are final and at
 most one stage is in progress. The same command continues an interrupted run or
 adds modes to a finished one.
+
+With a center pool (center.py) the target is the table entry minus the mean of
+its column over the pool's fixed histories instead of minus g; the pairs are
+pool futures behind fresh stream histories, and both tables lose the same
+center before their exact SVDs.
 """
 
 from __future__ import annotations
@@ -49,6 +54,8 @@ from utils.inference import CausalLMInference
 
 from . import PRETRAINED, SUBNETS, TABLE_KEYS, WARMUP_STEPS
 from .align import Moments, alignment, max_correlation
+from .center import FIRST_MODE as CENTER_FIRST_MODE
+from .center import CenteredPairs, prepare_centered_run
 from .model import Mode, build_mode, check_lengths, token_vectors
 from .stage import Selection, residual_target, stage_loss
 
@@ -274,12 +281,13 @@ class StagedRun:
         tables: dict[str, EvalTable],
         top_k: int,
         vectors: torch.Tensor,
-        sampler: SampleSampler,
+        sampler: SampleSampler | None,
         config: dict,
         output_dir: Path,
         device: str,
         encode_batch: int,
         eval_chunk: int,
+        pairs: CenteredPairs | None = None,
     ) -> None:
         self.inference = inference
         self.tables = tables
@@ -288,6 +296,8 @@ class StagedRun:
         self.top_k = top_k
         self.vectors = vectors
         self.sampler = sampler
+        # Set on the centered target: it gives the batches instead of the store.
+        self.pairs = pairs
         self.config = config
         self.output_dir = output_dir
         self.device = device
@@ -362,6 +372,8 @@ class StagedRun:
         self, count: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Histories (B, H), futures (B, T), header ids (B, K) and targets (B, K) of fresh pairs."""
+        if self.pairs is not None:
+            return self.pairs.draw(count)
         histories, futures, pair_logits = draw_pairs(self.sampler, count)
         future_hidden = last_hidden(self.inference, futures, self.encode_batch)
         header_ids, g = header_tokens(
@@ -588,10 +600,16 @@ def train_exp7(
     seed: int,
     overwrite: bool,
     roberta_path: Path,
+    center_pool: Path | None = None,
     encode_batch: int = 1024,
     eval_chunk: int = 256,
 ) -> dict:
     """Train `modes` modes one stage at a time on store pairs.
+
+    With center_pool, a finished center pool (center.py), the target is the
+    table entry minus its column's mean over the pool's fixed histories
+    instead of minus g. The pairs are then pool futures behind fresh stream
+    histories, the tables lose the same center, and store_dir is not read.
 
     A stage evaluates every eval_every of its steps and at its last step, and
     ends after stage_steps steps or, with patience > 0, once past
@@ -640,6 +658,11 @@ def train_exp7(
         "lr": lr, "encoder_lr": encoder_lr, "seed": seed, "optimizer": "Adam",
         "first_mode": FIRST_MODE,
     }
+    if center_pool is not None:
+        # Only a centered run has these keys, so a run on the target minus g
+        # still continues from a checkpoint written before they existed.
+        config.update(
+            store_dir=None, center_pool=str(center_pool), first_mode=CENTER_FIRST_MODE)
 
     output_dir = Path(output_dir)
     history_path = output_dir / "eval_history.jsonl"
@@ -655,10 +678,18 @@ def train_exp7(
             "evaluations": len(checkpoint["history"]),
         }
 
-    inference, tables, top_k, store_config = prepare_run(
-        inference_dir=inference_dir, store_dir=store_dir, model_path=model_path,
-        device=device, seed=seed, encode_batch=encode_batch,
-    )
+    pool = None
+    if center_pool is None:
+        inference, tables, top_k, store_config = prepare_run(
+            inference_dir=inference_dir, store_dir=store_dir, model_path=model_path,
+            device=device, seed=seed, encode_batch=encode_batch,
+        )
+    else:
+        inference, tables, top_k, pool = prepare_centered_run(
+            inference_dir=inference_dir, pool_dir=center_pool, model_path=model_path,
+            device=device, seed=seed, encode_batch=encode_batch,
+        )
+        store_config = None
     # compare_with_exact_svd drops ranks above the exact singular vectors the table
     # holds, so beyond them the selection metric would not depend on the current mode.
     selection_name = next(name for name, key in TABLE_KEYS.items() if key == "selection")
@@ -683,14 +714,16 @@ def train_exp7(
 
     # The frozen teacher's constant, shared by every mode and saved nowhere.
     vectors = token_vectors(inference.model.get_output_embeddings().weight).to(device)
+    # Seeded by the global step the run starts from, as in exp5, so a continued
+    # run does not replay the pairs it has seen.
+    draw_seed = sampler_seed(seed, 0 if checkpoint is None else checkpoint["step"])
     run = StagedRun(
         inference=inference, tables=tables, top_k=top_k, vectors=vectors,
-        # Seeded by the global step the run starts from, as in exp5, so a continued
-        # run does not replay the pairs it has seen.
-        sampler=SampleSampler(
-            store_dir, seed=sampler_seed(seed, 0 if checkpoint is None else checkpoint["step"])),
+        sampler=None if pool is not None else SampleSampler(store_dir, seed=draw_seed),
         config=config, output_dir=output_dir, device=device, encode_batch=encode_batch,
         eval_chunk=eval_chunk,
+        pairs=None if pool is None else CenteredPairs(
+            inference, pool, top_k, draw_seed, encode_batch),
     )
     if checkpoint is None:
         state = run.start_stage(1)
@@ -702,6 +735,18 @@ def train_exp7(
     shared = run_metadata(
         device=device, top_k=top_k, tables=tables, model=state.mode, store_config=store_config)
     shared["ranks"] = "1..l at stage l"
+    if pool is not None:
+        del shared["store"]
+        shared["center_pool"] = pool.config
+        shared["value"] = (
+            "logit(token | history + future) - mean(logits over full vocabulary) - the mean "
+            "of that value over the fixed histories of the center pool")
+        shared["sampling"] = (
+            "independent pairs of a center-pool future and a fresh history window of the "
+            "token stream; every header token of each pair")
+        shared["isolation"] = (
+            "pool futures and stream histories are drawn from the whole training stream "
+            "and are not excluded from the evaluation tables")
     shared["table_shapes"] = {
         TABLE_KEYS[name]: list(table.table.matrix.shape) for name, table in tables.items()}
     roles = {"selection": "decides when a stage ends and which weights are frozen",
@@ -725,8 +770,13 @@ def train_exp7(
         **shared,
     }))
 
-    print(f"Waiting for the first sample block in {store_dir}", flush=True)
-    run.sampler.wait_until_ready()
+    if run.sampler is not None:
+        print(f"Waiting for the first sample block in {store_dir}", flush=True)
+        run.sampler.wait_until_ready()
+    else:
+        print(
+            f"Target: table minus the column mean over {pool.config['histories']} fixed "
+            f"histories; {len(pool.futures)} pool futures from {center_pool}", flush=True)
     if subnet == "gpt2":
         rates = (
             f"copies of the model's transformer read at the last token; heads lr {lr}, "

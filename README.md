@@ -750,6 +750,37 @@ Stage 1 is run once with `scratch` and once with `roberta` (see [Run](#run)). Re
 
 With several stages, look also at the difference between the energy before and after the alignment (a large difference means later modes are repairing the errors of earlier ones), and at the energy each stage adds in `stages.jsonl` compared with what the exact SVD adds at that rank.
 
+### Centering on fixed histories
+
+After `g` is removed, the mean of a column over the histories is still there, and it is the leading mode: a left function that is nearly constant times the column means. On the selection table it holds 0.65 of the energy. The first stage of every run reached 0.37–0.43 of it, and what it missed stayed the largest part of every later residual (0.24 of the energy after the MiniLMv2 stage, where the second exact mode has 0.036), so the later stages added about 0.01 each.
+
+`train --center-pool` changes the target. `g` is not subtracted. A column `(future, z)` instead loses its mean over `M` fixed histories `h_1 .. h_M`, drawn once from the token stream:
+
+```text
+target(history, future, z) = A[history, (future, z)] − (1 / M) Σ_m A[h_m, (future, z)]
+```
+
+An entry is `⟨s(history + future), e_z⟩`, so the center of all tokens of one future is one vector, the mean of `s(h_m + future)`. It costs `M` passes of the frozen model per future, which is too much inside a training step, so it is computed once for a fixed pool of futures:
+
+```bash
+uv run exp7 center-pool                                   # 64 histories, 200000 futures
+uv run exp7 train --subnet scratch --modes 8 \
+  --center-pool data/center_pools/wikitext-103-train__gpt2-small__h64-f32__m64
+```
+
+- **`center-pool`** draws `--histories` (default 64) history windows and `--futures` (default 200000) future windows from `--stream-path` and writes `histories.npy`, `futures.npy` and `states.npy` (the center vector of every future) to `--pool-dir`. Each history is read once per block of futures and its attention cache is shared by the futures behind it, in half precision on a GPU. `metadata.json` is written last. An interrupted build continues from `progress.json` when the command is repeated; other settings in the same directory need `--overwrite`.
+- **`train --center-pool DIR`** draws each pair as a pool future behind a fresh history window of the pool's stream, and the frozen model computes the pair's entries during the step. The header tokens are still the top-k tokens after the future alone. Both exp4 tables lose the same center, computed for their futures from the pool's histories, before their exact SVDs. The sample store is not read. The run directory is `train-<name>-center<M>`, so a centered run never shares a directory with a run on the target minus `g`.
+
+The histories behind `M`: on the selection table, with the sample histories taken out of it and the rest measured, the part of the target that does not depend on the history is about `1 / (M + 1)` of its energy (0.090 at 8, 0.055 at 16, 0.016 at 64, 0.007 at 128), and the leading exact mode has 0.106. Below about 16 histories the error of the center is itself the leading mode.
+
+Things to keep in mind when reading a centered run:
+
+- **Its numbers do not compare with the runs on the target minus `g`.** The energy is a share of the table minus the center, which has about a third of the energy of the table minus `g`. Compare `captured_energy` with the same run's `exact_captured_energy`.
+- **The pool is finite.** A future is drawn again every `futures / batch size` steps on average (about 1600 with the defaults), each time behind another history.
+- **A shift shared by the 50 header tokens of a future is still in the target** when it depends on the history: 0.40 of the centered energy on the selection table.
+
+On BlueHive: `sbatch -J <name> bluehive_run/exp7-center.sbatch <exp7 arguments>`.
+
 ### Resources (estimated, not measured)
 
 - `gpt2`: each encoder has about 125 million parameters. A step needs the same gradient memory as exp6 (about 16 GB at batch 128). Each frozen mode adds about 1 GB of weights and two forward-only GPT-2 passes, so stage 8 needs about 23 GB and a step takes about two to three times as long as in stage 1.
