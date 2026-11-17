@@ -55,7 +55,9 @@ from experiments.exp7_independent_subnets.model import (
 )
 from experiments.exp7_independent_subnets.stage import Selection, residual_target, stage_loss
 from experiments.exp7_independent_subnets.train import (
+    INPUT_SPREAD_FLOOR,
     StagedRun,
+    input_spread,
     mode_table_features,
     selection_energy,
     train_exp7,
@@ -968,6 +970,37 @@ class TrainingTests(TrainingHelpers, Exp7Fixture):
                          for group in groups],
                         [(1e-2, parameter_ids(mode))])
 
+    def test_input_spread_is_zero_for_an_encoder_that_ignores_its_input(self):
+        table = load_eval_table(self.inference_dir / "train", self.inference, "cpu")
+        for subnet in ("scratch", "gpt2"):
+            with self.subTest(subnet=subnet):
+                mode = build_mode(self.inference, subnet, **SCRATCH)
+                left, right = input_spread(mode, table)
+                self.assertGreater(left, 1e-2)
+                self.assertGreater(right, 1e-2)
+                # The left encoder's transformer now gives the same states for every input.
+                with torch.no_grad():
+                    for parameter in mode.left_encoder.parameters():
+                        parameter.zero_()
+                left, right = input_spread(mode, table)
+                self.assertLess(left, INPUT_SPREAD_FLOOR)
+                self.assertGreater(right, 1e-2)
+
+    def test_an_encoder_that_ignores_its_input_is_reported_at_each_evaluation(self):
+        healthy = self.root / "exp7-spread-healthy"
+        self.train(healthy, modes=1)
+        self.assertNotIn("WARNING", self.log)
+        collapsed = self.root / "exp7-spread-collapsed"
+        with patch("experiments.exp7_independent_subnets.train.input_spread",
+                   return_value=(0.0, 0.4)):
+            self.train(collapsed, modes=1)
+        warnings = [line for line in self.log.splitlines() if line.startswith("WARNING")]
+        self.assertEqual(len(warnings), 2)  # one per evaluation
+        self.assertRegex(warnings[0], "left encoder of mode 1")
+        self.assertNotIn("right encoder", warnings[0])
+        # The run itself goes on: the stopping rule keeps the best weights.
+        self.assertEqual(len(self.records(collapsed)), 2)
+
     def test_a_non_finite_selection_metric_stops_the_run_before_it_is_recorded(self):
         for metrics, kept in (([float("nan")], 0), ([0.5, float("nan")], 1)):
             output = self.root / f"exp7-nan-{kept}"
@@ -1425,7 +1458,9 @@ class CLITests(Exp7Fixture):
                 "--patience", "0", "--eval-every", "2", "--align-pairs", "16",
                 "--batch-size", "8", "--device", "cpu",
             ])
-        run = results_root / "exp7_independent_subnets" / "tiny__model" / "train-roberta"
+        # A roberta run is named after its model, so two pretrained models do not collide.
+        run = (results_root / "exp7_independent_subnets" / "tiny__model"
+               / f"train-{self.roberta_dir.name}")
         self.assertTrue((run / "modes" / "mode-01.pt").is_file())
         self.assertIn(f"output_dir: {run}", output.getvalue())
         metadata = json.loads((run / "metadata.json").read_text())
@@ -1444,7 +1479,7 @@ class CLITests(Exp7Fixture):
                 "lr", "encoder_lr", "seed", "device", "overwrite")},
             {"subnet": "scratch", "modes": 8, "stage_steps": 30000, "min_stage_steps": 5000,
              "patience": 5, "align_pairs": 16384, "scratch_layers": 6, "scratch_width": 384,
-             "scratch_heads": 6, "batch_size": 128, "eval_every": 1000, "lr": 3e-4,
+             "scratch_heads": 6, "batch_size": 128, "eval_every": 1000, "lr": 1e-4,
              "encoder_lr": 2e-5, "seed": 42, "device": "cuda", "overwrite": False})
         self.assertEqual(options["model_path"], Path("models/gpt2-small"))
         self.assertEqual(options["roberta_path"], Path("models/roberta-base"))
@@ -1461,11 +1496,57 @@ class CLITests(Exp7Fixture):
         with patch("experiments.exp7_independent_subnets.train.train_exp7") as train:
             train.return_value = {"output_dir": "x", "step": 0, "modes": 0, "evaluations": 0}
             with contextlib.redirect_stdout(io.StringIO()):
-                main(["train", "--subnet", "roberta", "--roberta-path", "elsewhere/roberta"])
+                main(["train", "--subnet", "roberta", "--roberta-path", "elsewhere/minilm"])
         options = train.call_args.kwargs
         self.assertEqual(
-            (options["subnet"], options["roberta_path"]), ("roberta", Path("elsewhere/roberta")))
-        self.assertEqual(options["output_dir"].name, "train-roberta")
+            (options["subnet"], options["roberta_path"]), ("roberta", Path("elsewhere/minilm")))
+        self.assertEqual(options["output_dir"].name, "train-minilm")
+
+    def test_the_run_directory_names_the_kind_or_the_pretrained_model(self):
+        def directory(*arguments):
+            with patch("experiments.exp7_independent_subnets.train.train_exp7") as train:
+                train.return_value = {"output_dir": "x", "step": 0, "modes": 0, "evaluations": 0}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(["train", *arguments])
+            return train.call_args.kwargs["output_dir"].name
+
+        self.assertEqual(directory("--subnet", "roberta"), "train-roberta-base")
+        self.assertEqual(
+            directory("--subnet", "roberta", "--roberta-path", "models/minilmv2-l6-h384/"),
+            "train-minilmv2-l6-h384")
+        # The other kinds do not read --roberta-path, so it does not name their directory.
+        self.assertEqual(
+            directory("--subnet", "scratch", "--roberta-path", "models/minilmv2-l6-h384"),
+            "train-scratch")
+        self.assertEqual(directory("--subnet", "gpt2"), "train-gpt2")
+
+    def test_the_default_learning_rate_depends_on_the_kind(self):
+        def learning_rate(*arguments):
+            with patch("experiments.exp7_independent_subnets.train.train_exp7") as train:
+                train.return_value = {"output_dir": "x", "step": 0, "modes": 0, "evaluations": 0}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(["train", *arguments])
+            return train.call_args.kwargs["lr"]
+
+        # A scratch encoder collapsed to a constant output at 3e-4 on a finite table.
+        self.assertEqual(learning_rate(), 1e-4)
+        self.assertEqual(learning_rate("--subnet", "scratch"), 1e-4)
+        self.assertEqual(learning_rate("--subnet", "roberta"), 3e-4)
+        self.assertEqual(learning_rate("--subnet", "gpt2"), 3e-4)
+        self.assertEqual(learning_rate("--subnet", "scratch", "--lr", "3e-4"), 3e-4)
+        self.assertEqual(learning_rate("--subnet", "roberta", "--lr", "1e-4"), 1e-4)
+
+    def test_a_pretrained_model_named_like_a_kind_is_rejected(self):
+        # Its directory would be another kind's.
+        for name in ("scratch", "gpt2"):
+            with self.subTest(name=name), \
+                    patch("experiments.exp7_independent_subnets.train.train_exp7") as train, \
+                    contextlib.redirect_stderr(io.StringIO()) as errors, \
+                    self.assertRaises(SystemExit) as raised:
+                main(["train", "--subnet", "roberta", "--roberta-path", f"models/{name}"])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("--roberta-path", errors.getvalue())
+            train.assert_not_called()
 
     def test_usage_errors(self):
         for arguments in (["--subnet", "mlp"], ["--modes", "0"], ["--patience", "-1"],
@@ -1522,4 +1603,15 @@ class DownloadModelsTests(unittest.TestCase):
             "allow_patterns": [
                 "config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json",
                 "vocab.json", "merges.txt"],
+        }])
+
+    def test_minilm_is_downloaded_when_named(self):
+        calls = self.run_script(["--models", "minilm"])
+        self.assertEqual(calls, [{
+            "repo_id": "nreimers/MiniLMv2-L6-H384-distilled-from-RoBERTa-Large",
+            "revision": "a61886e95cedc4cd2440f71cf9a55320ee1d8e06",
+            "local_dir": self.output_dir / "minilmv2-l6-h384",
+            "allow_patterns": [
+                "config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json",
+                "special_tokens_map.json", "vocab.json", "merges.txt"],
         }])

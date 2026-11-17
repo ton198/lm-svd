@@ -148,6 +148,31 @@ def mode_table_features(
     return left, right
 
 
+# Below this spread an encoder gives every sequence the same pooled vector.
+INPUT_SPREAD_FLOOR = 1e-3
+# Sequences of each table that input_spread reads.
+INPUT_SPREAD_SAMPLE = 256
+
+
+@torch.no_grad()
+def input_spread(mode: Mode, table: EvalTable) -> tuple[float, float]:
+    """How much the left and the right encoder's pooled vectors vary over a table's inputs.
+
+    Each is the mean distance of the pooled vectors from their mean, over the mean norm,
+    on the table's first histories and futures. A healthy encoder is far from 0; one that
+    no longer reads its input gives 0, and its side of the mode is then a constant.
+    """
+    mode.eval()
+
+    def spread(encoder: torch.nn.Module, ids: torch.Tensor) -> float:
+        pooled = encoder(ids[:INPUT_SPREAD_SAMPLE]).double()
+        deviation = (pooled - pooled.mean(dim=0)).norm(dim=1).mean()
+        return (deviation / pooled.norm(dim=1).mean().clamp_min(1e-30)).item()
+
+    return (spread(mode.left_encoder, table.table.histories),
+            spread(mode.right_encoder, table.future_ids))
+
+
 def selection_energy(record: dict) -> float:
     """The selection metric: captured energy of the selection table at the largest rank."""
     return record["selection"]["captured_energy"][-1]
@@ -258,6 +283,8 @@ class StagedRun:
     ) -> None:
         self.inference = inference
         self.tables = tables
+        self.selection_table = next(
+            table for name, table in tables.items() if TABLE_KEYS[name] == "selection")
         self.top_k = top_k
         self.vectors = vectors
         self.sampler = sampler
@@ -445,6 +472,13 @@ class StagedRun:
                 f"{record['seconds_per_step']:.3f}s/step  elapsed {now - self.started:.0f}s"
             ]
             lines.extend(format_comparison(key, record[key]) for key in TABLE_KEYS.values())
+            spreads = input_spread(state.mode, self.selection_table)
+            lines.extend(
+                f"WARNING: the {side} encoder of mode {state.stage} gives every sequence "
+                f"the same vector (spread {value:.1e}); it no longer reads its input. "
+                "A lower --lr avoids this."
+                for side, value in zip(("left", "right"), spreads)
+                if value < INPUT_SPREAD_FLOOR)
             print("\n".join(lines), flush=True)
             self.history.append(record)
             if state.selection.record(metric, state.stage_step):

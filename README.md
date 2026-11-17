@@ -54,8 +54,9 @@ uv run python scripts/download_models.py
 # Optional: download just one model.
 uv run python scripts/download_models.py --models medium
 
-# RoBERTa-base for exp7's --subnet roberta; only downloaded when named.
-uv run python scripts/download_models.py --models roberta
+# Pretrained encoders for exp7's --subnet roberta; only downloaded when named.
+uv run python scripts/download_models.py --models roberta   # RoBERTa-base
+uv run python scripts/download_models.py --models minilm    # MiniLMv2 L6-H384
 ```
 
 The script downloads **complete inference files**, not every file in the upstream repositories. Each GPT-2 directory contains `model.safetensors`, `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, and `merges.txt`. The RoBERTa directory contains `model.safetensors`, `config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, and `merges.txt`. These include the full model weights, not just tokenizers. Duplicate PyTorch, TensorFlow, Flax, Rust, and ONNX weight formats are not downloaded.
@@ -66,6 +67,7 @@ The script downloads **complete inference files**, not every file in the upstrea
 | `models/gpt2-medium` | [openai-community/gpt2-medium](https://huggingface.co/openai-community/gpt2-medium) | `6dcaa7a952f72f9298047fd5137cd6e4f05f41da` |
 | `models/gpt2-large` | [openai-community/gpt2-large](https://huggingface.co/openai-community/gpt2-large) | `32b71b12589c2f8d625668d2335a01cac3249519` |
 | `models/roberta-base` | [FacebookAI/roberta-base](https://huggingface.co/FacebookAI/roberta-base) | `e2da8e2f811d1448a5b465c236feacd80ffbac7b` |
+| `models/minilmv2-l6-h384` | [nreimers/MiniLMv2-L6-H384-distilled-from-RoBERTa-Large](https://huggingface.co/nreimers/MiniLMv2-L6-H384-distilled-from-RoBERTa-Large) | `a61886e95cedc4cd2440f71cf9a55320ee1d8e06` |
 
 Re-running the script reuses files already downloaded at the pinned revisions. `--output-dir PATH` changes the parent directory of the model directories; by default it is the repository's `models/` directory. Without `--models` the script downloads the three GPT-2 models; `--models roberta` downloads RoBERTa-base (about 500 MB, used only by exp7). Internet access is required to fetch missing files. Download the source dataset in the next section before enabling offline mode.
 
@@ -593,9 +595,20 @@ right v_l:  future (32 tokens)  -> encoder_l^R -> pooled vector
 
 | `--subnet` | Each encoder | Pooled vector | Learning rates |
 | --- | --- | --- | --- |
-| `scratch` (default) | A randomly initialised BERT transformer (`transformers.BertModel` without its pooler), bidirectional, trained from scratch, dropout 0, with its own token and position embeddings; it reads the model's token ids directly; `--scratch-layers` 6, `--scratch-width` 384, `--scratch-heads` 6 by default | The mean of the last hidden state over all positions | everything `--lr` (default 3e-4), with a linear warmup over the first 1000 steps of each stage |
+| `scratch` (default) | A randomly initialised BERT transformer (`transformers.BertModel` without its pooler), bidirectional, trained from scratch, dropout 0, with its own token and position embeddings; it reads the model's token ids directly; `--scratch-layers` 6, `--scratch-width` 384, `--scratch-heads` 6 by default | The mean of the last hidden state over all positions | everything `--lr` (default 1e-4 for this kind), with a linear warmup over the first 1000 steps of each stage |
 | `roberta` | A trainable copy of the pretrained RoBERTa-base in `--roberta-path` (default `models/roberta-base`; `transformers.RobertaModel` without its pooler), bidirectional, dropout 0. The model's GPT-2 token ids are mapped to RoBERTa's ids by token string, and `<s>` is put in front of the sequence and `</s>` behind it | The mean of the last hidden state over all positions, `<s>` and `</s>` included | encoders `--encoder-lr` (default 2e-5), heads `--lr` (default 3e-4), no warmup |
 | `gpt2` (kept, not used in the planned runs) | A trainable copy of the model's transformer, causal, dropout off: exp6's encoder, so only "independent or shared" changes | The hidden state of the last position | encoders `--encoder-lr` (default 2e-5), heads `--lr` (default 3e-4) |
+
+The default of `--lr` depends on the kind: 1e-4 for `scratch`, 3e-4 for the heads of `roberta` and `gpt2`. At 3e-4 the left encoder of a `scratch` mode stopped reading its input: on a finite 256 × 1600 table (the pairs drawn from the table itself) it gave every history the same vector after 1500 to 2000 steps in three runs of three (two seeds, with and without gradient clipping), and in none of three runs at 1e-4. A mode with a constant left side still captures energy, because the first left singular function is close to a constant, so the comparison alone does not show it. Each evaluation therefore measures how much each encoder's pooled vector varies over the selection table's first 256 histories and futures and prints a `WARNING` line when one of them no longer varies. The run continues; with the default stopping rule the frozen weights are the best ones on the selection table, from before the collapse.
+
+`--subnet roberta` takes any local model with RoBERTa's structure and vocabulary through `--roberta-path`. Two are pinned in `scripts/download_models.py`:
+
+| `--roberta-path` | Layers × width | Parameters per encoder | What it is |
+| --- | --- | --- | --- |
+| `models/roberta-base` (default) | 12 × 768 | about 124 M | RoBERTa-base |
+| `models/minilmv2-l6-h384` | 6 × 384 | about 30 M (19.5 M of them token and position embeddings) | MiniLMv2 distilled from RoBERTa-Large; the size of the default `scratch` encoder, so the two differ only in pretraining |
+
+Both have RoBERTa-base's vocabulary file, so the mapping from GPT-2's token ids is the same. The MiniLMv2 repository stores its weights as `pytorch_model.bin` in half precision; they are loaded as float32.
 
 Each stage starts a new Adam optimizer.
 
@@ -657,9 +670,16 @@ Then, with the kind chosen from the table in [How to read the first stage](#how-
 uv run exp7 train --subnet scratch --modes 8     # continues train-scratch
 ```
 
+A smaller pretrained model is a third run with its own directory:
+
+```bash
+uv run python scripts/download_models.py --models minilm    # once per machine
+uv run exp7 train --subnet roberta --roberta-path models/minilmv2-l6-h384 --modes 1
+```
+
 `--subnet scratch` is the default. `--roberta-path` (default `models/roberta-base`) names the local RoBERTa of `--subnet roberta`; nothing is downloaded during training. It is one of the settings a continued run must repeat (see below), for every kind.
 
-Outputs go to `<results-root>/exp7_independent_subnets/<dataset>__<model>/train-<subnet>/`, so each kind has its own directory. On BlueHive, submit `bluehive_run/exp7-train.sbatch`; arguments after the script name are passed to the command, and resubmitting continues the current stage.
+Outputs go to `<results-root>/exp7_independent_subnets/<dataset>__<model>/train-<name>/`. `<name>` is `scratch` or `gpt2` for those kinds, and for `--subnet roberta` the directory name of `--roberta-path` (`train-roberta-base`, `train-minilmv2-l6-h384`), so every kind and every pretrained model has its own directory. A `--roberta-path` whose directory is called `scratch` or `gpt2` is rejected. On BlueHive, submit `bluehive_run/exp7-train.sbatch`; arguments after the script name are passed to the command, and resubmitting continues the current stage.
 
 Running the same command again continues: the frozen modes are loaded from `modes/`, and an interrupted stage continues at its last evaluation with its best weights and its count of evaluations without a new best. The sampler is reseeded from `--seed` and the global step, so a continued run draws other pairs. Between runs of one directory:
 

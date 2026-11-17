@@ -22,7 +22,10 @@ export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"
 #   sbatch bluehive_run/exp7-train.sbatch --subnet roberta --modes 1
 #   sbatch bluehive_run/exp7-train.sbatch --subnet scratch --modes 8
 # --subnet roberta needs models/roberta-base on the cluster
-# (uv run python scripts/download_models.py --models roberta, once).
+# (uv run python scripts/download_models.py --models roberta, once). A smaller pretrained
+# model is its own run (train-minilmv2-l6-h384), after --models minilm:
+#   sbatch bluehive_run/exp7-train.sbatch --subnet roberta \
+#     --roberta-path models/minilmv2-l6-h384 --modes 1
 # Needs the exp4 tables (exp4-inference.sbatch) and a sample store with published blocks,
 # or a producer running at the same time (sample-store-produce.sbatch).
 exec .venv/bin/python -u -m experiments.exp7_independent_subnets train "$@"

@@ -143,7 +143,7 @@ exp7 改成分阶段冻结，原因有两个：所有子网络同时带梯度放
    这等于 `experiments.exp5_gpt2_mlp_table.loss.paired_loss` 在 `neigs=1` 时的值。复用它时需要一个 `NestedLoRA(neigs=1)` 实例提供掩码，并把 `f` 变形为 `(B, 1)`、`g` 变形为 `(B·top_k, 1)`。
 5. 只更新当前模式的参数。
 
-每个阶段新建优化器（Adam）。预训练的两种（`roberta`、`gpt2`）的编码器用 `--encoder-lr`（默认 2e-5），头用 `--lr`（默认 3e-4）；`scratch` 的全部参数用 `--lr`，带 1000 步线性 warmup（warmup 是我的决定）。
+每个阶段新建优化器（Adam）。预训练的两种（`roberta`、`gpt2`）的编码器用 `--encoder-lr`（默认 2e-5），头用 `--lr`（默认 3e-4）；`scratch` 的全部参数用 `--lr`，带 1000 步线性 warmup（warmup 是我的决定）。`--lr` 的默认值随种类而定：`scratch` 是 1e-4，其余是 3e-4（2026-11-17 修订：在 256 × 1600 的有限表上，`scratch` 用 3e-4 时左编码器在 1500–2000 步后对所有 history 输出同一个向量，三次运行三次如此，加梯度裁剪也一样；1e-4 三次都没有出现）。每次评估检查两个编码器的输出是否还随输入变化，不变时打印 `WARNING`，训练不中断。
 
 ### 什么时候冻结
 
@@ -176,7 +176,7 @@ exp7 改成分阶段冻结，原因有两个：所有子网络同时带梯度放
 
 ### 输出
 
-`data/experiment_results/exp7_independent_subnets/<dataset>__<model>/train-<subnet>/` 下：
+`data/experiment_results/exp7_independent_subnets/<dataset>__<model>/train-<名字>/` 下。`scratch` 和 `gpt2` 的名字就是种类名；`roberta` 的名字是 `--roberta-path` 的目录名（`train-roberta-base`、`train-minilmv2-l6-h384`），这样不同的预训练模型各有自己的目录（2026-11-17 修订：用户要求再跑一个更小的预训练模型 MiniLMv2 L6-H384，约 3000 万参数，与 `scratch` 同样大小，词表与 RoBERTa-base 相同）：
 
 - `eval_history.jsonl`：每次评估一行，字段 `step`（全局步数）、`stage`、`stage_step`、`train_loss`、`kernel_energy`（`target` 的均方）、`residual_energy`（`r` 的均方）、`seconds_per_step`、`selection`、`report`。
 - `stages.jsonl`：每个结束的阶段一行，字段 `stage`、`steps`、`best_step`、结束原因、选择指标的最好值、未对齐与对齐后的 `selection`/`report` 比较、上面的非对角元诊断。

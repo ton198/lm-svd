@@ -13,7 +13,7 @@ from experiments.exp4_table_neural_svd.cli import positive_float
 from experiments.exp5_gpt2_mlp_table.cli import DEFAULT_STORE_DIR
 from utils.experiment_paths import INFERENCE_DIR, add_run_arguments, run_dir
 
-from . import EXPERIMENT, SUBNETS, WARMUP_STEPS
+from . import DEFAULT_LR, EXPERIMENT, SUBNETS, WARMUP_STEPS
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -39,8 +39,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     train_parser.add_argument(
         "--roberta-path", type=Path, default=Path("models/roberta-base"),
-        help="Local pretrained RoBERTa of --subnet roberta "
-             "(scripts/download_models.py --models roberta); a continued run must repeat it",
+        help="Local pretrained model of --subnet roberta: RoBERTa-base, or another model "
+             "with RoBERTa's structure and vocabulary such as models/minilmv2-l6-h384 "
+             "(scripts/download_models.py --models roberta minilm). Its directory name is "
+             "the name of the run's directory; a continued run must repeat it",
     )
     train_parser.add_argument(
         "--modes", type=positive_int, default=8,
@@ -72,9 +74,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     train_parser.add_argument("--eval-every", type=positive_int, default=1000)
     train_parser.add_argument(
-        "--lr", type=positive_float, default=3e-4,
+        # Absent unless given: the default depends on --subnet.
+        "--lr", type=positive_float, default=argparse.SUPPRESS,
         help="Learning rate of the heads of a roberta or gpt2 mode, and of all of a scratch "
-             f"mode after a linear warmup over the first {WARMUP_STEPS} steps of its stage",
+             f"mode after a linear warmup over the first {WARMUP_STEPS} steps of its stage "
+             "(default: " + ", ".join(f"{rate:g} for {kind}" for kind, rate in DEFAULT_LR.items())
+             + ")",
     )
     train_parser.add_argument(
         "--encoder-lr", type=positive_float, default=2e-5,
@@ -96,6 +101,14 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(
             f"--min-stage-steps ({args.min_stage_steps}) must not exceed "
             f"--stage-steps ({args.stage_steps})")
+    # A roberta run is named after its pretrained model, so that two of them do not share
+    # a directory; the other kinds do not read --roberta-path.
+    run_name = args.roberta_path.name if args.subnet == "roberta" else args.subnet
+    other_kinds = [kind for kind in SUBNETS if kind != args.subnet]
+    if args.subnet == "roberta" and (not run_name or run_name in other_kinds):
+        parser.error(
+            f"--roberta-path {args.roberta_path} would give the run directory "
+            f"train-{run_name}, which belongs to another kind; rename the model directory")
     try:
         from .train import train_exp7
 
@@ -107,7 +120,7 @@ def main(argv: list[str] | None = None) -> None:
             store_dir=args.store_dir,
             model_path=args.model_path,
             output_dir=run_dir(args.results_root, EXPERIMENT, args.dataset, model_label)
-            / f"train-{args.subnet}",
+            / f"train-{run_name}",
             device=args.device,
             subnet=args.subnet,
             modes=args.modes,
@@ -120,7 +133,7 @@ def main(argv: list[str] | None = None) -> None:
             scratch_heads=args.scratch_heads,
             batch_size=args.batch_size,
             eval_every=args.eval_every,
-            lr=args.lr,
+            lr=getattr(args, "lr", DEFAULT_LR[args.subnet]),
             encoder_lr=args.encoder_lr,
             seed=args.seed,
             overwrite=args.overwrite,

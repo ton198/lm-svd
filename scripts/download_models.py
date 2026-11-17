@@ -23,6 +23,16 @@ ROBERTA_FILES = (
     "vocab.json",
     "merges.txt",
 )
+# A 6-layer, 384-wide model distilled from RoBERTa-Large; its repository has no safetensors.
+MINILM_FILES = (
+    "config.json",
+    "pytorch_model.bin",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+)
 MODELS = {
     "small": (
         "openai-community/gpt2",
@@ -49,6 +59,13 @@ MODELS = {
         "roberta-base",
         ROBERTA_FILES,
     ),
+    # A smaller pretrained model for exp7's --subnet roberta; downloaded only when named.
+    "minilm": (
+        "nreimers/MiniLMv2-L6-H384-distilled-from-RoBERTa-Large",
+        "a61886e95cedc4cd2440f71cf9a55320ee1d8e06",
+        "minilmv2-l6-h384",
+        MINILM_FILES,
+    ),
 }
 DEFAULT_MODELS = ["small", "medium", "large"]
 
@@ -60,7 +77,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--models", nargs="+", choices=tuple(MODELS), default=DEFAULT_MODELS,
-        help="Models to download; roberta (RoBERTa-base, for exp7) only when named",
+        help="Models to download; roberta (RoBERTa-base) and minilm (MiniLMv2 L6-H384), "
+             "both for exp7, only when named",
     )
     parser.add_argument(
         "--output-dir", type=Path,
