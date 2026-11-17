@@ -71,9 +71,13 @@ def alignment(
 
 
 def max_correlation(gram: torch.Tensor) -> float:
-    """Largest absolute off-diagonal entry of the gram matrix as a correlation."""
+    """Largest absolute off-diagonal entry of the gram matrix as a correlation.
+
+    A mode of zero scale (a zero diagonal entry) has correlation 0 with every other.
+    """
     if gram.shape[0] < 2:
         return 0.0
     scale = gram.diagonal().sqrt()
-    corr = (gram / torch.outer(scale, scale)).abs()
+    outer = torch.outer(scale, scale)
+    corr = torch.where(outer > 0, gram.abs() / outer.where(outer > 0, 1.0), 0.0)
     return corr.fill_diagonal_(0.0).max().item()

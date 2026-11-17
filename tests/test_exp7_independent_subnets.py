@@ -1,11 +1,32 @@
+import contextlib
+import io
+import json
+import math
+import shutil
 import unittest
+from unittest.mock import patch
 
+import numpy as np
 import torch
 
+from experiments.exp4_table_neural_svd.train import compare_with_exact_svd
+from experiments.exp5_gpt2_mlp_table.features import (
+    future_only_logits,
+    header_tokens,
+    last_hidden,
+    pair_targets,
+)
 from experiments.exp5_gpt2_mlp_table.loss import paired_loss
+from experiments.exp5_gpt2_mlp_table.tables import load_eval_table
 from experiments.exp7_independent_subnets.align import Moments, alignment, max_correlation
 from experiments.exp7_independent_subnets.model import build_mode, token_vectors
 from experiments.exp7_independent_subnets.stage import Selection, residual_target, stage_loss
+from experiments.exp7_independent_subnets.train import (
+    mode_table_features,
+    selection_energy,
+    train_exp7,
+    train_step,
+)
 from utils.nestedlora import NestedLoRA
 from test_exp5_gpt2_mlp_table import FUTURES, HISTORIES, TOP_K, VOCAB, Exp5Fixture
 
@@ -282,3 +303,329 @@ class AlignmentTests(unittest.TestCase):
         self.assertEqual(max_correlation(torch.tensor([[4.0]])), 0.0)
         self.assertAlmostEqual(
             max_correlation(torch.tensor([[4.0, -1.0], [-1.0, 1.0]])), 0.5)
+
+    def test_a_zero_mode_has_correlation_zero(self):
+        self.assertEqual(max_correlation(torch.tensor([[0.0, 0.0], [0.0, 1.0]])), 0.0)
+        gram = torch.tensor([[4.0, 0.0, -1.0], [0.0, 0.0, 0.0], [-1.0, 0.0, 1.0]])
+        self.assertAlmostEqual(max_correlation(gram), 0.5)
+
+
+class TrainingTests(Exp5Fixture):
+    def train(self, output_dir, **changes):
+        options = dict(
+            inference_dir=self.inference_dir, store_dir=self.store_dir,
+            model_path=self.model_path, output_dir=output_dir, device="cpu", subnet="gpt2",
+            modes=2, stage_steps=4, min_stage_steps=0, patience=0, align_pairs=32,
+            **SCRATCH, batch_size=8, eval_every=2, lr=1e-2, encoder_lr=1e-3, seed=0,
+            overwrite=False,
+        )
+        options.update(changes)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            summary = train_exp7(**options)
+        self.log = output.getvalue()
+        return summary
+
+    def records(self, output_dir):
+        lines = (output_dir / "eval_history.jsonl").read_text().splitlines()
+        return [json.loads(line) for line in lines]
+
+    def stages(self, output_dir):
+        lines = (output_dir / "stages.jsonl").read_text().splitlines()
+        return [json.loads(line) for line in lines]
+
+    def vectors(self):
+        return token_vectors(self.inference.model.get_output_embeddings().weight)
+
+    def load_mode(self, path, subnet="gpt2"):
+        mode = build_mode(self.inference, subnet, **SCRATCH)
+        mode.load_state_dict(torch.load(path, weights_only=True)["state_dict"])
+        return mode
+
+    def batch(self):
+        histories, futures = torch.tensor(HISTORIES[:5]), torch.tensor(FUTURES)
+        future_hidden = last_hidden(self.inference, futures)
+        header_ids, g = header_tokens(future_only_logits(self.inference, future_hidden), TOP_K)
+        pair_logits = self.inference.next_token_logits_batch(
+            torch.cat([histories, futures], dim=1).tolist())
+        return histories, futures, header_ids, pair_targets(pair_logits, header_ids, g)
+
+    def test_train_step_updates_only_the_current_mode(self):
+        histories, futures, header_ids, target = self.batch()
+        vectors = self.vectors()
+        for subnet in SUBNETS:
+            with self.subTest(subnet=subnet):
+                frozen = [build_mode(self.inference, subnet, **SCRATCH) for _ in range(2)]
+                for mode in frozen:
+                    mode.requires_grad_(False).eval()
+                current = build_mode(self.inference, subnet, **SCRATCH)
+                frozen_before = [
+                    {name: p.detach().clone() for name, p in mode.named_parameters()}
+                    for mode in frozen]
+                current_before = {
+                    name: p.detach().clone() for name, p in current.named_parameters()}
+                optimizer = torch.optim.Adam(current.parameters(), lr=1e-2)
+                loss, residual_energy = train_step(
+                    current, frozen, vectors, optimizer, histories, futures, header_ids, target)
+                self.assertTrue(math.isfinite(loss))
+                for mode, before in zip(frozen, frozen_before):
+                    for name, parameter in mode.named_parameters():
+                        self.assertTrue(torch.equal(parameter, before[name]), name)
+                        self.assertIsNone(parameter.grad, name)
+                for part in ("left_encoder", "right_encoder", "left_head", "right_head"):
+                    self.assertTrue(any(
+                        not torch.equal(p, current_before[f"{part}.{name}"])
+                        for name, p in getattr(current, part).named_parameters()), part)
+                with torch.no_grad():
+                    frozen_left = torch.stack([m.left_features(histories) for m in frozen], 1)
+                    frozen_right = torch.stack(
+                        [m.right_features(futures, header_ids, vectors) for m in frozen], 2)
+                expected = residual_target(target, frozen_left, frozen_right).square().mean()
+                self.assertAlmostEqual(residual_energy, expected.item(), places=6)
+                with self.assertRaisesRegex(RuntimeError, "non-finite"):
+                    train_step(current, frozen, vectors, optimizer, histories, futures,
+                               header_ids, torch.full_like(target, float("nan")))
+
+    def test_writes_outputs_for_two_stages(self):
+        output = self.root / "exp7-outputs"
+        summary = self.train(output)
+        self.assertEqual(
+            summary, {"output_dir": str(output), "step": 8, "modes": 2, "evaluations": 4})
+        records = self.records(output)
+        self.assertEqual([(r["stage"], r["stage_step"], r["step"]) for r in records],
+                         [(1, 2, 2), (1, 4, 4), (2, 2, 6), (2, 4, 8)])
+        self.assertEqual(set(records[0]), {
+            "step", "stage", "stage_step", "train_loss", "kernel_energy", "residual_energy",
+            "seconds_per_step", "selection", "report"})
+        self.assertEqual([r["selection"]["ranks"] for r in records], [[1], [1], [1, 2], [1, 2]])
+        # Stage 1 trains on the target itself.
+        self.assertAlmostEqual(records[0]["residual_energy"], records[0]["kernel_energy"], places=6)
+        stages = self.stages(output)
+        self.assertEqual([(s["stage"], s["steps"], s["best_step"], s["reason"]) for s in stages],
+                         [(1, 4, 4, "steps"), (2, 4, 4, "steps")])
+        self.assertEqual(set(stages[1]), {
+            "stage", "steps", "best_step", "reason", "selection_energy", "selection", "report",
+            "aligned", "singular_values", "left_correlation", "right_correlation"})
+        self.assertEqual(set(stages[1]["aligned"]), {"selection", "report"})
+        self.assertEqual(stages[1]["aligned"]["selection"]["ranks"], [1, 2])
+        self.assertEqual(len(stages[1]["singular_values"]), 2)
+        # With patience 0 the frozen weights are the last ones, so the stage line repeats
+        # the stage's last evaluation.
+        self.assertEqual(stages[1]["selection"], records[-1]["selection"])
+        self.assertEqual(stages[1]["selection_energy"], selection_energy(records[-1]))
+        for stage in stages:
+            for key in ("left_correlation", "right_correlation"):
+                self.assertTrue(0.0 <= stage[key] <= 1.0 + 1e-9)
+        self.assertEqual(sorted(path.name for path in output.iterdir()), [
+            "alignment.pt", "checkpoint.pt", "eval_history.jsonl", "metadata.json", "modes",
+            "stages.jsonl"])
+        self.assertEqual(
+            sorted(path.name for path in (output / "modes").iterdir()),
+            ["mode-01.pt", "mode-02.pt"])
+        mode_file = torch.load(output / "modes" / "mode-02.pt", weights_only=True)
+        self.assertEqual((mode_file["stage"], mode_file["best_step"]), (2, 4))
+        self.assertEqual(
+            set(mode_file["state_dict"]),
+            set(build_mode(self.inference, "gpt2", **SCRATCH).state_dict()))
+        aligned = torch.load(output / "alignment.pt", weights_only=True)
+        self.assertEqual(aligned["T_f"].shape, (2, 2))
+        self.assertEqual(aligned["T_g"].shape, (2, 2))
+        self.assertEqual(aligned["modes"], 2)
+        self.assertEqual(aligned["S"].tolist(), stages[1]["singular_values"])
+        checkpoint = torch.load(output / "checkpoint.pt", weights_only=True)
+        self.assertEqual(
+            set(checkpoint), {"config", "completed_modes", "step", "history", "stage"})
+        self.assertEqual(
+            (checkpoint["completed_modes"], checkpoint["step"], checkpoint["stage"]), (2, 8, None))
+        self.assertEqual(checkpoint["history"], records)
+        for key in ("modes", "device", "overwrite", "encode_batch", "eval_chunk"):
+            self.assertNotIn(key, checkpoint["config"])
+        self.assertEqual(
+            (checkpoint["config"]["subnet"], checkpoint["config"]["stage_steps"]), ("gpt2", 4))
+        metadata = json.loads((output / "metadata.json").read_text())
+        self.assertEqual(metadata["table_shapes"], {"selection": [4, 9], "report": [2, 6]})
+        self.assertEqual(metadata["ranks"], "1..l at stage l")
+        self.assertEqual(
+            {key: metadata["tables"][key]["exp4_table"] for key in ("selection", "report")},
+            {"selection": "train", "report": "val"})
+        self.assertEqual(metadata["top_k"], TOP_K)
+        self.assertEqual(
+            metadata["trainable_parameters"],
+            sum(p.numel() for p in build_mode(self.inference, "gpt2", **SCRATCH).parameters()))
+        # No file holds the teacher's token vectors or the frozen model.
+        vectors = self.vectors()
+        teacher = set(self.inference.model.state_dict())
+        for path in [*output.glob("*.pt"), *(output / "modes").glob("*.pt")]:
+            stored = torch.load(path, weights_only=True)
+            tensors = [stored] if isinstance(stored, torch.Tensor) else []
+            pending = [stored]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, dict):
+                    self.assertFalse(teacher & set(value), path)
+                    self.assertFalse(any("vectors" in str(key) for key in value), path)
+                    pending.extend(value.values())
+                elif isinstance(value, (list, tuple)):
+                    pending.extend(value)
+                elif isinstance(value, torch.Tensor):
+                    tensors.append(value)
+            for tensor in tensors:
+                self.assertFalse(
+                    tensor.shape == vectors.shape and torch.allclose(tensor, vectors), path)
+        self.assertIn("stage 1", self.log)
+        self.assertIn("stage 2 finished", self.log)
+
+    def test_selection_table_is_exp4_train_and_report_table_is_exp4_val(self):
+        output = self.root / "exp7-tables"
+        self.train(output)
+        record = self.records(output)[-1]
+        modes = [self.load_mode(output / "modes" / f"mode-0{stage}.pt") for stage in (1, 2)]
+        vectors = self.vectors()
+        for exp4_name, key in (("train", "selection"), ("val", "report")):
+            table = load_eval_table(self.inference_dir / exp4_name, self.inference, "cpu")
+            features = [mode_table_features(mode, table, vectors, chunk=2) for mode in modes]
+            left = torch.stack([f[0] for f in features], dim=1)
+            right = torch.stack([f[1] for f in features], dim=1)
+            self.assertEqual((left.dtype, right.dtype), (torch.float64, torch.float64))
+            self.assertEqual(
+                (left.shape, right.shape), ((len(table.table.histories), 2),
+                                            (len(table.table.columns), 2)))
+            expected = compare_with_exact_svd(left, right, table.table, ranks=(1, 2))
+            self.assertEqual(set(expected), set(record[key]))
+            for name, values in expected.items():
+                # chunk 2 here and 256 in the run: equal up to float32 rounding.
+                np.testing.assert_allclose(record[key][name], values, rtol=1e-6, atol=1e-6)
+
+    def test_mode_table_features_follow_the_column_order(self):
+        table = load_eval_table(self.inference_dir / "train", self.inference, "cpu")
+        mode = build_mode(self.inference, "gpt2", **SCRATCH)
+        vectors = self.vectors()
+        left, right = mode_table_features(mode, table, vectors, chunk=2)
+        self.assertFalse(mode.training)
+        futures = table.future_ids
+        with torch.no_grad():
+            expected_left = mode.left_features(table.table.histories)
+            for column, tokens in enumerate(table.table.columns):
+                f, j = divmod(column, TOP_K)
+                self.assertTrue(torch.equal(tokens[:-1], futures[f]))
+                expected = mode.right_features(futures[f:f + 1], tokens[None, -1:], vectors)
+                self.assertAlmostEqual(right[column].item(), expected.item(), places=5)
+        torch.testing.assert_close(left.float(), expected_left, atol=1e-6, rtol=0)
+
+    def test_third_stage_selects_on_rank_three(self):
+        output = self.root / "exp7-three"
+        self.train(output, modes=3)
+        records = self.records(output)
+        third = [r for r in records if r["stage"] == 3]
+        self.assertEqual(len(third), 2)
+        for record in third:
+            self.assertEqual(record["selection"]["ranks"], [1, 2, 3])
+            self.assertEqual(selection_energy(record), record["selection"]["captured_energy"][2])
+            # The frozen modes 1 and 2 do not move during stage 3.
+            np.testing.assert_allclose(
+                record["selection"]["captured_energy"][:2],
+                [r for r in records if r["stage"] == 2][-1]["selection"]["captured_energy"],
+                rtol=0, atol=1e-9)
+        # The selection metric follows the mode being trained.
+        self.assertNotEqual(selection_energy(third[0]), selection_energy(third[1]))
+
+    def test_last_step_of_a_stage_is_evaluated(self):
+        output = self.root / "exp7-last-a"
+        self.train(output, modes=1, stage_steps=3, eval_every=2)
+        self.assertEqual([r["stage_step"] for r in self.records(output)], [2, 3])
+        output = self.root / "exp7-last-b"
+        self.train(output, modes=1, stage_steps=3, eval_every=5)
+        self.assertEqual([r["stage_step"] for r in self.records(output)], [3])
+        self.assertEqual(self.stages(output)[0]["steps"], 3)
+
+    def test_patience_freezes_the_best_weights_and_patience_zero_the_last(self):
+        a, b, c = (self.root / f"exp7-patience-{name}" for name in "abc")
+        self.train(a, modes=1, stage_steps=2)
+        self.train(b, modes=1, stage_steps=4)
+        with patch("experiments.exp7_independent_subnets.train.selection_energy",
+                   side_effect=[0.9, 0.1]):
+            summary = self.train(c, modes=1, stage_steps=6, patience=1)
+        self.assertEqual(summary["step"], 4)
+        self.assertEqual([r["stage_step"] for r in self.records(c)], [2, 4])
+        stage = self.stages(c)[0]
+        self.assertEqual(
+            (stage["steps"], stage["best_step"], stage["reason"], stage["selection_energy"]),
+            (4, 2, "patience", 0.9))
+        weights = {
+            name: torch.load(path / "modes" / "mode-01.pt", weights_only=True)
+            for name, path in (("a", a), ("b", b), ("c", c))}
+        self.assertEqual(weights["c"]["best_step"], 2)
+        self.assertEqual(weights["b"]["best_step"], 4)
+        for key, value in weights["a"]["state_dict"].items():
+            self.assertTrue(torch.equal(weights["c"]["state_dict"][key], value), key)
+        self.assertTrue(any(
+            not torch.equal(weights["b"]["state_dict"][key], value)
+            for key, value in weights["a"]["state_dict"].items()))
+
+    def test_scratch_subnet_trains_with_its_own_small_transformers(self):
+        output = self.root / "exp7-scratch"
+        summary = self.train(output, subnet="scratch")
+        self.assertEqual(
+            summary, {"output_dir": str(output), "step": 8, "modes": 2, "evaluations": 4})
+        self.assertEqual([(s["stage"], s["reason"]) for s in self.stages(output)],
+                         [(1, "steps"), (2, "steps")])
+        state = torch.load(output / "modes" / "mode-01.pt", weights_only=True)["state_dict"]
+        for side in ("left_encoder", "right_encoder"):
+            self.assertEqual(state[f"{side}.wte.weight"].shape, (VOCAB, 4))
+            self.assertEqual(state[f"{side}.wpe.weight"].shape[1], 4)
+        self.assertEqual(state["left_head.1.weight"].shape, (1, 4))
+        self.assertEqual(state["right_head.1.weight"].shape, (8, 4))
+        metadata = json.loads((output / "metadata.json").read_text())
+        self.assertEqual(
+            {key: metadata[key] for key in (
+                "subnet", "scratch_layers", "scratch_width", "scratch_heads")},
+            {"subnet": "scratch", "scratch_layers": 1, "scratch_width": 4, "scratch_heads": 2})
+        self.assertIn("linear warmup over the first 1000 steps", self.log)
+
+    def test_two_stages_learn_and_the_second_starts_from_a_smaller_residual(self):
+        output = self.root / "exp7-learns"
+        self.train(output, stage_steps=300, eval_every=100, batch_size=16, align_pairs=256)
+        records = self.records(output)
+        first = [r for r in records if r["stage"] == 1][-1]
+        # An untrained mode scores at or below zero; the exact value is 1.
+        for key in ("selection", "report"):
+            self.assertGreater(first[key]["captured_energy"][0], 0.5, key)
+        second = [r for r in records if r["stage"] == 2]
+        self.assertEqual(len(second), 3)
+        for record in second:
+            self.assertLess(record["residual_energy"], record["kernel_energy"])
+        aligned = self.stages(output)[1]["aligned"]["selection"]
+        self.assertTrue(math.isfinite(aligned["captured_energy"][1]))
+        self.assertLessEqual(
+            aligned["captured_energy"][1], aligned["exact_captured_energy"][1] + 1e-6)
+
+    def test_rejects_missing_tables_a_negative_seed_and_another_store(self):
+        with self.assertRaisesRegex(ValueError, "exp4 inference"):
+            self.train(self.root / "exp7-none", inference_dir=self.root / "absent")
+        with self.assertRaises(ValueError):
+            self.train(self.root / "exp7-seed", seed=-1)
+        store = self.root / "exp7-store-other-model"
+        shutil.copytree(self.store_dir, store)
+        config = json.loads((store / "store.json").read_text())
+        config["model_files"][next(iter(config["model_files"]))]["size"] += 1
+        (store / "store.json").write_text(json.dumps(config))
+        with self.assertRaisesRegex(ValueError, "model"):
+            self.train(self.root / "exp7-other-model", store_dir=store)
+        with self.assertRaisesRegex(ValueError, "subnet"):
+            self.train(self.root / "exp7-subnet", subnet="mlp")
+        for change in ({"modes": 0}, {"stage_steps": 0}, {"eval_every": 0},
+                       {"align_pairs": 0}, {"patience": -1}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.train(self.root / "exp7-bad", **change)
+        self.assertFalse((self.root / "exp7-bad").exists())
+
+    def test_existing_outputs_need_overwrite(self):
+        # Removed in Task 5 when resuming replaces this rule.
+        output = self.root / "exp7-overwrite"
+        self.train(output, modes=2, stage_steps=2)
+        with self.assertRaises(FileExistsError):
+            self.train(output, modes=1, stage_steps=2)
+        summary = self.train(output, modes=1, stage_steps=2, overwrite=True)
+        self.assertEqual(summary["modes"], 1)
+        self.assertEqual(len(self.records(output)), 1)
+        self.assertEqual(len(self.stages(output)), 1)
+        self.assertEqual([path.name for path in (output / "modes").iterdir()], ["mode-01.pt"])
