@@ -14,7 +14,7 @@ Experiments use sampled history/future token sequences but construct different m
 | `exp6` | Same entry and pairs as `exp5`; the right network is bilinear in the header token's unembedding row | no stored matrix; evaluated on the `exp4` tables | — |
 | `exp7` | Same entry and pairs as `exp5`; one independent pair of sub-networks per mode, trained one mode at a time | no stored matrix; evaluated on the `exp4` tables | — |
 
-Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead runs `inference` → `train`: it builds two tables with their exact SVDs, trains NeuralSVD on the training table, and compares the learned modes with both exact SVDs during training. **exp5** has only `train`: it trains two MLPs on frozen GPT-2 hidden states with pairs from the sample store and compares them with the exact SVDs of the exp4 tables. **exp6** also has only `train`: the same pairs and target as exp5, with a trainable copy of GPT-2 on each side and a right side that is bilinear in the header token's unembedding row. **exp7** also has only `train`: the same pairs and target, with its own pair of sub-networks for every mode, trained and frozen one mode at a time.
+Experiments **exp1–exp3** have two subcommands, run in order: `inference` builds the matrix, and `analysis` runs SVD → numerical rank → visualization together with a selectable secondary centering strategy. Once a matrix exists, their analysis does not load a language model. Their analysis defaults to CUDA; use `--device cpu` to run without a GPU. **exp4** instead runs `inference` → `train`: it builds two tables with their exact SVDs, trains NeuralSVD on the training table, and compares the learned modes with both exact SVDs during training. **exp5** has only `train`: it trains two MLPs on frozen GPT-2 hidden states with pairs from the sample store and compares them with the exact SVDs of the exp4 tables. **exp6** also has only `train`: the same pairs and target as exp5, with a trainable copy of GPT-2 on each side and a right side that is bilinear in the header token's unembedding row. **exp7** also has only `train`: the same pairs and target, with its own pair of sub-networks for every mode, trained and frozen one mode at a time, or with `--joint` all at once.
 
 ## Navigation
 
@@ -786,6 +786,24 @@ Things to keep in mind when reading a centered run:
 - **A shift shared by the 50 header tokens of a future is still in the target** when it depends on the history: 0.40 of the centered energy on the selection table.
 
 On BlueHive: `sbatch -J <name> bluehive_run/exp7-center.sbatch <exp7 arguments>`.
+
+### All modes at once (`--joint`)
+
+`train --joint` keeps exp7's network and drops the stages: all `--modes` sub-network pairs are trained in every step, no mode is frozen, and no gradient is stopped. It answers whether the staged run is held back by freezing a mode before the next one starts.
+
+```bash
+uv run exp7 train --joint --subnet roberta --roberta-path models/minilmv2-l6-h384 \
+  --modes 8 --steps 100000 --lr 3e-5 --encoder-lr 3e-5 \
+  --center-pool data/center_pools/wikitext-103-train__gpt2-small__h64-f32__m64
+```
+
+- **Loss.** Joint nesting, exp5's loss: the mean over the ranks `k = 1..modes` of the rank-`k` loss of the first `k` modes. Mode `l` is part of the ranks `l..modes`, so it also gets gradient from every later mode; in the staged run it sees the earlier modes as a fixed residual and the later ones never.
+- **Network.** The staged run's modes with the staged run's first weights: mode `l` is seeded as stage `l` seeds it. The learning rates are the same too; a scratch run warms up once, over the first 1000 steps of the run.
+- **Pairs.** Made in the step as in exp5, so no sample store is read: with `--center-pool` a pool future behind a fresh history window, without it fresh windows of `--stream-path` and the target minus `g`.
+- **Evaluation.** Every `--eval-every` steps all modes are compared with the exact SVD of both tables at ranks `1..modes`. No table selects anything and there is no alignment; the last weights are the result. `--stage-steps`, `--min-stage-steps`, `--patience`, `--align-pairs` and `--store-dir` are not used.
+- **Outputs.** `train-<name>[-center<histories>]-joint/` with `eval_history.jsonl`, `metadata.json`, `checkpoint.pt` (all modes and the optimizer, rewritten at every evaluation) and, when the run reaches `--steps`, `modes/mode-XX.pt`. The same command continues an interrupted run from its last evaluation, and a larger `--steps` continues a finished one; `--modes` is a setting of the run and cannot grow.
+
+All modes and their optimizer state are on the GPU at once: eight MiniLM pairs are about 0.5 billion parameters.
 
 ### Resources (estimated, not measured)
 

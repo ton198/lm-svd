@@ -1,4 +1,5 @@
-"""Command line of exp7: `train`, which trains the modes one stage at a time.
+"""Command line of exp7: `train`, which trains the modes one stage at a time or,
+with --joint, all at once; `center-pool`, which builds the center of a centered run.
 
 Imports stay light; the training code is imported after the arguments are parsed.
 """
@@ -89,6 +90,23 @@ def main(argv: list[str] | None = None) -> None:
         help="Modes to have when the run ends; a finished run continues with a larger value",
     )
     train_parser.add_argument(
+        "--joint", action="store_true",
+        help="Train all --modes modes at once instead of one stage per mode: no mode is "
+             "frozen and none is detached, the loss is the mean over the ranks 1..modes of "
+             "the rank-k loss (joint nesting, as in exp5). The pairs are made in the step, "
+             "so --store-dir is not read; --stage-steps, --min-stage-steps, --patience and "
+             "--align-pairs are not used, and --modes cannot grow later. The run directory "
+             "gets the suffix -joint",
+    )
+    train_parser.add_argument(
+        "--steps", type=positive_int, default=100000,
+        help="Steps of a --joint run; a finished run continues with a larger value",
+    )
+    train_parser.add_argument(
+        "--stream-path", type=Path, default=DEFAULT_STREAM,
+        help="Token stream a --joint run without --center-pool draws its pairs from",
+    )
+    train_parser.add_argument(
         "--stage-steps", type=positive_int, default=30000,
         help="Most steps of one stage",
     )
@@ -166,22 +184,19 @@ def main(argv: list[str] | None = None) -> None:
             from .center import read_pool_config
 
             run_name += f"-center{read_pool_config(args.center_pool)['histories']}"
+        if args.joint:
+            run_name += "-joint"
         model_label = args.model_path.name
-        summary = train_exp7(
+        shared = dict(
             inference_dir=run_dir(
                 args.results_root, TABLES_EXPERIMENT, args.dataset, model_label
             ) / INFERENCE_DIR,
-            store_dir=args.store_dir,
             model_path=args.model_path,
             output_dir=run_dir(args.results_root, EXPERIMENT, args.dataset, model_label)
             / f"train-{run_name}",
             device=args.device,
             subnet=args.subnet,
             modes=args.modes,
-            stage_steps=args.stage_steps,
-            min_stage_steps=args.min_stage_steps,
-            patience=args.patience,
-            align_pairs=args.align_pairs,
             scratch_layers=args.scratch_layers,
             scratch_width=args.scratch_width,
             scratch_heads=args.scratch_heads,
@@ -194,6 +209,20 @@ def main(argv: list[str] | None = None) -> None:
             roberta_path=args.roberta_path,
             center_pool=args.center_pool,
         )
+        if args.joint:
+            from .joint import train_exp7_joint
+
+            summary = train_exp7_joint(
+                stream_path=args.stream_path, steps=args.steps, **shared)
+        else:
+            summary = train_exp7(
+                store_dir=args.store_dir,
+                stage_steps=args.stage_steps,
+                min_stage_steps=args.min_stage_steps,
+                patience=args.patience,
+                align_pairs=args.align_pairs,
+                **shared,
+            )
     except (ValueError, FileExistsError) as error:
         parser.error(str(error))
     print(
