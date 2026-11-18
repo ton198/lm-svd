@@ -161,7 +161,7 @@ class NetworkTests(Exp5Fixture):
 class TrainingTests(Exp5Fixture):
     def train(self, output_dir, **changes):
         options = dict(
-            inference_dir=self.inference_dir, store_dir=self.store_dir,
+            inference_dir=self.inference_dir, stream_path=self.stream_path,
             model_path=self.model_path, output_dir=output_dir, device="cpu", neigs=2,
             head_rank=4, batch_size=8, steps=4, eval_every=2, lr=1e-2, encoder_lr=1e-3,
             seed=0, overwrite=False,
@@ -193,6 +193,8 @@ class TrainingTests(Exp5Fixture):
         self.assertEqual(metadata["top_k"], TOP_K)
         self.assertEqual(metadata["table_shapes"], {"train": [4, 9], "val": [2, 6]})
         self.assertIn("head_rank", metadata["right_features"])
+        self.assertEqual(metadata["stream_path"], str(self.stream_path))
+        self.assertNotIn("store", metadata)
         heads = (HIDDEN * 2 + 2) + (HIDDEN * 2 * 4 + 2 * 4) + 4 * HIDDEN
         self.assertEqual(
             metadata["trainable_parameters"],
@@ -234,18 +236,13 @@ class TrainingTests(Exp5Fixture):
                 self.train(output, steps=6, **change)
         self.assertEqual(self.train(output, steps=2, head_rank=3, overwrite=True)["step"], 2)
 
-    def test_rejects_missing_tables_a_negative_seed_and_another_store(self):
+    def test_rejects_missing_tables_a_negative_seed_and_a_missing_stream(self):
         with self.assertRaisesRegex(ValueError, "exp4 inference"):
             self.train(self.root / "exp6-none", inference_dir=self.root / "absent")
         with self.assertRaises(ValueError):
             self.train(self.root / "exp6-seed", seed=-1)
-        store = self.root / "exp6-store-other-model"
-        shutil.copytree(self.store_dir, store)
-        config = json.loads((store / "store.json").read_text())
-        config["model_files"][next(iter(config["model_files"]))]["size"] += 1
-        (store / "store.json").write_text(json.dumps(config))
-        with self.assertRaisesRegex(ValueError, "model"):
-            self.train(self.root / "exp6-other-model", store_dir=store)
+        with self.assertRaisesRegex(ValueError, "no token stream"):
+            self.train(self.root / "exp6-no-stream", stream_path=self.root / "absent.npy")
 
     def test_table_features_read_histories_and_columns(self):
         loaded = load_eval_table(self.inference_dir / "train", self.inference, "cpu")
@@ -273,7 +270,7 @@ class CLITests(Exp5Fixture):
         )
         arguments = [
             "train", "--results-root", str(results_root), "--dataset", "tiny",
-            "--model-path", str(self.model_path), "--store-dir", str(self.store_dir),
+            "--model-path", str(self.model_path), "--stream-path", str(self.stream_path),
             "--device", "cpu", "--neigs", "2", "--head-rank", "4", "--batch-size", "8",
             "--steps", "2", "--eval-every", "2",
         ]
@@ -303,8 +300,7 @@ class CLITests(Exp5Fixture):
              "overwrite": False})
         self.assertEqual(options["model_path"], Path("models/gpt2-small"))
         self.assertEqual(
-            options["store_dir"],
-            Path("data/sample_stores/wikitext-103-train__gpt2-small__h64-f32"))
+            options["stream_path"], Path("data/token_streams/wikitext-103-train.npy"))
         self.assertEqual(options["inference_dir"], Path(
             "data/experiment_results/exp4_table_neural_svd/wikitext-large__gpt2-small/inference"))
         self.assertEqual(options["output_dir"], Path(

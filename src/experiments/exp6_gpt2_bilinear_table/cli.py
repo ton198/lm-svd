@@ -4,7 +4,7 @@ from pathlib import Path
 from data_pipline.cli import positive_int
 from experiments.exp4_table_neural_svd.cli import EXPERIMENT as TABLES_EXPERIMENT
 from experiments.exp4_table_neural_svd.cli import positive_float
-from experiments.exp5_gpt2_mlp_table.cli import DEFAULT_STORE_DIR
+from experiments.exp5_gpt2_mlp_table.cli import DEFAULT_STREAM
 from utils.experiment_paths import INFERENCE_DIR, add_run_arguments, run_dir
 
 from . import EXPERIMENT, TRAIN_DIR
@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> None:
     train_parser = subparsers.add_parser(
         "train",
         help="Train two copies of GPT-2, the right one bilinear in the header token's "
-             "unembedding row, with sample-store pairs and compare with the exact SVDs "
+             "unembedding row, with pairs made in the step and compare with the exact SVDs "
              "of the exp4 tables",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -45,8 +45,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument(
-        "--store-dir", type=Path, default=DEFAULT_STORE_DIR,
-        help="Sample store to draw training pairs from; it must come from --model-path",
+        "--stream-path", type=Path, default=DEFAULT_STREAM,
+        help="Token stream whose windows are the training histories and futures; the "
+             "frozen model computes each pair's entries in the step",
     )
     add_run_arguments(train_parser)
     # The evaluation tables are exp4's, which are built from this sample set.
@@ -63,7 +64,7 @@ def main(argv: list[str] | None = None) -> None:
             inference_dir=run_dir(
                 args.results_root, TABLES_EXPERIMENT, args.dataset, model_label
             ) / INFERENCE_DIR,
-            store_dir=args.store_dir,
+            stream_path=args.stream_path,
             model_path=args.model_path,
             output_dir=run_dir(args.results_root, EXPERIMENT, args.dataset, model_label)
             / TRAIN_DIR,

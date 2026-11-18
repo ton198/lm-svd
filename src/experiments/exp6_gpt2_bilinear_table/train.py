@@ -1,4 +1,4 @@
-"""Train exp6 on sample-store pairs and compare it with the exact SVDs.
+"""Train exp6 on pairs made in the step and compare it with the exact SVDs.
 
 The pairs, the target (the table entry minus g), the loss, the evaluation
 tables and the comparison are exp5's; see experiments.exp5_gpt2_mlp_table.train.
@@ -15,9 +15,8 @@ import torch
 
 from experiments.exp5_gpt2_mlp_table.tables import token_features
 from experiments.exp5_gpt2_mlp_table.train import (
-    FIRST_MODE,
-    prepare_run,
-    run_metadata,
+    fresh_metadata,
+    prepare_fresh_run,
     run_training,
 )
 
@@ -27,7 +26,7 @@ from .model import build_model
 def train_exp6(
     *,
     inference_dir: Path,
-    store_dir: Path,
+    stream_path: Path,
     model_path: Path,
     output_dir: Path,
     device: str,
@@ -43,22 +42,21 @@ def train_exp6(
     encode_batch: int = 1024,
     eval_chunk: int = 256,
 ) -> dict:
-    """Train on store pairs; every eval_every steps compare both exp4 tables.
+    """Train on fresh stream pairs; every eval_every steps compare both exp4 tables.
 
     Writes the same files as exp5 to output_dir and continues an existing
     checkpoint with the same settings up to `steps`; pass overwrite to start
     again. The heads and the projection of the unembedding rows use lr, the two
     encoders use encoder_lr. head_rank is d, the width of that projection.
     """
-    inference, tables, top_k, store_config = prepare_run(
-        inference_dir=inference_dir, store_dir=store_dir, model_path=model_path,
+    inference, tables, top_k, source = prepare_fresh_run(
+        inference_dir=inference_dir, stream_path=stream_path, model_path=model_path,
         device=device, seed=seed, encode_batch=encode_batch,
     )
     config = {
-        "inference_dir": str(inference_dir), "store_dir": str(store_dir),
-        "model_path": str(model_path), "neigs": neigs, "head_rank": head_rank,
-        "batch_size": batch_size, "lr": lr, "encoder_lr": encoder_lr, "seed": seed,
-        "optimizer": "Adam", "first_mode": FIRST_MODE,
+        "inference_dir": str(inference_dir), "model_path": str(model_path),
+        "neigs": neigs, "head_rank": head_rank, "batch_size": batch_size, "lr": lr,
+        "encoder_lr": encoder_lr, "seed": seed, "optimizer": "Adam", **source.config,
     }
 
     torch.manual_seed(seed)
@@ -73,8 +71,7 @@ def train_exp6(
     return run_training(
         model=model,
         optimizer=optimizer,
-        forward=lambda histories, futures, future_hidden, header_ids: model(
-            histories.to(device), futures.to(device), header_ids),
+        forward=lambda histories, futures, header_ids: model(histories, futures, header_ids),
         features=lambda table: token_features(model, table, eval_chunk),
         config=config,
         metadata={
@@ -89,13 +86,11 @@ def train_exp6(
                               "model's unembedding row of the header token minus the mean "
                               "row, over the root mean square of all entries; P is a "
                               "trained head_rank x hidden projection",
-            **run_metadata(
-                device=device, top_k=top_k, tables=tables, model=model,
-                store_config=store_config,
-            ),
+            **fresh_metadata(
+                device=device, top_k=top_k, tables=tables, model=model, source=source),
         },
         description=f"rank {neigs}, bilinear right side with head rank {head_rank}",
-        inference=inference, tables=tables, top_k=top_k, store_dir=store_dir,
-        output_dir=output_dir, device=device, batch_size=batch_size, steps=steps,
-        eval_every=eval_every, seed=seed, overwrite=overwrite, encode_batch=encode_batch,
+        tables=tables, top_k=top_k, source=source, output_dir=output_dir, device=device,
+        batch_size=batch_size, steps=steps, eval_every=eval_every, seed=seed,
+        overwrite=overwrite,
     )

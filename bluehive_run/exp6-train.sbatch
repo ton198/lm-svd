@@ -17,6 +17,8 @@ export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"
 
 # Resubmitting continues from the last checkpoint. Extra arguments pass through,
 # e.g. sbatch exp6-train.sbatch --head-rank 64
-# Needs the exp4 tables (exp4-inference.sbatch) and a sample store with published blocks,
-# or a producer running at the same time (sample-store-produce.sbatch).
+# Needs the exp4 tables (exp4-inference.sbatch) and the token stream; the training
+# pairs are computed in the step, so no sample store is read.
+# The checkout the job was submitted from, not the installed one.
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 exec .venv/bin/python -u -m experiments.exp6_gpt2_bilinear_table train "$@"

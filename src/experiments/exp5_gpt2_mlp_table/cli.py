@@ -6,9 +6,11 @@ from experiments.exp4_table_neural_svd.cli import EXPERIMENT as TABLES_EXPERIMEN
 from experiments.exp4_table_neural_svd.cli import positive_float
 from utils.experiment_paths import INFERENCE_DIR, add_run_arguments, run_dir
 
-from . import EXPERIMENT, TRAIN_DIR
+from . import EXPERIMENT, LR_SCHEDULES, TRAIN_DIR
 
+# The store that the store-reading form of exp7 defaults to.
 DEFAULT_STORE_DIR = Path("data/sample_stores/wikitext-103-train__gpt2-small__h64-f32")
+DEFAULT_STREAM = Path("data/token_streams/wikitext-103-train.npy")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -19,7 +21,7 @@ def main(argv: list[str] | None = None) -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     train_parser = subparsers.add_parser(
         "train",
-        help="Train MLPs on frozen GPT-2 hidden states with sample-store pairs and "
+        help="Train MLPs on frozen GPT-2 hidden states with pairs made in the step and "
              "compare with the exact SVDs of the exp4 tables",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -34,6 +36,11 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--steps", type=positive_int, default=100000)
     train_parser.add_argument("--eval-every", type=positive_int, default=1000)
     train_parser.add_argument("--lr", type=positive_float, default=3e-4)
+    train_parser.add_argument(
+        "--lr-schedule", choices=LR_SCHEDULES, default="constant",
+        help="cosine lowers every learning rate from its value to 0 over --steps, which "
+             "a continued run must then repeat",
+    )
     train_parser.add_argument("--seed", type=int, default=42)
     encoders = train_parser.add_mutually_exclusive_group()
     encoders.add_argument(
@@ -52,8 +59,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Learning rate of the trainable encoders, with --unfreeze-right or --finetune",
     )
     train_parser.add_argument(
-        "--store-dir", type=Path, default=DEFAULT_STORE_DIR,
-        help="Sample store to draw training pairs from; it must come from --model-path",
+        "--stream-path", type=Path, default=DEFAULT_STREAM,
+        help="Token stream whose windows are the training histories and futures; the "
+             "frozen model computes each pair's entries in the step",
+    )
+    train_parser.add_argument(
+        "--center-pool", type=Path, default=None,
+        help="Train on the table minus each column's mean over the fixed histories of this "
+             "center pool (`exp7 center-pool`) instead of minus g. The futures then come "
+             "from the pool and --stream-path is not read. The run directory gets the "
+             "suffix -center<histories>",
     )
     add_run_arguments(train_parser)
     # The evaluation tables are exp4's, which are built from this sample set.
@@ -66,18 +81,23 @@ def main(argv: list[str] | None = None) -> None:
         from .train import train_exp5
 
         model_label = args.model_path.name
+        train_dir = (
+            f"{TRAIN_DIR}-unfreeze-right" if args.unfreeze_right
+            else f"{TRAIN_DIR}-finetune" if args.finetune
+            else TRAIN_DIR
+        )
+        if args.center_pool is not None:
+            from experiments.exp7_independent_subnets.center import read_pool_config
+
+            train_dir += f"-center{read_pool_config(args.center_pool)['histories']}"
         summary = train_exp5(
             inference_dir=run_dir(
                 args.results_root, TABLES_EXPERIMENT, args.dataset, model_label
             ) / INFERENCE_DIR,
-            store_dir=args.store_dir,
+            stream_path=args.stream_path,
             model_path=args.model_path,
             output_dir=run_dir(args.results_root, EXPERIMENT, args.dataset, model_label)
-            / (
-                f"{TRAIN_DIR}-unfreeze-right" if args.unfreeze_right
-                else f"{TRAIN_DIR}-finetune" if args.finetune
-                else TRAIN_DIR
-            ),
+            / train_dir,
             device=args.device,
             neigs=args.neigs,
             mlp_width=args.mlp_width,
@@ -90,6 +110,8 @@ def main(argv: list[str] | None = None) -> None:
             unfreeze_right=args.unfreeze_right,
             finetune=args.finetune,
             encoder_lr=args.encoder_lr,
+            center_pool=args.center_pool,
+            lr_schedule=args.lr_schedule,
         )
     except (ValueError, FileExistsError) as error:
         parser.error(str(error))

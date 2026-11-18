@@ -38,29 +38,38 @@ from experiments.exp5_gpt2_mlp_table.model import (
     header_attention,
     trainable_encoder,
 )
+from experiments.exp5_gpt2_mlp_table.pairs import StreamPairs
 from experiments.exp5_gpt2_mlp_table.tables import eval_features, load_eval_table
 from experiments.exp5_gpt2_mlp_table.train import (
-    MEMORIZING_RATIO,
     check_store,
     draw_pairs,
+    lr_factor,
     sampler_seed,
     train_exp5,
+)
+from experiments.exp7_independent_subnets.center import (
+    CenterPool,
+    build_center_pool,
+    table_baseline,
 )
 from utils.common import Sample
 from utils.inference import CausalLMInference
 from utils.nestedlora import NestedLoRA
 
 VOCAB, HISTORY_TOKENS, FUTURE_TOKENS, TOP_K = 17, 3, 2, 3
-# The store's token stream is 7 * i mod VOCAB, so its windows are arithmetic runs with
-# step 7. The table rows and columns are such windows too: the tables are sub-grids of
-# the 17 x 17 grid of windows the store's pairs come from.
+# The token stream is 7 * i mod VOCAB, so its windows are arithmetic runs with step 7.
+# The table rows and columns are such windows too: the tables are sub-grids of the
+# 17 x 17 grid of windows that the training pairs and the store's pairs come from.
 STREAM_STEP = 7
 HISTORIES = [[(row + STREAM_STEP * i) % VOCAB for i in range(HISTORY_TOKENS)] for row in range(6)]
 FUTURES = [[(row + 2 + STREAM_STEP * i) % VOCAB for i in range(FUTURE_TOKENS)] for row in range(5)]
 
 
 class Exp5Fixture(unittest.TestCase):
-    """A tiny GPT-2, the exp4 tables built from it and a sample store of its pairs."""
+    """A tiny GPT-2, the exp4 tables built from it, a token stream and a sample store.
+
+    exp5 and exp6 train on the stream; the store serves exp7's tests.
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -98,7 +107,7 @@ class Exp5Fixture(unittest.TestCase):
             )
         # Sample store: 100 blocks of 16 pairs, several pairs per cell of the window grid.
         # With few pairs a network can fit which history came with which future instead.
-        stream_path = cls.root / "stream.npy"
+        stream_path = cls.stream_path = cls.root / "stream.npy"
         np.save(stream_path, (np.arange(200, dtype=np.uint16) * STREAM_STEP) % VOCAB)
         stream_path.with_suffix(".json").write_text(json.dumps({
             "vocab_size": VOCAB, "config": "tiny", "split": "train",
@@ -478,14 +487,16 @@ class EvalTableTests(Exp5Fixture):
 class TrainingTests(Exp5Fixture):
     def train(self, output_dir, **changes):
         options = dict(
-            inference_dir=self.inference_dir, store_dir=self.store_dir,
+            inference_dir=self.inference_dir, stream_path=self.stream_path,
             model_path=self.model_path, output_dir=output_dir, device="cpu", neigs=2,
             mlp_width=16, batch_size=8, steps=4, eval_every=2, lr=1e-2, seed=0,
             overwrite=False,
         )
         options.update(changes)
-        with contextlib.redirect_stdout(io.StringIO()):
-            return train_exp5(**options)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            summary = train_exp5(**options)
+        self.log = output.getvalue()
+        return summary
 
     def records(self, output_dir):
         lines = (output_dir / "eval_history.jsonl").read_text().splitlines()
@@ -509,7 +520,13 @@ class TrainingTests(Exp5Fixture):
         self.assertEqual(
             set(metadata["tables"]["val"]), {"residual_energy", "residual_top_mode"})
         self.assertIn("0.1%", metadata["isolation"])
-        self.assertEqual(metadata["store"]["history_tokens"], HISTORY_TOKENS)
+        self.assertIn("in the step", metadata["sampling"])
+        self.assertNotIn("store", metadata)
+        self.assertNotIn("store_dir", metadata)
+        self.assertEqual(metadata["stream_path"], str(self.stream_path))
+        self.assertEqual(
+            (metadata["stream"]["vocab_size"], metadata["stream"]["tokens"]), (VOCAB, 200))
+        self.assertNotIn("lr_schedule", metadata)
 
     def test_only_the_mlps_are_trained_and_saved(self):
         output = self.root / "run-frozen"
@@ -550,33 +567,53 @@ class TrainingTests(Exp5Fixture):
         best_record = max(records, key=lambda record: record["val"]["captured_energy"][-1])
         best = torch.load(output / "checkpoint-best.pt", weights_only=True)
         self.assertEqual(best["step"], best_record["step"])
-        self.assertTrue(all("memorizing" not in record for record in records))
 
-    def test_a_loss_far_below_the_energy_is_flagged(self):
-        # 24 pairs: the network can fit which history came with which future.
-        store = self.root / "store-few-pairs"
-        stream = self.root / "stream.npy"
-        with contextlib.redirect_stdout(io.StringIO()):
-            produce_blocks(
-                store_dir=store, model_path=self.model_path, stream_path=stream,
-                device="cpu", history_tokens=HISTORY_TOKENS, future_tokens=FUTURE_TOKENS,
-                samples_per_block=4,
-                max_bytes=8 * slot_bytes(4, HISTORY_TOKENS, FUTURE_TOKENS, VOCAB),
-                worker_id=0, seed=0, batch_size=2, max_blocks=6, log_every=100,
-                overwrite=False,
-            )
-        output = self.root / "run-memorizes"
-        log = io.StringIO()
-        with contextlib.redirect_stdout(log):
-            train_exp5(
-                inference_dir=self.inference_dir, store_dir=store, model_path=self.model_path,
-                output_dir=output, device="cpu", neigs=2, mlp_width=16, batch_size=16,
-                steps=600, eval_every=200, lr=1e-2, seed=0, overwrite=False,
-            )
-        last = self.records(output)[-1]
-        self.assertLess(last["train_loss"], -MEMORIZING_RATIO * last["kernel_energy"])
-        self.assertIs(last["memorizing"], True)
-        self.assertIn("WARNING", log.getvalue())
+    def test_training_reads_no_sample_store(self):
+        with patch("experiments.exp5_gpt2_mlp_table.train.SampleSampler",
+                   side_effect=AssertionError("sample store")), \
+                patch("experiments.exp5_gpt2_mlp_table.train.read_store_config",
+                      side_effect=AssertionError("sample store")):
+            self.assertEqual(self.train(self.root / "run-no-store")["step"], 4)
+
+    def test_cosine_schedule_lowers_the_rate_and_belongs_to_the_settings(self):
+        output = self.root / "run-cosine"
+        self.train(output, steps=8, eval_every=2, lr_schedule="cosine")
+        self.assertIn("cosine learning rate", self.log)
+        records = self.records(output)
+        # An evaluation records the rate of the step before it.
+        self.assertEqual(
+            [record["lr"] for record in records],
+            [1e-2 * lr_factor("cosine", 8)(step - 1) for step in (2, 4, 6, 8)])
+        checkpoint = torch.load(output / "checkpoint.pt", weights_only=True)
+        self.assertEqual(
+            (checkpoint["config"]["lr_schedule"], checkpoint["config"]["steps"]), ("cosine", 8))
+        # Another length gives other rates: it is another run.
+        with self.assertRaisesRegex(ValueError, "--overwrite"):
+            self.train(output, steps=12, eval_every=2, lr_schedule="cosine")
+        with self.assertRaisesRegex(ValueError, "lr_schedule"):
+            self.train(self.root / "run-linear", lr_schedule="linear")
+
+    def test_a_continued_cosine_run_follows_the_uninterrupted_rates(self):
+        whole, parts = self.root / "run-cosine-whole", self.root / "run-cosine-parts"
+        self.train(whole, steps=8, eval_every=4, lr_schedule="cosine")
+        original = torch.optim.Adam.step
+        calls = {"count": 0}
+
+        def step(optimizer, *args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 6:
+                raise RuntimeError("interrupted")
+            return original(optimizer, *args, **kwargs)
+
+        # The settings hold the length of the run, so it stops by an error, not by --steps.
+        with patch.object(torch.optim.Adam, "step", step), \
+                self.assertRaisesRegex(RuntimeError, "interrupted"):
+            self.train(parts, steps=8, eval_every=4, lr_schedule="cosine")
+        self.train(parts, steps=8, eval_every=4, lr_schedule="cosine")
+        self.assertIn("Resuming from step 4", self.log)
+        self.assertEqual(
+            [record["lr"] for record in self.records(parts)],
+            [record["lr"] for record in self.records(whole)])
 
     def test_unfrozen_right_trains_the_encoder_copy(self):
         output = self.root / "run-unfrozen"
@@ -700,19 +737,15 @@ class TrainingTests(Exp5Fixture):
         config["model_files"][name]["mtime_ns"] += 1
         self.check(config)
 
-    def test_a_mismatched_store_stops_training(self):
-        store = self.root / "store-other-model"
-        shutil.copytree(self.store_dir, store)
-        config = self.store_config()
-        config["model_files"][next(iter(config["model_files"]))]["size"] += 1
-        (store / "store.json").write_text(json.dumps(config))
-        with self.assertRaisesRegex(ValueError, "model"):
-            self.train(self.root / "run-other-model", store_dir=store)
-
-    def test_waits_for_the_first_block(self):
-        with patch.object(SampleSampler, "wait_until_ready", autospec=True) as wait:
-            self.train(self.root / "run-wait")
-        wait.assert_called_once()
+    def test_a_missing_stream_or_another_vocabulary_stops_training(self):
+        with self.assertRaisesRegex(ValueError, "no token stream"):
+            self.train(self.root / "run-no-stream", stream_path=self.root / "absent.npy")
+        other = self.root / "stream-other-vocabulary.npy"
+        shutil.copy(self.stream_path, other)
+        metadata = json.loads(self.stream_path.with_suffix(".json").read_text())
+        other.with_suffix(".json").write_text(json.dumps({**metadata, "vocab_size": VOCAB + 1}))
+        with self.assertRaisesRegex(ValueError, "vocabulary"):
+            self.train(self.root / "run-other-vocabulary", stream_path=other)
 
     def test_draw_pairs_stacks_store_samples(self):
         h, f, logits = draw_pairs(SampleSampler(self.store_dir, seed=3), 5)
@@ -722,6 +755,107 @@ class TrainingTests(Exp5Fixture):
         expected = self.inference.next_token_logits(h[0].tolist() + f[0].tolist())
         torch.testing.assert_close(logits[0], expected, rtol=0, atol=1e-6)
         self.assertNotEqual(sampler_seed(0, 0), sampler_seed(0, 2))
+
+    def stream_pairs(self, seed):
+        return StreamPairs(
+            self.inference, self.stream_path, history_tokens=HISTORY_TOKENS,
+            future_tokens=FUTURE_TOKENS, top_k=TOP_K, seed=seed, encode_batch=4)
+
+    def test_stream_pairs_are_stream_windows_with_the_table_entries_minus_g(self):
+        histories, futures, header_ids, target = self.stream_pairs(3).draw(6)
+        self.assertEqual(
+            (histories.shape, futures.shape, header_ids.shape, target.shape),
+            ((6, HISTORY_TOKENS), (6, FUTURE_TOKENS), (6, TOP_K), (6, TOP_K)))
+        for windows in (histories, futures):  # arithmetic runs of the stream
+            self.assertTrue(((windows[:, 1:] - windows[:, :-1]) % VOCAB == STREAM_STEP).all())
+        expected_ids, expected_g = select_header_tokens(
+            self.inference, [Sample(i, row) for i, row in enumerate(futures.tolist())], TOP_K)
+        self.assertEqual(header_ids.tolist(), expected_ids.tolist())
+        for row in range(6):
+            logits = self.inference.next_token_logits(
+                histories[row].tolist() + futures[row].tolist())
+            entries = (logits - logits.mean())[header_ids[row]]
+            torch.testing.assert_close(
+                target[row], entries - torch.from_numpy(expected_g[row]).float(),
+                rtol=0, atol=1e-5)
+
+    def test_stream_pairs_draw_histories_and_futures_independently(self):
+        histories, futures, _, _ = self.stream_pairs(0).draw(400)
+        cells = {(h[0].item(), f[0].item()) for h, f in zip(histories, futures)}
+        self.assertGreater(len(cells), 200)  # of the 17 x 17 grid, not one future per history
+        again = self.stream_pairs(0).draw(400)
+        self.assertEqual(again[0].tolist(), histories.tolist())
+        self.assertNotEqual(self.stream_pairs(1).draw(400)[0].tolist(), histories.tolist())
+
+    def test_lr_factor(self):
+        self.assertIsNone(lr_factor("constant", 10))
+        cosine = lr_factor("cosine", 10)
+        self.assertEqual(cosine(0), 1.0)
+        self.assertAlmostEqual(cosine(5), 0.5)
+        self.assertLess(cosine(9), 0.03)
+        self.assertGreater(cosine(9), 0.0)
+        self.assertTrue(all(cosine(step + 1) < cosine(step) for step in range(9)))
+
+
+class CenteredTrainingTests(Exp5Fixture):
+    """exp5 on the target of a center pool."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.pool_dir = cls.root / "pool"
+        with contextlib.redirect_stdout(io.StringIO()):
+            build_center_pool(
+                pool_dir=cls.pool_dir, model_path=cls.model_path, stream_path=cls.stream_path,
+                device="cpu", histories=3, futures=10, history_tokens=HISTORY_TOKENS,
+                future_tokens=FUTURE_TOKENS, seed=0, overwrite=False, chunk=4, save_every=4,
+            )
+
+    def train(self, output_dir, **changes):
+        options = dict(
+            inference_dir=self.inference_dir, stream_path=self.root / "unread.npy",
+            model_path=self.model_path, output_dir=output_dir, device="cpu", neigs=2,
+            mlp_width=16, batch_size=8, steps=4, eval_every=2, lr=1e-2, seed=0,
+            overwrite=False, center_pool=self.pool_dir,
+        )
+        options.update(changes)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return train_exp5(**options)
+
+    def test_a_centered_run_trains_on_the_pool_target(self):
+        output = self.root / "run-centered"
+        self.assertEqual(self.train(output)["step"], 4)
+        metadata = json.loads((output / "metadata.json").read_text())
+        self.assertEqual(metadata["center_pool"]["histories"], 3)
+        self.assertIn("none", metadata["first_mode"])
+        self.assertIn("center pool", metadata["value"])
+        self.assertNotIn("stream_path", metadata)
+        self.assertNotIn("store", metadata)
+        # The tables lose the pool's center, not g.
+        pool = CenterPool(self.pool_dir)
+        centered = load_eval_table(
+            self.inference_dir / "val", self.inference, "cpu",
+            baseline=table_baseline(self.inference, pool))
+        self.assertAlmostEqual(
+            metadata["tables"]["val"]["residual_energy"], centered.residual_energy)
+        self.assertNotAlmostEqual(
+            metadata["tables"]["val"]["residual_energy"],
+            load_eval_table(self.inference_dir / "val", self.inference, "cpu").residual_energy)
+        # A run on the target minus g cannot continue it.
+        with self.assertRaisesRegex(ValueError, "--overwrite"):
+            self.train(output, steps=6, center_pool=None, stream_path=self.stream_path)
+
+    def test_every_kind_of_network_takes_the_centered_pairs(self):
+        for name, changes in (
+            ("unfreeze", {"unfreeze_right": True}), ("finetune", {"finetune": True}),
+        ):
+            with self.subTest(name=name):
+                output = self.root / f"run-centered-{name}"
+                self.assertEqual(self.train(output, **changes)["step"], 4)
+
+    def test_a_missing_pool_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "center pool"):
+            self.train(self.root / "run-no-pool", center_pool=self.root / "absent-pool")
 
 
 class CLITests(Exp5Fixture):
@@ -736,7 +870,7 @@ class CLITests(Exp5Fixture):
     def run_cli(self, *extra):
         main([
             "train", "--results-root", str(self.results_root), "--dataset", "tiny",
-            "--model-path", str(self.model_path), "--store-dir", str(self.store_dir),
+            "--model-path", str(self.model_path), "--stream-path", str(self.stream_path),
             "--device", "cpu", "--neigs", "2", "--mlp-width", "16", "--batch-size", "8",
             "--steps", "2", "--eval-every", "2", *extra,
         ])
@@ -750,7 +884,8 @@ class CLITests(Exp5Fixture):
         self.assertIn("step: 2", output.getvalue())
 
     def test_errors_are_reported_as_usage_errors(self):
-        for extra in (["--store-dir", str(self.root / "no-store")], ["--dataset", "missing"]):
+        for extra in (["--stream-path", str(self.root / "no-stream.npy")],
+                      ["--dataset", "missing"], ["--lr-schedule", "linear"]):
             with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
                     self.run_cli(*extra)
@@ -765,15 +900,16 @@ class CLITests(Exp5Fixture):
         self.assertEqual(
             {key: options[key] for key in (
                 "neigs", "mlp_width", "batch_size", "steps", "eval_every", "lr", "seed",
-                "device", "overwrite", "unfreeze_right", "finetune", "encoder_lr")},
+                "device", "overwrite", "unfreeze_right", "finetune", "encoder_lr",
+                "center_pool", "lr_schedule")},
             {"neigs": 128, "mlp_width": 4096, "batch_size": 256, "steps": 100000,
              "eval_every": 1000, "lr": 3e-4, "seed": 42, "device": "cuda",
              "overwrite": False, "unfreeze_right": False, "finetune": False,
-             "encoder_lr": 2e-5})
+             "encoder_lr": 2e-5, "center_pool": None, "lr_schedule": "constant"})
         self.assertEqual(options["model_path"], Path("models/gpt2-small"))
         self.assertEqual(
-            options["store_dir"],
-            Path("data/sample_stores/wikitext-103-train__gpt2-small__h64-f32"))
+            options["stream_path"], Path("data/token_streams/wikitext-103-train.npy"))
+        self.assertNotIn("store_dir", options)
         self.assertEqual(options["inference_dir"], Path(
             "data/experiment_results/exp4_table_neural_svd/wikitext-large__gpt2-small/inference"))
         self.assertEqual(options["output_dir"], Path(
@@ -803,6 +939,23 @@ class CLITests(Exp5Fixture):
         self.assertEqual(options["output_dir"], Path(
             "data/experiment_results/exp5_gpt2_mlp_table/wikitext-large__gpt2-small/"
             "train-finetune"))
+
+    def test_a_center_pool_gets_its_own_run_directory(self):
+        pool = self.root / "cli-pool"
+        with contextlib.redirect_stdout(io.StringIO()):
+            build_center_pool(
+                pool_dir=pool, model_path=self.model_path, stream_path=self.stream_path,
+                device="cpu", histories=3, futures=10, history_tokens=HISTORY_TOKENS,
+                future_tokens=FUTURE_TOKENS, seed=0, overwrite=False, chunk=4, save_every=4,
+            )
+            self.run_cli("--center-pool", str(pool), "--lr-schedule", "cosine")
+        run = self.results_root / "exp5_gpt2_mlp_table" / "tiny__model" / "train-center3"
+        metadata = json.loads((run / "metadata.json").read_text())
+        self.assertEqual((metadata["lr_schedule"], metadata["steps"]), ("cosine", 2))
+        self.assertEqual(metadata["center_pool"]["histories"], 3)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            self.run_cli("--center-pool", str(self.root / "absent-pool"))
+        self.assertEqual(raised.exception.code, 2)
 
     def test_finetune_and_unfreeze_right_cannot_be_combined(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:

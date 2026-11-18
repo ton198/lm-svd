@@ -497,26 +497,32 @@ The hidden state is the final layer after `ln_f`. Each side passes through GPT-2
 
 ### Run
 
-exp5 needs the exp4 tables and a sample store that holds published blocks from the same model (see [Training sample generation and sampling](#training-sample-generation-and-sampling)). A producer may keep running during training.
+exp5 needs the exp4 tables and the token stream (`data-pipline build-token-stream`, see [Training sample generation and sampling](#training-sample-generation-and-sampling)). It reads no sample store: the frozen model computes the training pairs during the step.
 
 ```bash
 uv run exp4 inference                                              # the evaluation tables
-uv run data-pipline sample-store produce --device cuda --worker-id 0   # in another terminal
+uv run data-pipline build-token-stream                             # the stream the pairs are drawn from
 uv run exp5 train
 ```
 
-Each step draws `--batch-size` (default 256) independent (history, future) pairs from the store. For each pair it takes the stored logits of `history + future` on the future's header tokens, centers them over the vocabulary and subtracts `g`. The loss uses those entries for its operator term and every history and column of the batch for its metric term. In expectation this is the loss of a full history × future grid, because the store draws histories and futures independently.
+Each step draws `--batch-size` (default 256) history windows and as many future windows from the token stream (`--stream-path`), uniformly, with replacement and independently of each other, and pairs them in order. The frozen model reads each `history + future`; the step takes its logits on the future's header tokens, centers them over the vocabulary and subtracts `g`. The loss uses those entries for its operator term and every history and column of the batch for its metric term. In expectation this is the loss of a full history × future grid, because histories and futures are drawn independently. No pair is kept, so a run sees a pair twice only by chance.
 
 Every `--eval-every` steps the learned features of both exp4 tables are compared with the exact SVD of that table minus `g`, in the same columns as exp4 (`sv_rel_err`, `left_overlap`, `right_overlap`, `energy`, `exact_energy`). The header tokens stored by exp4 are kept: a batched pass can order near-tied tokens differently, so exp5 only checks that they are among the model's top-k.
 
-Outputs under `<results-root>/exp5_gpt2_mlp_table/<dataset>__<model>/train/`: `eval_history.jsonl` (one line per evaluation with `train_loss`, `kernel_energy`, `seconds_per_step` and the `train` and `val` comparisons), `checkpoint.pt` (the latest trained weights, without the frozen GPT-2), `checkpoint-best.pt` (the weights of the evaluation with the highest validation `energy` at the largest rank) and `metadata.json`, which also records how much energy `g` leaves in each table. `--dataset` and `--model-path` select the exp4 run to evaluate on; `--store-dir` selects the store. Rank, MLP width and learning rate are set with `--neigs`, `--mlp-width` and `--lr`.
+Outputs under `<results-root>/exp5_gpt2_mlp_table/<dataset>__<model>/train/`: `eval_history.jsonl` (one line per evaluation with `train_loss`, `kernel_energy`, `seconds_per_step` and the `train` and `val` comparisons), `checkpoint.pt` (the latest trained weights, without the frozen GPT-2), `checkpoint-best.pt` (the weights of the evaluation with the highest validation `energy` at the largest rank) and `metadata.json`, which also records how much energy `g` leaves in each table. `--dataset` and `--model-path` select the exp4 run to evaluate on; `--stream-path` selects the token stream. Rank, MLP width and learning rate are set with `--neigs`, `--mlp-width` and `--lr`.
+
+Two options change the run, for every kind of network below:
+
+- **`--lr-schedule cosine`** lowers every learning rate (`--lr` and `--encoder-lr`) from its value to 0 over `--steps`, without warmup; the default `constant` keeps them. The rate of a step then depends on the length of the run, so `--steps` becomes one of the run's settings: a run cannot be continued with another value. Each evaluation records the current `--lr` as `lr`.
+- **`--center-pool DIR`** trains on the table minus each column's mean over the fixed histories of a center pool instead of minus `g` (see [Centering on fixed histories](#centering-on-fixed-histories); build the pool with `exp7 center-pool`). Each pair is then a pool future behind a fresh history window of the pool's stream, both tables are compared after the same subtraction, and `--stream-path` is not read. Results go to a directory with the suffix `-center<histories>`, e.g. `train-center64/`. Its numbers are not comparable with those of a run on the tables minus `g`.
 
 Things to keep in mind when reading the numbers:
 
 - **They are not comparable with exp4's.** exp5 is measured on the tables minus `g`; exp4's `train/` and `train-column-mean/` runs are measured on the stored tables and on the tables minus their column means. Compare each run's `energy` with its own `exact_energy`.
-- **Both tables are held out to the same degree.** Store pairs come from the whole training stream and are not excluded from the tables; a pair overlaps a validation window with a probability of about 0.1%. The `train` table is no longer "seen" data, it is just the larger table.
-- **A loss far below `−E[K²]` means the store is too small or too stale.** `kernel_energy` is `E[K²]`, and a fit of the table ends near `−E[K²]`. When the same pairs are drawn many times, the network can instead fit which history came with which future, and the loss drops well below that while the `energy` of both tables falls. An evaluation whose loss is below `−1.2 × E[K²]` prints a warning and gets `"memorizing": true` in `eval_history.jsonl`; training continues, and `checkpoint-best.pt` keeps the weights from before. Keep a producer running so the store is refreshed.
-- **A continued run draws other pairs.** Running `train` again continues from the checkpoint up to `--steps` (`--overwrite` starts over), but the store changes while producers run, so the pairs are not reproduced.
+- **Both tables are held out to the same degree.** Training windows come from the whole training stream and are not excluded from the tables; a pair overlaps a validation window with a probability of about 0.1%. The `train` table is no longer "seen" data, it is just the larger table.
+- **`kernel_energy` is `E[K²]`**, the mean square of the target, and a fit of the table ends near a loss of `−E[K²]`.
+- **A continued run draws other pairs.** Running `train` again continues from the checkpoint up to `--steps` (`--overwrite` starts over). The pairs are seeded by the step the run starts from, so a continued run does not repeat the pairs of an uninterrupted one.
+- **Runs made before the pairs came from the stream** read a sample store and recorded `store_dir`; the current code does not continue them.
 
 ### Training the right side's GPT-2
 
@@ -528,9 +534,9 @@ The reason for this option is a probe on the exp4 training table (`scripts/probe
 
 `train --finetune` replaces both MLPs: each side is its own trainable copy of the model's transformer (learning rate `--encoder-lr`, dropout off) with a `LayerNorm → Linear` head on its last hidden state. The left copy reads the history. The right copy reads a column as its future followed by the header token, so the token is part of the input; the header tokens of one future share one sequence, in which each sees the future and itself only and sits at the position after the future. `--mlp-width` is unused. The frozen model still gives the header tokens and `g`. Results go to `.../train-finetune/`. A step with `--batch-size 128` needs about 23 GB of GPU memory.
 
-On BlueHive, submit `bluehive_run/exp5-train.sbatch` after `exp4-inference.sbatch`, with `sample-store-produce.sbatch` running or its store already filled. Arguments after the script name are passed to the command.
+On BlueHive, submit `bluehive_run/exp5-train.sbatch` after `exp4-inference.sbatch`. Arguments after the script name are passed to the command.
 
-Small smoke run on CPU, after the commands above have produced the tables and at least one block:
+Small smoke run on CPU, after the commands above have produced the tables and the token stream:
 
 ```bash
 RESULTS_ROOT=$(mktemp -d /tmp/lm-svd-exp5.XXXXXX)
@@ -564,7 +570,7 @@ A head that gave `w_l(future)` directly would need rank × hidden outputs (75 M 
 uv run exp6 train
 ```
 
-It needs what exp5 needs: the exp4 tables and a sample store from the same model. The heads and `P` use `--lr` (default 3e-4), the two copies `--encoder-lr` (default 2e-5). Outputs go to `<results-root>/exp6_gpt2_bilinear_table/<dataset>__<model>/train/`, with the same files and the same columns as exp5, so its numbers compare directly with exp5's (both are measured on the tables minus `g`). On BlueHive, submit `bluehive_run/exp6-train.sbatch`.
+It needs what exp5 needs: the exp4 tables and the token stream (`--stream-path`); its pairs are made in the step in the same way. The heads and `P` use `--lr` (default 3e-4), the two copies `--encoder-lr` (default 2e-5). Outputs go to `<results-root>/exp6_gpt2_bilinear_table/<dataset>__<model>/train/`, with the same files and the same columns as exp5, so its numbers compare directly with exp5's (both are measured on the tables minus `g`). On BlueHive, submit `bluehive_run/exp6-train.sbatch`.
 
 ## Experiment 7: an independent sub-network per singular function
 
@@ -656,7 +662,7 @@ M = Λ_f^{-1/2} C Λ_g^{-1/2} = P S Qᵀ        T_f = Λ_f^{-1/2} P S^{1/2}     
 
 ### Run
 
-exp7 needs what exp5 and exp6 need: the exp4 tables and a sample store from the same model. The first step runs stage 1 alone, once with `scratch` and once with `roberta`:
+exp7 needs the exp4 tables and, unlike exp5 and exp6, a sample store from the same model (a run with `--center-pool` reads none). The first step runs stage 1 alone, once with `scratch` and once with `roberta`:
 
 ```bash
 uv run python scripts/download_models.py --models roberta   # once per machine
