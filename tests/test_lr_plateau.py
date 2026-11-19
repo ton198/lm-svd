@@ -182,6 +182,22 @@ class Exp5PlateauCLITests(unittest.TestCase):
         self.assertEqual(first["lr_schedule"], "plateau")
         self.assertIsNone(second["plateau"])
 
+    def test_the_run_directory_gets_the_suffix(self):
+        with patch("experiments.exp5_gpt2_mlp_table.train.train_exp5") as train, \
+                patch("experiments.exp7_independent_subnets.center.read_pool_config",
+                      return_value={"histories": 64}):
+            train.return_value = {"output_dir": "x", "step": 0, "evaluations": 0}
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.run_cli("--lr-schedule", "plateau")
+                self.run_cli("--lr-schedule", "plateau", "--center-pool", "pool")
+                self.run_cli()
+        self.assertEqual(
+            [call.kwargs["output_dir"].name for call in train.call_args_list],
+            ["train-plateau", "train-center64-plateau", "train"])
+        # The tables are those of the constant run: the same results root.
+        self.assertEqual(
+            len({call.kwargs["inference_dir"] for call in train.call_args_list}), 1)
+
     def test_a_bad_rule_is_a_usage_error(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
             self.run_cli("--lr-schedule", "plateau", "--plateau-factor", "2")

@@ -40,8 +40,9 @@ def main(argv: list[str] | None = None) -> None:
         "--lr-schedule", choices=LR_SCHEDULES, default="constant",
         help="cosine lowers every learning rate from its value to 0 over --steps, which "
              "a continued run must then repeat. plateau multiplies every learning rate by "
-             "--plateau-factor each time the --plateau-table energy stops rising; a "
-             "constant run can be continued with it",
+             "--plateau-factor each time the --plateau-table energy stops rising. The run "
+             "directory gets the suffix -plateau; a copy of a constant run's directory "
+             "under that name is continued",
     )
     train_parser.add_argument(
         "--plateau-table", choices=("train", "val"), default="val",
@@ -111,6 +112,9 @@ def main(argv: list[str] | None = None) -> None:
             from experiments.exp7_independent_subnets.center import read_pool_config
 
             train_dir += f"-center{read_pool_config(args.center_pool)['histories']}"
+        if args.lr_schedule == "plateau":
+            # Beside the constant run of the same results root, whose copy it may continue.
+            train_dir += "-plateau"
         summary = train_exp5(
             inference_dir=run_dir(
                 args.results_root, TABLES_EXPERIMENT, args.dataset, model_label
