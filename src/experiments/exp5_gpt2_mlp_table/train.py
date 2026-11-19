@@ -57,6 +57,7 @@ from .features import last_hidden
 from .loss import paired_loss
 from .model import build_finetune_model, build_model, trainable_encoder
 from .pairs import StreamPairs, open_stream
+from .plateau import CONFIG_KEY, SCALE_KEY, Plateau, continues
 from .tables import EvalTable, eval_features, load_eval_table
 
 FIRST_MODE = "1 x centered future-only logit of the header token"
@@ -282,10 +283,11 @@ def lr_factor(schedule: str, steps: int) -> Callable[[int], float] | None:
     """The multiple of each learning rate at a 0-based step, or None for a constant rate.
 
     cosine falls from 1 at the first step to 0 after the last of `steps`.
+    plateau has no multiple by the step: its rule reads the evaluations (plateau.py).
     """
     if schedule not in LR_SCHEDULES:
         raise ValueError(f"lr_schedule must be one of {LR_SCHEDULES}, not {schedule!r}")
-    if schedule == "constant":
+    if schedule in ("constant", "plateau"):
         return None
     return lambda step: 0.5 * (1.0 + math.cos(math.pi * step / steps))
 
@@ -312,6 +314,7 @@ def run_training(
     seed: int,
     overwrite: bool,
     schedule: Callable[[int], float] | None = None,
+    plateau: Plateau | None = None,
 ) -> dict:
     """Train on the source's pairs; every eval_every steps compare both tables.
 
@@ -321,11 +324,15 @@ def run_training(
     each future, all on the model's device. features(table) returns the features
     of every row and column of an evaluation table. schedule(step) is the
     multiple of every group's learning rate at a 0-based step; an evaluation
-    then records the rate of the first group as `lr`.
+    then records the rate of the first group as `lr`. plateau multiplies every
+    rate by its factor when its table's energy stops rising; an evaluation then
+    also records the multiple of the first rates as `lr_scale`, and config must
+    hold the rule under plateau.CONFIG_KEY.
 
     Writes checkpoint.pt, checkpoint-best.pt, eval_history.jsonl and
     metadata.json (config and metadata) to output_dir, and continues an
-    existing checkpoint whose config equals `config`.
+    existing checkpoint whose config equals `config`, or equals it without the
+    plateau rule.
     """
     checkpoint_path = output_dir / "checkpoint.pt"
     best_path = output_dir / "checkpoint-best.pt"
@@ -341,7 +348,7 @@ def run_training(
     base_rates = [group["lr"] for group in optimizer.param_groups]
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        if checkpoint["config"] != config:
+        if not continues(checkpoint["config"], config):
             raise ValueError(
                 f"checkpoint settings {checkpoint['config']} differ from {config}; "
                 "pass --overwrite to start over"
@@ -369,15 +376,17 @@ def run_training(
         flush=True,
     )
 
+    scale = 1.0 if plateau is None else plateau.scale(history)
     loss_sum = energy_sum = 0.0
     window = 0
     started = window_started = time.perf_counter()
     while step < steps:
         model.train()
         histories, futures, header_ids, target = pairs.draw(batch_size)
-        if schedule is not None:
+        if schedule is not None or plateau is not None:
+            factor = scale * (1.0 if schedule is None else schedule(step))
             for group, rate in zip(optimizer.param_groups, base_rates):
-                group["lr"] = rate * schedule(step)
+                group["lr"] = rate * factor
 
         optimizer.zero_grad()
         left, right = forward(histories, futures, header_ids)
@@ -401,9 +410,11 @@ def run_training(
                 "seconds_per_step": (now - window_started) / window,
             }
             rate = ""
-            if schedule is not None:
+            if schedule is not None or plateau is not None:
                 record["lr"] = optimizer.param_groups[0]["lr"]
                 rate = f"  lr {record['lr']:.2e}"
+            if plateau is not None:
+                record[SCALE_KEY] = scale
             lines = [
                 f"step {step}: loss {record['train_loss']:.4f}  "
                 f"E[K^2] {record['kernel_energy']:.4f}{rate}  "
@@ -412,8 +423,13 @@ def run_training(
             for name, table in tables.items():
                 record[name] = compare_with_exact_svd(*features(table), table.table)
                 lines.append(format_comparison(name, record[name]))
-            print("\n".join(lines), flush=True)
             history.append(record)
+            if plateau is not None and plateau.scale(history) != scale:
+                scale = plateau.scale(history)
+                lines.append(
+                    f"the {plateau.table} energy stopped rising: every learning rate is now "
+                    f"{scale:.3g} of its first value")
+            print("\n".join(lines), flush=True)
             loss_sum = energy_sum = 0.0
             window = 0
             val_energy = record["val"]["captured_energy"][-1]
@@ -458,6 +474,7 @@ def train_exp5(
     encoder_lr: float = 2e-5,
     center_pool: Path | None = None,
     lr_schedule: str = "constant",
+    plateau: Plateau | None = None,
     encode_batch: int = 1024,
     eval_chunk: int = 2048,
 ) -> dict:
@@ -471,7 +488,9 @@ def train_exp5(
 
     The pairs are fresh windows of the token stream at stream_path with the
     entry minus g as the target, or with center_pool the pairs and the target
-    of that pool (see prepare_fresh_run). lr_schedule "cosine" lowers every
+    of that pool (see prepare_fresh_run). lr_schedule "plateau" takes a plateau
+    rule, which lowers every learning rate when its table's energy stops rising;
+    a constant-rate checkpoint may be continued with it. lr_schedule "cosine" lowers every
     learning rate from its value to 0 over `steps`, which then belong to the
     run's settings.
 
@@ -485,6 +504,10 @@ def train_exp5(
             "unfreeze_right, not both"
         )
     schedule = lr_factor(lr_schedule, steps)
+    if (lr_schedule == "plateau") != (plateau is not None):
+        raise ValueError("lr_schedule plateau and a plateau rule go together")
+    if plateau is not None and plateau.table not in ("train", "val"):
+        raise ValueError(f"the plateau rule watches train or val, not {plateau.table!r}")
     inference, tables, top_k, source = prepare_fresh_run(
         inference_dir=inference_dir, stream_path=stream_path, model_path=model_path,
         device=device, seed=seed, encode_batch=encode_batch, center_pool=center_pool,
@@ -499,6 +522,8 @@ def train_exp5(
     if schedule is not None:
         # The rate of a step depends on the length of the run.
         config.update(lr_schedule=lr_schedule, steps=steps)
+    if plateau is not None:
+        config[CONFIG_KEY] = plateau.config()
     if unfreeze_right:
         # Added only here, so checkpoints of frozen runs keep matching.
         config.update(unfreeze_right=True, encoder_lr=encoder_lr)
@@ -564,8 +589,9 @@ def train_exp5(
         },
         description=f"rank {neigs}, "
                     + ("linear heads" if finetune else f"MLP width {mlp_width}")
-                    + ("" if schedule is None else f", {lr_schedule} learning rate"),
+                    + ("" if schedule is None else f", {lr_schedule} learning rate")
+                    + ("" if plateau is None else f"; {plateau.describe()}"),
         tables=tables, top_k=top_k, source=source, output_dir=output_dir, device=device,
         batch_size=batch_size, steps=steps, eval_every=eval_every, seed=seed,
-        overwrite=overwrite, schedule=schedule,
+        overwrite=overwrite, schedule=schedule, plateau=plateau,
     )

@@ -39,7 +39,27 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument(
         "--lr-schedule", choices=LR_SCHEDULES, default="constant",
         help="cosine lowers every learning rate from its value to 0 over --steps, which "
-             "a continued run must then repeat",
+             "a continued run must then repeat. plateau multiplies every learning rate by "
+             "--plateau-factor each time the --plateau-table energy stops rising; a "
+             "constant run can be continued with it",
+    )
+    train_parser.add_argument(
+        "--plateau-table", choices=("train", "val"), default="val",
+        help="Table whose energy at the largest rank the plateau rule watches",
+    )
+    train_parser.add_argument(
+        "--plateau-window", type=positive_int, default=20,
+        help="Evaluations in each of the two means the plateau rule compares; the rule "
+             "waits for twice as many at each learning rate",
+    )
+    train_parser.add_argument(
+        "--plateau-gain", type=float, default=0.01,
+        help="The plateau rule lowers the rates when the later mean is less than this "
+             "fraction above the earlier one",
+    )
+    train_parser.add_argument(
+        "--plateau-factor", type=float, default=0.3,
+        help="What the plateau rule multiplies every learning rate by",
     )
     train_parser.add_argument("--seed", type=int, default=42)
     encoders = train_parser.add_mutually_exclusive_group()
@@ -78,6 +98,7 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     try:
+        from .plateau import Plateau
         from .train import train_exp5
 
         model_label = args.model_path.name
@@ -112,6 +133,10 @@ def main(argv: list[str] | None = None) -> None:
             encoder_lr=args.encoder_lr,
             center_pool=args.center_pool,
             lr_schedule=args.lr_schedule,
+            plateau=Plateau(
+                table=args.plateau_table, window=args.plateau_window,
+                gain=args.plateau_gain, factor=args.plateau_factor,
+            ) if args.lr_schedule == "plateau" else None,
         )
     except (ValueError, FileExistsError) as error:
         parser.error(str(error))

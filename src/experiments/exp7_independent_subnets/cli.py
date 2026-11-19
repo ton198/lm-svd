@@ -103,6 +103,31 @@ def main(argv: list[str] | None = None) -> None:
         help="Steps of a --joint run; a finished run continues with a larger value",
     )
     train_parser.add_argument(
+        "--lr-plateau", action="store_true",
+        help="With --joint: multiply every learning rate by --plateau-factor each time the "
+             "--plateau-table energy stops rising. The run directory gets the suffix "
+             "-plateau; a copy of a constant-rate run's directory under that name is "
+             "continued",
+    )
+    train_parser.add_argument(
+        "--plateau-table", choices=("selection", "report"), default="report",
+        help="Table whose energy at the largest rank the plateau rule watches",
+    )
+    train_parser.add_argument(
+        "--plateau-window", type=positive_int, default=20,
+        help="Evaluations in each of the two means the plateau rule compares; the rule "
+             "waits for twice as many at each learning rate",
+    )
+    train_parser.add_argument(
+        "--plateau-gain", type=float, default=0.01,
+        help="The plateau rule lowers the rates when the later mean is less than this "
+             "fraction above the earlier one",
+    )
+    train_parser.add_argument(
+        "--plateau-factor", type=float, default=0.3,
+        help="What the plateau rule multiplies every learning rate by",
+    )
+    train_parser.add_argument(
         "--stream-path", type=Path, default=DEFAULT_STREAM,
         help="Token stream a --joint run without --center-pool draws its pairs from",
     )
@@ -165,6 +190,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "center-pool":
         build_pool(args, parser)
         return
+    if args.lr_plateau and not args.joint:
+        parser.error("--lr-plateau needs --joint: a staged run has no single learning rate")
     if args.min_stage_steps > args.stage_steps:
         parser.error(
             f"--min-stage-steps ({args.min_stage_steps}) must not exceed "
@@ -186,6 +213,8 @@ def main(argv: list[str] | None = None) -> None:
             run_name += f"-center{read_pool_config(args.center_pool)['histories']}"
         if args.joint:
             run_name += "-joint"
+        if args.lr_plateau:
+            run_name += "-plateau"
         model_label = args.model_path.name
         shared = dict(
             inference_dir=run_dir(
@@ -210,10 +239,17 @@ def main(argv: list[str] | None = None) -> None:
             center_pool=args.center_pool,
         )
         if args.joint:
+            from experiments.exp5_gpt2_mlp_table.plateau import Plateau
+
             from .joint import train_exp7_joint
 
             summary = train_exp7_joint(
-                stream_path=args.stream_path, steps=args.steps, **shared)
+                stream_path=args.stream_path, steps=args.steps,
+                plateau=Plateau(
+                    table=args.plateau_table, window=args.plateau_window,
+                    gain=args.plateau_gain, factor=args.plateau_factor,
+                ) if args.lr_plateau else None,
+                **shared)
         else:
             summary = train_exp7(
                 store_dir=args.store_dir,

@@ -12,7 +12,8 @@ on fresh windows of the token stream, or with a center pool the entry minus the
 column's mean over the pool's fixed histories. Every evaluation compares all L
 modes with the exact SVD of both exp4 tables at ranks 1..L, under the staged
 run's names (selection, report). Nothing is selected: the last weights are the
-result.
+result. With a plateau rule (exp5's plateau.py) every learning rate falls when
+the watched table's energy at rank L stops rising.
 """
 
 from __future__ import annotations
@@ -27,6 +28,12 @@ import torch
 from experiments.exp4_table_neural_svd.train import (
     compare_with_exact_svd,
     format_comparison,
+)
+from experiments.exp5_gpt2_mlp_table.plateau import (
+    CONFIG_KEY,
+    SCALE_KEY,
+    Plateau,
+    continues,
 )
 from experiments.exp5_gpt2_mlp_table.train import (
     fresh_metadata,
@@ -88,18 +95,23 @@ def train_exp7_joint(
     center_pool: Path | None = None,
     encode_batch: int = 1024,
     eval_chunk: int = 256,
+    plateau: Plateau | None = None,
 ) -> dict:
     """Train `modes` modes together for `steps` steps on pairs made in the step.
 
     Learning rates are the staged run's: a pretrained kind trains its encoders
     with encoder_lr and its heads with lr, scratch modes train everything with
     lr after a linear warmup over the first WARMUP_STEPS steps of the run.
+    plateau lowers all of these rates when its table's energy at rank `modes`
+    stops rising; each evaluation then records the multiple of the first rates
+    its steps were trained with as lr_scale.
 
     Writes eval_history.jsonl (one line per evaluation, every eval_every steps
     and at the last step), checkpoint.pt and metadata.json to output_dir, and
     modes/mode-XX.pt when the run reaches `steps`. A checkpoint.pt of the same
     settings is continued up to `steps`, which may be larger than before; the
-    number of modes is a setting. overwrite deletes the outputs and starts again.
+    number of modes is a setting, and so is the plateau rule, except that a run
+    made without one may take one up. overwrite deletes the outputs and starts again.
     """
     if subnet not in SUBNETS:
         raise ValueError(f"subnet must be one of {SUBNETS}, got {subnet!r}")
@@ -107,6 +119,10 @@ def train_exp7_joint(
                         ("batch_size", batch_size)):
         if value < 1:
             raise ValueError(f"{name} must be at least 1, got {value}")
+    if plateau is not None and plateau.table not in TABLE_KEYS.values():
+        raise ValueError(
+            f"the plateau rule watches one of {tuple(TABLE_KEYS.values())}, "
+            f"not {plateau.table!r}")
     if subnet == "scratch" and scratch_width % scratch_heads:
         raise ValueError(
             f"scratch_width must be divisible by scratch_heads, got {scratch_width} "
@@ -124,6 +140,8 @@ def train_exp7_joint(
         "lr": lr, "encoder_lr": encoder_lr, "seed": seed, "optimizer": "Adam",
         **source.config,
     }
+    if plateau is not None:
+        config[CONFIG_KEY] = plateau.config()
     selection_name = next(name for name, key in TABLE_KEYS.items() if key == "selection")
     selection_table = tables[selection_name]
     exact = selection_table.table
@@ -140,7 +158,7 @@ def train_exp7_joint(
     if not overwrite and checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         saved = checkpoint["config"]
-        if saved != config:
+        if not continues(saved, config):
             changed = {
                 key: (saved.get(key), config.get(key))
                 for key in sorted(set(saved) | set(config)) if saved.get(key) != config.get(key)}
@@ -184,6 +202,8 @@ def train_exp7_joint(
     else:
         optimizer = torch.optim.Adam(network.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_factor)
+    # One per parameter group, before the warmup and the plateau rule scale them.
+    first_rates = [lr, encoder_lr] if subnet in PRETRAINED else [lr]
     step = 0
     history: list[dict] = []
     if checkpoint is not None:
@@ -203,7 +223,11 @@ def train_exp7_joint(
     shared["table_shapes"] = {
         TABLE_KEYS[name]: list(table.table.matrix.shape) for name, table in tables.items()}
     shared["tables"] = {
-        TABLE_KEYS[name]: {"exp4_table": name, "role": "reported only", **values}
+        TABLE_KEYS[name]: {
+            "exp4_table": name,
+            "role": "watched by the learning-rate rule"
+            if plateau is not None and plateau.table == TABLE_KEYS[name] else "reported only",
+            **values}
         for name, values in shared["tables"].items()}
     write_atomic(output_dir / "metadata.json", lambda tmp: save_json(tmp, {
         **config,
@@ -212,6 +236,7 @@ def train_exp7_joint(
         "loss": "joint nesting: the mean over the ranks k = 1..modes of the rank-k loss of "
                 "the first k modes; all modes are trained in every step and none is detached",
         "trainable_parameters_of": "one mode; no two modes share a trainable parameter",
+        **({} if plateau is None else {"lr_rule": plateau.describe()}),
         **shared,
     }))
 
@@ -223,9 +248,21 @@ def train_exp7_joint(
              f"lr {lr} with a linear warmup over the first {WARMUP_STEPS} steps")
     print(
         f"Training {modes} modes together on {device}: {batch_size} pairs x {top_k} header "
-        f"tokens per step, {steps} steps, {subnet} sub-networks, {rates}",
+        f"tokens per step, {steps} steps, {subnet} sub-networks, {rates}"
+        + ("" if plateau is None else f"; {plateau.describe()}"),
         flush=True,
     )
+
+    scale = 1.0 if plateau is None else plateau.scale(history)
+
+    def set_rates() -> None:
+        """The rates of the next step: the first ones, the warmup and the plateau scale."""
+        factor = scale * (1.0 if scheduler is None else warmup_factor(step))
+        for group, rate in zip(optimizer.param_groups, first_rates):
+            group["lr"] = rate * factor
+
+    if plateau is not None:
+        set_rates()
 
     loss_sum = kernel_sum = 0.0
     window = 0
@@ -244,6 +281,8 @@ def train_exp7_joint(
         if scheduler is not None:
             scheduler.step()
         step += 1
+        if plateau is not None:
+            set_rates()
         loss_sum += loss.item()
         kernel_sum += target.square().mean().item()
         window += 1
@@ -257,6 +296,8 @@ def train_exp7_joint(
             "kernel_energy": kernel_sum / window,
             "seconds_per_step": (now - window_started) / window,
         }
+        if plateau is not None:
+            record[SCALE_KEY] = scale
         for name, table in tables.items():
             features = [
                 mode_table_features(mode, table, vectors, eval_chunk) for mode in network]
@@ -279,8 +320,14 @@ def train_exp7_joint(
                  "A lower --lr avoids this.")
                 for side, value in zip(("left", "right"), input_spread(mode, selection_table))
                 if value < INPUT_SPREAD_FLOOR)
-        print("\n".join(lines), flush=True)
         history.append(record)
+        if plateau is not None and plateau.scale(history) != scale:
+            scale = plateau.scale(history)
+            set_rates()
+            lines.append(
+                f"the {plateau.table} energy stopped rising: every learning rate is now "
+                f"{scale:.3g} of its first value")
+        print("\n".join(lines), flush=True)
         # The checkpoint first: eval_history.jsonl never holds a record it does not.
         write_atomic(checkpoint_path, lambda tmp: torch.save({
             "config": config,

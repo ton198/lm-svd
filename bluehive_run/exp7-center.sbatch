@@ -20,6 +20,7 @@ set -euo pipefail
 #   sbatch -J exp7-c64-scratch bluehive_run/exp7-center.sbatch train --subnet scratch \
 #     --center-pool data/center_pools/wikitext-103-train__gpt2-small__h64-f32__m64
 # Add --joint --steps N to train all modes at once instead of one stage per mode.
+# Add --lr-plateau to a --joint run to lower the learning rates when the report energy stops rising.
 # A requeued job repeats its command: an unfinished pool and an unfinished stage
 # both continue. Needs the exp4 tables (exp4-inference.sbatch) and the token
 # stream; a centered run reads no sample store.
